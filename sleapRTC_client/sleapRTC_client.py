@@ -28,11 +28,6 @@ CHUNK_SIZE = 64 * 1024
 MAX_RECONNECT_ATTEMPTS = 5
 RETRY_DELAY = 5  # seconds
 
-# AWS Cognito configuration.
-COGNITO_REGION = "us-west-2"
-USER_POOL_ID = "us-west-2_XXXXXXXXX" 
-CLIENT_ID = "XXXXXXXXX"  
-
 class RTCCLIClient:
     def __init__(
         self, 
@@ -75,53 +70,72 @@ class RTCCLIClient:
             raise ValueError(f"Failed to decode session string: {e}")
 
 
-    def cognito_anonymous_signin(self, cognito_client=None):
-        """Signs in anonymously with AWS Cognito and returns the ID token."""
+    def request_anonymous_signin(self) -> str:
+        """Request an anonymous token from Signaling Server."""
 
-        username = str(uuid.uuid4())
-        password = f"Aa{uuid.uuid4().hex}!"
+        # Send POST request to the anonymous sign-in endpoint.
+        # CHANGE TO EC2 DNS LATER
+        url = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001/anonymous-signin"
+        response = requests.post(url)
 
-        # Sign up user
-        try:
-            cognito_client.sign_up(
-                ClientId=CLIENT_ID,
-                Username=username,
-                Password=password,
-            )
-        except cognito_client.exceptions.UsernameExistsException:
-            logging.info(f"Username {username} already exists. Using existing user.")
-        except Exception as e:
-            logging.error(f"Failed to sign up user: {e}")
-            return None
+        if response.status_code == 200:
+            return response.json()["id_token"]
+        else:
+            logging.error(f"Failed to get anonymous token: {response.text}")
+            return None 
+        
 
-        # Confirm user immediately (no email verification needed for anonymous sign-in).
-        cognito_client.admin_confirm_sign_up(
-            UserPoolId=USER_POOL_ID,
-            Username=username,
-        )
+    async def start_zmq_listener(self, channel: RTCDataChannel, zmq_address: str = "tcp://127.0.0.1:9000"): # Control Port
+        """Starts a ZMQ ctrl SUB socket to listen for ZMQ commands from the LossViewer.
+    
+        Args:
+            channel: The RTCDataChannel to send progress reports to.
+            zmq_address: Address of the ZMQ socket to connect to.
+        Returns:
+            None
+        """
+        # Use LossViewer's already initialized ZMQ control socket.
+        # Initialize SUB socket.
+        logging.info("Starting new ZMQ listener socket...")
+        context = zmq.Context()
+        socket = context.socket(zmq.SUB)
 
-        # Sign in user to get tokens.
-        response = cognito_client.intiate_auth(
-            ClientId=CLIENT_ID,
-            AuthFlow='USER_PASSWORD_AUTH',
-            AuthParameters={
-                'USERNAME': username,
-                'PASSWORD': password
-            }
-        )
+        logging.info(f"Connecting to ZMQ address: {zmq_address}")
+        socket.connect(zmq_address)
+        socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-        return response['AuthenticationResult']['IdToken']
+        loop = asyncio.get_event_loop()
 
-        # url = f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={os.environ.get('FIREBASE_API_KEY')}"
-        # r = requests.post(url, json={"returnSecureToken": True})
-        # if r.status_code == 200:
-        #     return r.json()
-        # else:
-        #     logging.error(f"Failed to sign in anonymously: {r.status_code}")
-        #     return None
+        def recv_msg():
+            """Receives a message from the ZMQ socket in a non-blocking way.
+            
+            Returns:
+                The received message as a JSON object, or None if no message is available.
+            """
+            
+            try:
+                # logging.info("Receiving message from ZMQ...")
+                return socket.recv_string(flags=zmq.NOBLOCK)  # or jsonpickle.decode(msg_str) if needed
+            except zmq.Again:
+                return None
+
+        while True:
+            # Send progress as JSON string with prefix.
+            msg = await loop.run_in_executor(None, recv_msg)
+
+            if msg:
+                try:
+                    logging.info(f"Sending progress report to client: {msg}")
+                    channel.send(f"ZMQ_CTRL::{msg}")
+                    # logging.info("Progress report sent to client.")
+                except Exception as e:
+                    logging.error(f"Failed to send ZMQ progress: {e}")
+                    
+            # Polling interval.
+            await asyncio.sleep(0.05)
 
 
-    def start_zmq_control(self, zmq_address: str = "tcp://127.0.0.1:9001"):
+    def start_zmq_control(self, zmq_address: str = "tcp://127.0.0.1:9001"): # Publish Port
         """Starts a ZMQ ctrl PUB socket to forward ZMQ commands to the LossViewer.
     
         Args:
@@ -330,6 +344,7 @@ class RTCCLIClient:
 
         # Start ZMQ control socket.
         self.start_zmq_control()
+        asyncio.create_task(self.start_zmq_listener(self.data_channel))
         logging.info(f'{self.data_channel.label} ZMQ control socket started')
             
         return
@@ -389,6 +404,7 @@ class RTCCLIClient:
                 self.received_files.clear()
 
                 # Update monitor window with file transfer and training completion.
+                # Can close LossViewer window NOW since EOF received.
                 # self.win.close()
                 close_msg = {
                     "event": "rtc_close_monitor",
@@ -482,6 +498,7 @@ class RTCCLIClient:
                         model_type = config_info.head_name
 
                         if self.win:
+                            # Reset (clear) LossViewer window for new training job.
                             logging.info("Resetting monitor window.")
                             plateau_patience = job.optimization.early_stopping.plateau_patience
                             plateau_min_delta = job.optimization.early_stopping.plateau_min_delta
@@ -513,19 +530,19 @@ class RTCCLIClient:
                 except Exception as e:
                     logging.error(f"Failed to parse training job config: {e}")
 
-            elif "TRAIN_JOB_END::" in message:
+            elif "TRAIN_JOB_END::" in message: # ONLY TO SIGNAL TRAINING JOB END, NOT WHOLE TRAINING SESSION END (resets handled by TRAIN_JOB_START)
                 # Training job end message received.
                 _, job_info = message.split("TRAIN_JOB_END::", 1)
                 logging.info(f"Train job completed: {job_info}, checking for next job...")
 
                 # Update LossViewer window to indicate training completion based on how many training jobs left.
                 if len(self.config_info_list) == 0:
-                    logging.info("No more training jobs to run. Closing LossViewer window.")
-                    close_msg = {
-                        "event": "rtc_close_monitor"
-                    }
-                    self.ctrl_socket.send_string(jsonpickle.encode(close_msg))
-                    await self.clean_exit()
+                    logging.info("No more training jobs to run. Closing LossViewer window once trained zip is sent.")
+                    # close_msg = {
+                    #     "event": "rtc_close_monitor"
+                    # }
+                    # self.ctrl_socket.send_string(jsonpickle.encode(close_msg)) # sent to port 9001
+                    # await self.clean_exit() <- DON'T WANT TO EXIT YET, WAITING FOR Training zip still
                 else:
                     logging.info(f"More training jobs to run: {len(self.config_info_list)} remaining.")
                     # Handle next job with TRAIN_JOB_START message.
@@ -623,7 +640,6 @@ class RTCCLIClient:
             output_dir: str = "", 
             zmq_ports: list = None, 
             config_info_list: List[ConfigFileInfo] = None,
-            win: LossViewer = None,
         ):
         """Sends initial SDP offer to worker peer and establishes both connection & datachannel to be used by both parties.
         
@@ -644,7 +660,6 @@ class RTCCLIClient:
         logging.info("channel(%s) %s" % (channel.label, "created by local party."))
 
         # Set local variable
-        self.win = win
         self.file_path = file_path
         self.output_dir = output_dir
         self.zmq_ports = zmq_ports
@@ -654,14 +669,10 @@ class RTCCLIClient:
         channel.on("open", self.on_channel_open)
         channel.on("message", self.on_message)
 
-        # Initialize LossViewer RTC data channel event handlers.
-        # Doesn't directly interact with window, so doesn't need to be in main thread.
-        logging.info("Setting up RTC data channel for LossViewer...")
-        self.win.set_rtc_channel(channel)    
+        # CLI so no LossViewer functions/updates.
 
         # Sign-in anonymously with Cognito to get an ID token.
-        cognito = boto3.client('cognito-idp', region_name=COGNITO_REGION)
-        id_token = self.cognito_anonymous_signin(cognito)
+        id_token = self.request_anonymous_signin()
 
         if not id_token:
             logging.error("Failed to sign in anonymously. Exiting client.")
@@ -748,6 +759,7 @@ class RTCCLIClient:
 
 def create_remote_trainer_using_cli(args: Optional[List] = None):
     """Create CLI for remote training"""
-    
+    import argparse
+    parser = argparse.ArgumentParser(description="SLEAP Remote Training CLI Client")
 
     pass
