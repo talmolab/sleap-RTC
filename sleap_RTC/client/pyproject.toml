@@ -1,0 +1,22 @@
+[project]
+name = "webrtc-external"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.35.86",
+    "fastapi>=0.115.6",
+    "python-dotenv>=1.0.0",
+    "python-jose[cryptography]>=3.3.0",
+    "requests>=2.32.3",
+    "uvicorn>=0.34.0",
+    "websockets>=14.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+]
