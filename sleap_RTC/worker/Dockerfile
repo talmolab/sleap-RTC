@@ -3,7 +3,8 @@
 # FROM eberrigan/sleap-cuda:latest
 
 # Use a lightweight multi-architecture base image & install uv
-FROM ghcr.io/talmolab/sleap-cuda:linux-amd64-2a8cefd7d0291d2ce07998fa3c54c9d0d618d31b
+# FROM ghcr.io/talmolab/sleap-cuda:linux-amd64-2a8cefd7d0291d2ce07998fa3c54c9d0d618d31b
+FROM python:3.12-slim-trixie
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 # Set working directory
@@ -21,18 +22,23 @@ WORKDIR /app
 # Install websocket dependencies onto image @ build time (asyncio is included in python3.8)
 # put into requirement.txt later
 
-# Install zip function
-RUN apt-get update && apt-get install -y zip unzip 
+# Install system dependencies for OpenCV and OpenGL
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+    ffmpeg libgl1 libsm6 libxext6 libxrender1 libglib2.0-0 \
+    zip unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies (CHANGE TO TORCH-CUDA LATER)
+# TORCH-CPU FOR LOCAL MAC TESTING
+COPY pyproject.toml /app/
+RUN uv sync
 
 # Copy the sleap_webRTC directory into the image's root dir
-COPY ../../pyproject.toml /app/
-COPY worker.py /app/
-COPY zmq_check.py /app/
+# COPY worker.py /app/
+# COPY zmq_check.py /app/
 COPY worker_class.py /app/
-COPY run_training.py /app/
-
-# Install dependencies 
-RUN uv sync 
+# COPY run_training.py /app/
 
 # Create shared file directory inside container 
 RUN mkdir -p /app/shared_data && chmod 777 /app/shared_data
