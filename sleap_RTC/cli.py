@@ -6,10 +6,6 @@ from pathlib import Path
 from sleap_RTC.RTCworker import run_RTCworker
 from sleap_RTC.RTCclient import run_RTCclient
 import sys
-from click import Command
-
-class WorkerCommand(Command):
-    """CLI command class that overrides help behavior for worker command"""
 
 @click.group()
 def cli():
@@ -31,15 +27,13 @@ def show_worker_help():
     """
     click.echo(help_text)
 
-@cli.command(cls=WorkerCommand)
-
-def start_worker():
+def worker():
     """Start the sleap-RTC worker node."""
     run_RTCworker()
 
 @cli.command()
 @click.option(
-    "--session-string",
+    "--session_string",
     "-s",
     type=str,
     required=True,
@@ -66,7 +60,7 @@ def start_worker():
     default=9001,
     help="ZMQ ports for publish communication with SLEAP.",
 )
-def start_client(**kwargs):
+def client(**kwargs):
     """Run the sleap-RTC GUI client."""
     logger.info(f"Using controller port: {kwargs['controller_port']}")
     logger.info(f"Using publish port: {kwargs['publish_port']}")
@@ -80,3 +74,6 @@ def start_client(**kwargs):
         zmq_ports=kwargs.pop("zmq_ports"),
         **kwargs
     )
+
+if __name__ == "__main__":
+    cli()
