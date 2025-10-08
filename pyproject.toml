@@ -11,6 +11,7 @@ classifiers = [
 ]
 dependencies = [
     "aiortc",
+    "loguru",
     "websockets",
     "requests",
     "pyzmq",
@@ -18,6 +19,9 @@ dependencies = [
     "boto3",
     "sleap",
 ]
+
+[project.scripts]
+sleap-rtc = "sleap_RTC.cli:cli"
 
 [project.optional-dependencies]
 dev = [
