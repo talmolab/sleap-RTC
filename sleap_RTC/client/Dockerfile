@@ -24,13 +24,13 @@ WORKDIR /app
 # Install zip function
 RUN apt-get update && apt-get install -y zip unzip 
 
-# Copy the sleap_webRTC directory into the image's root dir
-COPY ../../pyproject.toml /app/
-COPY client.py /app/
-COPY rtc_gui_client.py /app/
-
 # Install dependencies 
-RUN uv sync 
+COPY pyproject.toml /app/
+RUN uv sync --extra dev
+
+# Copy the sleap_webRTC directory into the image's root dir
+COPY client.py /app/
+COPY client_class.py /app/
 
 # Create shared file directory inside container 
 RUN mkdir -p /app/shared_data && chmod 777 /app/shared_data
