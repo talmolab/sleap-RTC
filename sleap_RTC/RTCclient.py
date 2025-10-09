@@ -2,7 +2,7 @@ import asyncio
 import uuid
 import logging
 
-from sleap_RTC.client.client_class import RTCGUIClient
+from sleap_RTC.client.client_class import RTCClient
 
 
 def run_RTCclient(session_string: str, pkg_path: str, zmq_ports: dict, **kwargs):
@@ -15,7 +15,7 @@ def run_RTCclient(session_string: str, pkg_path: str, zmq_ports: dict, **kwargs)
         **kwargs: Additional arguments (currently unused)
     """
     # Create client instance
-    client = RTCGUIClient(
+    client = RTCClient(
         peer_id=str(uuid.uuid4()),
         DNS="ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com"
     )
