@@ -17,7 +17,9 @@ def run_RTCclient(session_string: str, pkg_path: str, zmq_ports: dict, **kwargs)
     # Create client instance
     client = RTCClient(
         peer_id=str(uuid.uuid4()),
-        DNS="ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com"
+        DNS="ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
+        port_number="8080",
+        gui=False  # Indicate that this is running in CLI mode
     )
     
     # Map CLI arguments to method parameters

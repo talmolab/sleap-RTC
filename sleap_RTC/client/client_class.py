@@ -14,8 +14,6 @@ import zmq
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 from functools import partial
 from pathlib import Path
-# from sleap.gui.widgets.monitor import LossViewer
-from sleap.gui.learning.configs import ConfigFileInfo
 from typing import List, Optional, Text, Tuple
 from websockets.client import ClientConnection
 
@@ -33,6 +31,7 @@ class RTCClient:
         peer_id: str = f"client-{uuid.uuid4()}",
         DNS: str = "ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
         port_number: str = "8080",
+        gui: bool = False
     ):
         # Initialize RTC peer connection and websocket.
         self.pc = RTCPeerConnection()
@@ -44,49 +43,13 @@ class RTCClient:
         self.peer_id = peer_id
         self.DNS = DNS
         self.port_number = port_number
+        self.gui = gui
 
         # Other variables.
         self.received_files = {}
         self.target_worker = None
         self.reconnecting = False
-
-
-    def parse_training_script(self, training_script_path: str):
-        """Parse the training script to extract ConfigFileInfo names.
-        Args:
-            training_script_path: Path to the training script (e.g., train-script.sh)
-        Returns:
-            List[str]: List of config names found in the training script
-        """
-        config_names = []
-        
-        if not Path(training_script_path).exists():
-            logging.error(f"Training script not found: {training_script_path}")
-            return config_names
-            
-        try:
-            with open(training_script_path, 'r') as f:
-                content = f.read()
-                
-            # Pattern to match --config-name followed by the config name
-            # Handles both .yaml extension and without extension
-            pattern = r'--config-name\s+(\w+)(?:\.yaml)?'
-            matches = re.findall(pattern, content)
-            
-            # Remove duplicates while preserving order
-            seen = set()
-            for match in matches:
-                if match not in seen:
-                    config_names.append(match)
-                    seen.add(match)
-                    
-            logging.info(f"Found {len(config_names)} config names: {config_names}")
-            
-        except Exception as e:
-            logging.error(f"Error parsing training script {training_script_path}: {e}")
-            
-        return config_names
-
+    
 
     def parse_session_string(self, session_string: str):
         prefix = "sleap-session:"
@@ -379,9 +342,10 @@ class RTCClient:
             logging.info(f"File sent to worker.")
 
         # Start ZMQ control socket.
-        self.start_zmq_control()
-        asyncio.create_task(self.start_zmq_listener(self.data_channel))
-        logging.info(f'{self.data_channel.label} ZMQ control socket started')
+        if self.gui:
+            self.start_zmq_control()
+            asyncio.create_task(self.start_zmq_listener(self.data_channel))
+            logging.info(f'{self.data_channel.label} ZMQ control socket started')
             
         return
     
@@ -440,13 +404,12 @@ class RTCClient:
                 self.received_files.clear()
 
                 # Update monitor window with file transfer and training completion.
-                # Can close LossViewer window NOW since EOF_FILE received.
-                # self.win.close()
-                close_msg = {
-                    "event": "rtc_close_monitor",
-                }
-                self.ctrl_socket.send_string(jsonpickle.encode(close_msg))
-                logging.info("Sent ZMQ close message to LossViewer window.")
+                if self.gui:
+                    close_msg = {
+                        "event": "rtc_close_monitor",
+                    }
+                    self.ctrl_socket.send_string(jsonpickle.encode(close_msg))
+                    logging.info("Sent ZMQ close message to LossViewer window.")
 
             elif "PROGRESS_REPORT::" in message:
                 # Progress report received from worker.
@@ -454,38 +417,12 @@ class RTCClient:
                 _, progress = message.split("PROGRESS_REPORT::", 1)
                 
                 # Update LossViewer window with received progress report.
-                if self.win:
+                if self.gui:
                     rtc_progress_msg = {
                         "event": "rtc_update_monitor",
                         "rtc_msg": progress
                     }
                     self.ctrl_socket.send_string(jsonpickle.encode(rtc_progress_msg))
-
-                    # QtCore.QTimer.singleShot(0, partial(self.win._check_messages, rtc_msg=progress))
-                    # win._check_messages(
-                    #     # Progress should be result from jsonpickle.decode(msg_str)
-                    #     rtc_msg=progress 
-                    # )
-                else:
-                    logging.info(f"No monitor window available! win is {self.win}")
-
-
-                # print("Resetting monitor window.")
-                # plateau_patience = config_info.optimization.early_stopping.plateau_patience
-                # plateau_min_delta = config_info.optimization.early_stopping.plateau_min_delta
-                # win.reset(
-                #     what=str(model_type),
-                #     plateau_patience=plateau_patience,
-                #     plateau_min_delta=plateau_min_delta,
-                # )
-                # win.setWindowTitle(f"Training Model - {str(model_type)}")
-                # win.set_message(f"Preparing to run training...")
-                # if save_viz:
-                #     viz_window = QtImageDirectoryWidget.make_training_vizualizer(
-                #         job.outputs.run_path
-                #     )
-                #     viz_window.move(win.x() + win.width() + 20, win.y())
-                #     win.on_epoch.connect(viz_window.poll)
 
             elif "FILE_META::" in message: 
                 # Metadata received (file name & size).
@@ -509,33 +446,31 @@ class RTCClient:
                 logging.info(f"Training job started with info: {job_info}")
 
                 # Parse the job info and update the LossViewer window.
-                try:
-                    # Get next config info.
-                    config_info = self.config_info_list.pop(0)
+                if self.gui:
+                    try:
+                        # Get next config info.
+                        config_info = self.config_info_list.pop(0)
 
-                    # Check for retraining flag.
-                    if config_info.dont_retrain:
-                        if not config_info.has_trained_model:
-                            raise ValueError(
-                                "Config is set to not retrain but no trained model found: "
+                        # Check for retraining flag.
+                        if config_info.dont_retrain:
+                            if not config_info.has_trained_model:
+                                raise ValueError(
+                                    "Config is set to not retrain but no trained model found: "
+                                    f"{config_info.path}"
+                                )
+
+                            logging.info(
+                                f"Using already trained model for {config_info.head_name}: "
                                 f"{config_info.path}"
                             )
 
-                        logging.info(
-                            f"Using already trained model for {config_info.head_name}: "
-                            f"{config_info.path}"
-                        )
+                            # Trained job paths not needed because no remote inference (remote training only) so far.
 
-                        # Trained job paths not needed because no remote inference (remote training only).
-
-                    # Otherwise, prepare to run training job.
-                    else:
-                        job = config_info.config
-                        model_type = config_info.head_name
-
-                        if self.win:
-                            #
+                        # Otherwise, prepare to run training job.
+                        else:
                             logging.info("Resetting monitor window.")
+                            job = config_info.config
+                            model_type = config_info.head_name
                             plateau_patience = job.optimization.early_stopping.plateau_patience
                             plateau_min_delta = job.optimization.early_stopping.plateau_min_delta
 
@@ -550,21 +485,13 @@ class RTCClient:
                                 "message": "Preparing to run training..."
                             }
                             self.ctrl_socket.send_string(jsonpickle.encode(reset_msg))
-
-                            # self.win.reset(
-                            #     what=str(model_type),
-                            #     plateau_patience=plateau_patience,
-                            #     plateau_min_delta=plateau_min_delta,
-                            # )
-                            # self.win.setWindowTitle(f"Training Model - {str(model_type)}")
-                            # self.win.set_message(f"Preparing to run training...")
                             
                             # Further updates to the LossViewer window handled by PROGRESS_REPORT messages when training starts remotely.
 
-                        logging.info(f"Start training {str(model_type)} job with config: {job}")
-            
-                except Exception as e:
-                    logging.error(f"Failed to parse training job config: {e}")
+                            logging.info(f"Start training {str(model_type)} job with config: {job}")
+                
+                    except Exception as e:
+                        logging.error(f"Failed to parse training job config: {e}")
 
             elif "TRAIN_JOB_END::" in message: # ONLY TO SIGNAL TRAINING JOB END, NOT WHOLE TRAINING SESSION END.
                 # Training job end message received.
@@ -572,29 +499,12 @@ class RTCClient:
                 logging.info(f"Train job completed: {job_info}, checking for next job...")
 
                 # Update LossViewer window to indicate training completion based on how many training jobs left.
-                if len(self.config_info_list) == 0:
-                    logging.info("No more training jobs to run. Closing LossViewer window.")
-                    # close_msg = {
-                    #     "event": "rtc_close_monitor"
-                    # }
-                    # self.ctrl_socket.send_string(jsonpickle.encode(close_msg))
-                    # await self.clean_exit()
-                else:
-                    logging.info(f"More training jobs to run: {len(self.config_info_list)} remaining.")
-                    # Handle next job with TRAIN_JOB_START message.
-                    
-                    # next_job = self.config_info_list[0]
-                    # if self.win:
-                    #     # Send reset ZMQ message to LossViewer window.
-                    #     reset_msg = {
-                    #         "event": "rtc_reset_monitor",
-                    #         "what": str(next_job.head_name),
-                    #         "plateau_patience": next_job.config.optimization.early_stopping.plateau_patience,
-                    #         "plateau_min_delta": next_job.config.optimization.early_stopping.plateau_min_delta,
-                    #         "window_title": f"Training Model - {str(next_job.head_name)}",
-                    #         "message": "Preparing to run training..."
-                    #     }
-                    #     self.ctrl_socket.send_string(jsonpickle.encode(reset_msg))
+                if self.gui:
+                    if len(self.config_info_list) == 0:
+                        logging.info("No more training jobs to run. Closing LossViewer window.")
+                    else:
+                        logging.info(f"More training jobs to run: {len(self.config_info_list)} remaining.")
+    
                 
 
             elif "TRAIN_JOB_ERROR::" in message:
@@ -613,20 +523,12 @@ class RTCClient:
                 _, progress = message.decode().split("PROGRESS_REPORT::", 1)
                 
                 # Update LossViewer window with received progress report.
-                if self.win:
+                if self.gui:
                     rtc_progress_msg = {
                         "event": "rtc_update_monitor",
                         "rtc_msg": progress
                     }
                     self.ctrl_socket.send_string(jsonpickle.encode(rtc_progress_msg))
-
-                    # QtCore.QTimer.singleShot(0, partial(self.win._check_messages, rtc_msg=progress))
-                    # win._check_messages(
-                    #     # Progress should be result from jsonpickle.decode(msg_str)
-                    #     rtc_msg=progress 
-                    # )
-                else:
-                    logging.info(f"No monitor window available! win is {self.win}")
 
             file_name = list(self.received_files.keys())[0]
             if file_name not in self.received_files:
@@ -675,8 +577,8 @@ class RTCClient:
             file_path: str = None, 
             output_dir: str = "", 
             zmq_ports: list = None, 
-            # config_info_list: List[ConfigFileInfo] = None,
-            win: bool = False,
+            config_info_list: list = None,
+            # win: bool = False,
             session_string: str = None
         ):
         """Sends initial SDP offer to worker peer and establishes both connection & datachannel to be used by both parties.
@@ -697,24 +599,19 @@ class RTCClient:
         self.data_channel = channel
         logging.info("channel(%s) %s" % (channel.label, "created by local party."))
 
-        # Parse training script for config info list
-        config_info_list = self.parse_training_script(file_path)
-
         # Set local variable
-        self.win = win
+        # self.win = win
         self.file_path = file_path
         self.output_dir = output_dir
         self.zmq_ports = zmq_ports
-        self.config_info_list = config_info_list
+        self.config_info_list = config_info_list # only passed if not CLI
 
         # Register event handlers for the data channel.
         channel.on("open", self.on_channel_open)
         channel.on("message", self.on_message)
 
-        # Initialize LossViewer RTC data channel event handlers.
-        # Doesn't directly interact with window, so doesn't need to be in main thread.
+        # Initialize reconnect attempts.
         logging.info("Setting up RTC data channel reconnect attempts...")
-        # self.win.set_rtc_channel(channel)   
         self.reconnect_attempts = 0 
 
         # Sign-in anonymously with Cognito to get an ID token.
@@ -745,7 +642,7 @@ class RTCClient:
                     session_string = input("Please enter RTC session string (or type 'exit' to quit): ")
                     if session_string.lower() == "exit":
                         print("Exiting client.")
-                        return  # <-- This exits the current function (e.g., run_client)
+                        return
                     try:
                         session_str_json = self.parse_session_string(session_string)
                         break  # Exit loop if parsing succeeds
