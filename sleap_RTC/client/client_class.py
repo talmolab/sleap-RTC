@@ -8,14 +8,14 @@ import json
 import jsonpickle
 import logging
 import os
+import re
 import zmq
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 from functools import partial
 from pathlib import Path
-from sleap.gui.widgets.monitor import LossViewer
+# from sleap.gui.widgets.monitor import LossViewer
 from sleap.gui.learning.configs import ConfigFileInfo
-from sleap.nn.config.training_job import TrainingJobConfig
 from typing import List, Optional, Text, Tuple
 from websockets.client import ClientConnection
 
@@ -27,7 +27,7 @@ CHUNK_SIZE = 64 * 1024
 MAX_RECONNECT_ATTEMPTS = 5
 RETRY_DELAY = 5  # seconds
 
-class RTCGUIClient:
+class RTCClient:
     def __init__(
         self, 
         peer_id: str = f"client-{uuid.uuid4()}",
@@ -49,6 +49,43 @@ class RTCGUIClient:
         self.received_files = {}
         self.target_worker = None
         self.reconnecting = False
+
+
+    def parse_training_script(self, training_script_path: str):
+        """Parse the training script to extract ConfigFileInfo names.
+        Args:
+            training_script_path: Path to the training script (e.g., train-script.sh)
+        Returns:
+            List[str]: List of config names found in the training script
+        """
+        config_names = []
+        
+        if not Path(training_script_path).exists():
+            logging.error(f"Training script not found: {training_script_path}")
+            return config_names
+            
+        try:
+            with open(training_script_path, 'r') as f:
+                content = f.read()
+                
+            # Pattern to match --config-name followed by the config name
+            # Handles both .yaml extension and without extension
+            pattern = r'--config-name\s+(\w+)(?:\.yaml)?'
+            matches = re.findall(pattern, content)
+            
+            # Remove duplicates while preserving order
+            seen = set()
+            for match in matches:
+                if match not in seen:
+                    config_names.append(match)
+                    seen.add(match)
+                    
+            logging.info(f"Found {len(config_names)} config names: {config_names}")
+            
+        except Exception as e:
+            logging.error(f"Error parsing training script {training_script_path}: {e}")
+            
+        return config_names
 
 
     def parse_session_string(self, session_string: str):
@@ -638,8 +675,8 @@ class RTCGUIClient:
             file_path: str = None, 
             output_dir: str = "", 
             zmq_ports: list = None, 
-            config_info_list: List[ConfigFileInfo] = None,
-            win: LossViewer = None,
+            # config_info_list: List[ConfigFileInfo] = None,
+            win: bool = False,
             session_string: str = None
         ):
         """Sends initial SDP offer to worker peer and establishes both connection & datachannel to be used by both parties.
@@ -660,6 +697,9 @@ class RTCGUIClient:
         self.data_channel = channel
         logging.info("channel(%s) %s" % (channel.label, "created by local party."))
 
+        # Parse training script for config info list
+        config_info_list = self.parse_training_script(file_path)
+
         # Set local variable
         self.win = win
         self.file_path = file_path
@@ -673,8 +713,8 @@ class RTCGUIClient:
 
         # Initialize LossViewer RTC data channel event handlers.
         # Doesn't directly interact with window, so doesn't need to be in main thread.
-        logging.info("Setting up RTC data channel for LossViewer...")
-        self.win.set_rtc_channel(channel)   
+        logging.info("Setting up RTC data channel reconnect attempts...")
+        # self.win.set_rtc_channel(channel)   
         self.reconnect_attempts = 0 
 
         # Sign-in anonymously with Cognito to get an ID token.
