@@ -30,7 +30,7 @@ def run_RTCclient(session_string: str, pkg_path: str, zmq_ports: dict, **kwargs)
         'output_dir': '',
         'zmq_ports': [zmq_ports.get('controller', 9000), zmq_ports.get('publish', 9001)],  # Convert dict to list
         'config_info_list': None, # None since CLI (used for updating LossViewer)
-        'win': None, # None since CLI
+        # 'win': None, # None since CLI
         'session_string': session_string # Pass session_string here (CLI)
     }
     

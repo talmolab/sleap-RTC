@@ -327,7 +327,7 @@ class RTCClient:
             file_size = Path(file_path).stat().st_size
 
             # Send metadata next.
-            self.data_channel.send(f"FILE_META::{file_name}:{file_size}")
+            self.data_channel.send(f"FILE_META::{file_name}:{file_size}:{self.gui}")
 
             # Send file in chunks (32 KB).
             with open(file_path, "rb") as file:
