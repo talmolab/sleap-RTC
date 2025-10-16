@@ -17,7 +17,7 @@ dependencies = [
     "pyzmq",
     "jsonpickle",
     "boto3",
-    "sleap",
+    "sleap-nn[torch]",
 ]
 
 [project.scripts]
