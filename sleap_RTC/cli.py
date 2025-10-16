@@ -27,6 +27,7 @@ def show_worker_help():
     """
     click.echo(help_text)
 
+@cli.command()
 def worker():
     """Start the sleap-RTC worker node."""
     run_RTCworker()

@@ -22,8 +22,15 @@ from websockets.client import ClientConnection
 logging.basicConfig(level=logging.INFO)
 
 class RTCWorkerClient:
-    def __init__(self, remote_save_dir="/app/shared_data", chunk_size=32 * 1024):
-        self.save_dir = remote_save_dir
+    def __init__(self, remote_save_dir="app/shared_data", chunk_size=32 * 1024):
+        # Use /app/shared_data in production, current dir + shared_data in dev
+        if os.path.exists("app/shared_data"):
+            logging.info("Using app/shared_data as save directory.")
+            self.save_dir = remote_save_dir
+        else:
+            logging.info("Using current working directory + shared_data as save directory.")
+            self.save_dir = os.path.join(os.getcwd(), "app/shared_data")
+            os.makedirs(self.save_dir, exist_ok=True)
         self.chunk_size = chunk_size
         self.received_files = {}
         self.output_dir = ""
@@ -83,14 +90,16 @@ class RTCWorkerClient:
 
     def parse_training_script(self, training_script_path: str):
         jobs = []
-        pattern = re.compile(r"^\s*sleap-train\s+([^\s]+)\s+([^\s]+)")
+        # Updated pattern to match both 'sleap-train' and 'sleap-nn train' commands
+        pattern = re.compile(r"^\s*sleap-(?:nn\s+)?train\s+.*--config-name\s+(\S+)")
 
         with open(training_script_path, "r") as f:
             for line in f:
                 match = pattern.match(line)
                 if match:
-                    config, labels = match.groups()
-                    jobs.append((config.strip(), labels.strip()))
+                    config_name = match.group(1)
+                    # For sleap-nn, we don't need separate labels file - it's configured in the YAML
+                    jobs.append((config_name, None))
         return jobs
 
 
@@ -101,34 +110,56 @@ class RTCWorkerClient:
             job_name = Path(config_name).stem
 
             # Send RTC msg over channel to indicate job start.
-            logging.info(f"Starting training job: {job_name} with config: {config_name} and labels: {labels_name}")
+            logging.info(f"Starting training job: {job_name} with config: {config_name}")
             channel.send(f"TRAIN_JOB_START::{job_name}")
 
+            # Use sleap-nn train command for newer SLEAP versions
+            # Run directly in the extracted directory with current directory as config-dir
             cmd = [
-                "sleap-train",
-                config_name,
-                labels_name,
-                "--zmq",
-                "--controller_port",
-                "9000",
-                "--publish_port",
-                "9001"
+                "uv", "run",
+                "sleap-nn", "train",
+                "--config-name", config_name,
+                "--config-dir", ".",
+                "trainer_config.ckpt_dir=models",
+                f"trainer_config.run_name={job_name}",
+                "trainer_config.zmq.controller_port=9000",
+                "trainer_config.zmq.publish_port=9001"
             ]
-            logging.info(f"[RUNNING] {' '.join(cmd)}")
+            logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.zip_dir})")
+            logging.info(f"Working directory exists: {os.path.exists(self.zip_dir)}")
+            logging.info(f"Config files in directory: {os.listdir(self.zip_dir)}")
 
+            # Force unbuffered output and simulate terminal environment
+            env = {
+                **os.environ, 
+                "PYTHONUNBUFFERED": "1", 
+                "FORCE_COLOR": "1",
+                "TERM": "xterm-256color",  # Simulate terminal
+                "COLUMNS": "80",           # Set terminal width
+                "LINES": "24"              # Set terminal height
+            }
+            
+            # Copy to container-local storage for better performance on Mac/Docker
+            # This avoids slow bind-mount I/O
+            container_work_dir = f"/tmp/sleap_work_{job_name}"
+            if not os.path.exists(container_work_dir):
+                shutil.copytree(self.zip_dir, container_work_dir)
+                logging.info(f"Copied files to container-local storage: {container_work_dir}")
+            
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                cwd=save_dir
+                cwd=container_work_dir,  # Use container-local directory (much faster)
+                env=env
             )
 
             assert process.stdout is not None
+            logging.info(f"Process started with PID: {process.pid}")
 
             async def stream_logs():
                 async for line in process.stdout:
                     decoded_line = line.decode().rstrip()
-                    logging.info(decoded_line)
 
                     if channel.readyState == "open":
                         try:
@@ -137,7 +168,9 @@ class RTCWorkerClient:
                             logging.error(f"Failed to send log line: {e}")
 
             await stream_logs()
+            logging.info("Waiting for process to complete...")
             await process.wait()
+            logging.info(f"Process completed with return code: {process.returncode}")
 
             if process.returncode == 0:
                 logging.info(f"[DONE] Job {job_name} completed successfully.")
@@ -273,6 +306,7 @@ class RTCWorkerClient:
         """
 
         if dir_path is None:
+            logging.info("No directory path given. Using save_dir instead.")
             dir_path = self.save_dir
 
         logging.info("Unzipping results...")
@@ -280,6 +314,7 @@ class RTCWorkerClient:
             try:
                 shutil.unpack_archive(file_path, dir_path)
                 logging.info(f"Results unzipped from {file_path}")
+                logging.info(f"Unzipped contents to {dir_path}")
             except Exception as e:
                 logging.error(f"Error unzipping results: {e}")
                 return
@@ -557,7 +592,7 @@ class RTCWorkerClient:
 
                     # File transfer complete, save to disk.
                     file_name, file_data = list(self.received_files.items())[0]
-                    file_path = os.path.join("", file_name)
+                    file_path = os.path.join(self.save_dir, file_name)
 
                     with open(file_path, "wb") as file:
                         file.write(file_data)
@@ -565,17 +600,30 @@ class RTCWorkerClient:
 
                     # Unzip results if needed.
                     if file_path.endswith(".zip"):
-                        await self.unzip_results(file_path)
+                        await self.unzip_results(file_path, self.save_dir)
                         logging.info(f"Unzipped results from {file_path}")
 
                     # Reset dictionary for next file and train model.
                     self.received_files.clear()
 
-                    train_script_path = os.path.join(self.save_dir, "train-script.sh")
+                    # Remove .zip extension from file_path to get directory name
+                    if file_path.endswith(".zip"):
+                        extracted_dir = os.path.splitext(os.path.basename(file_path))[0]
+                    else:
+                        extracted_dir = os.path.basename(file_path)
+
+                    self.zip_dir = os.path.join(self.save_dir, extracted_dir)
+                    
+                    train_script_path = os.path.join(self.zip_dir, "train-script.sh")
 
                     if Path(train_script_path):
                         try:
+                            logging.info("self.gui is: " + str(self.gui))
+                            progress_listener_task = None
+                            # if self.gui:
                             # Start ZMQ progress listener.
+                            # Don't need to send ZMQ progress reports if User just using CLI sleap-rtc.
+                            # (Will print sleap-nn train logs directly to terminal instead.)
                             progress_listener_task = asyncio.create_task(self.start_progress_listener(channel))
                             logging.info(f'{channel.label} progress listener started')
 
@@ -596,7 +644,8 @@ class RTCWorkerClient:
 
                             # Finish training.
                             logging.info("Training completed successfully.")
-                            progress_listener_task.cancel()
+                            if progress_listener_task:
+                                progress_listener_task.cancel()
 
                             # Zip the results.
                             logging.info("Zipping results...")
@@ -620,10 +669,15 @@ class RTCWorkerClient:
                 elif "FILE_META::" in message:
                     logging.info(f"File metadata received: {message}")
                     _, meta = message.split("FILE_META::", 1)
-                    file_name, file_size = meta.split(":")
+                    file_name, file_size, gui = meta.split(":")
 
+                    logging.info("self.gui set to: " + gui)
+
+                    # Convert string to boolean
+                    self.gui = gui.lower() == 'true'
                     self.received_files[file_name] = bytearray()
                     logging.info(f"File name received: {file_name}, of size {file_size}")
+                    logging.info(f"self.gui converted to boolean: {self.gui}")
                 elif "ZMQ_CTRL::" in message:
                     logging.info(f"ZMQ LossViewer control message received: {message}")
                     _, zmq_msg = message.split("ZMQ_CTRL::", 1)
