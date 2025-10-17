@@ -51,11 +51,24 @@ class RTCWorkerClient:
         return f"sleap-session:{encoded}"
 
 
+    def request_peer_room_deletion(self, id_token, room_id):
+        """Requests the signaling server to delete the room and associated user/worker."""
+        
+        url = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001/delete"
+        response = requests.post(url)
+
+        if response.status_code == 200:
+            return # Success
+        else:
+            logging.error(f"Failed to get anonymous token: {response.text}")
+            return None
+
+
     def request_create_room(self, id_token):
         """Requests the signaling server to create a room and returns the room ID and token.
 
         Args:
-            id_token (str): Firebase ID token for authentication.
+            id_token (str): Cognito ID token for authentication.
         Returns:
             dict: Contains room_id and token if successful, otherwise raises an exception.
         """
@@ -82,7 +95,7 @@ class RTCWorkerClient:
         response = requests.post(url)
 
         if response.status_code == 200:
-            return response.json()["id_token"] # should be string type
+            return response.json() # should be string type
         else:
             logging.error(f"Failed to get anonymous token: {response.text}")
             return None
@@ -737,7 +750,7 @@ class RTCWorkerClient:
             logging.info("ICE connection is checking...")
             
 
-    async def run_worker(self, pc, peer_id: str, DNS: str, port_number):
+    async def run_worker(self, pc, DNS: str, port_number):
         """Main function to run the worker. Contains several event handlers for the WebRTC connection and data channel.
         
         Args:
@@ -759,7 +772,10 @@ class RTCWorkerClient:
         self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
 
         # Sign-in anonymously with AWS Cognito to get an ID token (str).
-        id_token = self.request_anonymous_signin()
+        sign_in_json = self.request_anonymous_signin()
+        id_token = sign_in_json['id_token']
+        peer_id = sign_in_json.get['username']
+        self.cognito_username = peer_id
         
         if not id_token:
             logging.error("Failed to sign in anonymously. No ID token given. Exiting...")
@@ -767,7 +783,7 @@ class RTCWorkerClient:
         
         logging.info(f"Anonymous sign-in successful. ID token: {id_token}")
        
-        # Create the room and get the room ID and token.
+        # Create the room and get the room ID, token, and cognito username.
         room_json = self.request_create_room(id_token)
 
         if not room_json or 'room_id' not in room_json or 'token' not in room_json:
@@ -798,6 +814,8 @@ class RTCWorkerClient:
             await self.handle_connection(self.pc, self.websocket, peer_id)
             logging.info(f"{peer_id} connected with client!")
 
+        
+
 if __name__ == "__main__":
     # Create the worker instance.
     worker = RTCWorkerClient()
@@ -806,14 +824,14 @@ if __name__ == "__main__":
     pc = RTCPeerConnection()
 
     # Generate a unique peer ID for the worker.
-    peer_id = f"worker-{uuid.uuid4()}"
+    # peer_id = f"worker-{uuid.uuid4()}"
 
     # Run the worker 
     try:
         asyncio.run(
             worker.run_worker(
                 pc=pc,
-                peer_id=peer_id,
+                # peer_id=peer_id,
                 DNS="ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
                 port_number=8080
             )

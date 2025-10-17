@@ -28,7 +28,6 @@ RETRY_DELAY = 5  # seconds
 class RTCClient:
     def __init__(
         self, 
-        peer_id: str = f"client-{uuid.uuid4()}",
         DNS: str = "ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
         port_number: str = "8080",
         gui: bool = False
@@ -40,7 +39,6 @@ class RTCClient:
         self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
 
         # Initialize given parameters.
-        self.peer_id = peer_id
         self.DNS = DNS
         self.port_number = port_number
         self.gui = gui
@@ -67,6 +65,19 @@ class RTCClient:
             }
         except jsonpickle.UnpicklingError as e:
             raise ValueError(f"Failed to decode session string: {e}")
+        
+
+    def request_peer_room_deletion(self):
+        """Requests the signaling server to delete the room and associated user/worker."""
+
+        url = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001/delete"
+        response = requests.post(url)
+
+        if response.status_code == 200:
+            return # Success
+        else:
+            logging.error(f"Failed to get anonymous token: {response.text}")
+            return None
 
 
     def request_anonymous_signin(self) -> str:
@@ -76,7 +87,7 @@ class RTCClient:
         response = requests.post(url)
 
         if response.status_code == 200:
-            return response.json()['id_token']
+            return response.json() # should be string type
         else:
             logging.error(f"Failed to get anonymous token: {response.text}")
             return None
@@ -578,7 +589,6 @@ class RTCClient:
             output_dir: str = "", 
             zmq_ports: list = None, 
             config_info_list: list = None,
-            # win: bool = False,
             session_string: str = None
         ):
         """Sends initial SDP offer to worker peer and establishes both connection & datachannel to be used by both parties.
@@ -615,7 +625,10 @@ class RTCClient:
         self.reconnect_attempts = 0 
 
         # Sign-in anonymously with Cognito to get an ID token.
-        id_token = self.request_anonymous_signin()
+        sign_in_json = self.request_anonymous_signin()
+        id_token = sign_in_json['id_token']
+        self.peer_id = sign_in_json['peer_id']
+        self.cognito_username = self.peer_id
 
         if not id_token:
             logging.error("Failed to get anonymous ID token. Exiting client.")
@@ -698,6 +711,8 @@ class RTCClient:
 
             # Handle incoming messages from server (e.g. answer from worker).
             await self.handle_connection()
+
+        # Send POST req to server to delete this User, Worker, and associated Room.
 
         # Exit.
         await self.pc.close()
