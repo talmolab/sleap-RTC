@@ -23,7 +23,6 @@ def run_RTCworker():
         asyncio.run(
             worker.run_worker(
                 pc=pc,
-                peer_id=peer_id,
                 DNS="ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
                 port_number=8080
             )

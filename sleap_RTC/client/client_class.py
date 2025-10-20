@@ -28,7 +28,6 @@ RETRY_DELAY = 5  # seconds
 class RTCClient:
     def __init__(
         self, 
-        peer_id: str = f"client-{uuid.uuid4()}",
         DNS: str = "ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
         port_number: str = "8080",
         gui: bool = False
@@ -40,7 +39,6 @@ class RTCClient:
         self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
 
         # Initialize given parameters.
-        self.peer_id = peer_id
         self.DNS = DNS
         self.port_number = port_number
         self.gui = gui
@@ -67,6 +65,24 @@ class RTCClient:
             }
         except jsonpickle.UnpicklingError as e:
             raise ValueError(f"Failed to decode session string: {e}")
+        
+
+    def request_peer_room_deletion(self, peer_id: str):
+        """Requests the signaling server to delete the room and associated user/worker."""
+
+        url = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001/delete-peers-and-room"
+        json = {
+            "peer_id": peer_id,
+        }
+        
+        # Pass the Cognito usernmae (peer_id) to identify which room/peers to delete.
+        response = requests.post(url, json=json)
+
+        if response.status_code == 200:
+            return # Success
+        else:
+            logging.error(f"Failed to delete room and peer: {response.text}")
+            return None
 
 
     def request_anonymous_signin(self) -> str:
@@ -76,7 +92,7 @@ class RTCClient:
         response = requests.post(url)
 
         if response.status_code == 200:
-            return response.json()['id_token']
+            return response.json() # should be string type
         else:
             logging.error(f"Failed to get anonymous token: {response.text}")
             return None
@@ -165,11 +181,18 @@ class RTCClient:
         """
 
         logging.info("Closing WebRTC connection...")
-        await self.pc.close()
+        if self.pc:
+            await self.pc.close()
 
         logging.info("Closing websocket connection...")
-        await self.websocket.close()
+        if self.websocket:
+            await self.websocket.close()
 
+        logging.info("Cleaning up Cognito and DynamoDB entries...")
+        if self.cognito_username:
+            self.request_peer_room_deletion(self.cognito_username)
+            self.cognito_username = None
+        
         logging.info("Client shutdown complete. Exiting...")
 
 
@@ -578,7 +601,6 @@ class RTCClient:
             output_dir: str = "", 
             zmq_ports: list = None, 
             config_info_list: list = None,
-            # win: bool = False,
             session_string: str = None
         ):
         """Sends initial SDP offer to worker peer and establishes both connection & datachannel to be used by both parties.
@@ -593,112 +615,123 @@ class RTCClient:
         Returns:
             None
         """
+        try:
+            # Initialize data channel.
+            channel = self.pc.createDataChannel("my-data-channel")
+            self.data_channel = channel
+            logging.info("channel(%s) %s" % (channel.label, "created by local party."))
 
-        # Initialize data channel.
-        channel = self.pc.createDataChannel("my-data-channel")
-        self.data_channel = channel
-        logging.info("channel(%s) %s" % (channel.label, "created by local party."))
+            # Set local variable
+            # self.win = win
+            self.file_path = file_path
+            self.output_dir = output_dir
+            self.zmq_ports = zmq_ports
+            self.config_info_list = config_info_list # only passed if not CLI
 
-        # Set local variable
-        # self.win = win
-        self.file_path = file_path
-        self.output_dir = output_dir
-        self.zmq_ports = zmq_ports
-        self.config_info_list = config_info_list # only passed if not CLI
+            # Register event handlers for the data channel.
+            channel.on("open", self.on_channel_open)
+            channel.on("message", self.on_message)
 
-        # Register event handlers for the data channel.
-        channel.on("open", self.on_channel_open)
-        channel.on("message", self.on_message)
+            # Initialize reconnect attempts.
+            logging.info("Setting up RTC data channel reconnect attempts...")
+            self.reconnect_attempts = 0 
 
-        # Initialize reconnect attempts.
-        logging.info("Setting up RTC data channel reconnect attempts...")
-        self.reconnect_attempts = 0 
+            # Sign-in anonymously with Cognito to get an ID token.
+            sign_in_json = self.request_anonymous_signin()
+            id_token = sign_in_json['id_token']
+            self.peer_id = sign_in_json['username']
+            self.cognito_username = self.peer_id
 
-        # Sign-in anonymously with Cognito to get an ID token.
-        id_token = self.request_anonymous_signin()
-
-        if not id_token:
-            logging.error("Failed to get anonymous ID token. Exiting client.")
-            return
-        
-        logging.info(f"Anonymous ID token received: {id_token}")
-
-        # No room creation needed for GUI Client since using Worker credentials.
-        # Only needs its own Cognito ID token and peer ID 
-        # Create the room and get the room ID and token.
-        # room_json = self.request_create_room(id_token)
-        # logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
-
-        # Initate the WebSocket connection to the signaling server.
-        async with websockets.connect(f"{self.DNS}:{self.port_number}") as websocket:
-
-            # Initate the websocket for the GUI client (so other functions can use). 
-            self.websocket = websocket
-
-            # Prompt for session string.
-            if not session_string:
-                session_str_json = None
-                while True:
-                    session_string = input("Please enter RTC session string (or type 'exit' to quit): ")
-                    if session_string.lower() == "exit":
-                        print("Exiting client.")
-                        return
-                    try:
-                        session_str_json = self.parse_session_string(session_string)
-                        break  # Exit loop if parsing succeeds
-                    except ValueError as e:
-                        print(f"Error: {e}")
-                        print("Please try again or type 'exit' to quit.")
-            else:
-                session_str_json = self.parse_session_string(session_string)
-            
-            # Extract worker credentials from session string.
-            worker_room_id = session_str_json.get("room_id")
-            worker_token = session_str_json.get("token")
-            worker_peer_id = session_str_json.get("peer_id")
-
-            # Register the client with the signaling server.
-            logging.info(f"Registering {self.peer_id} with signaling server...")
-            await self.websocket.send(json.dumps({
-                'type': 'register', 
-                'peer_id': self.peer_id, # should be own peer_id (Zoom username)
-                'room_id': worker_room_id, # should match Worker's room_id (Zoom meeting ID)
-                'token': worker_token, # should match Worker's token (Zoom meeting password)
-                'id_token': id_token, # should be own Cognito ID token
-            }))
-            # await websocket.send(json.dumps({'type': 'register', 'peer_id': self.peer_id}))
-            logging.info(f"{self.peer_id} sent to signaling server for registration!")
-
-            # # Query for available workers.
-            # await websocket.send(json.dumps({'type': 'query'}))
-            # response = await websocket.recv()
-            # available_workers = json.loads(response)["peers"]
-            # logging.info(f"Available workers: {available_workers}")
-
-            # Select a worker to connect to.
-            # target_worker = available_workers[0] if available_workers else None
-
-            # self.peer_id should match Worker's peer_id (Zoom username).
-            self.target_worker = worker_peer_id
-            logging.info(f"Selected worker: {self.target_worker}")
-
-            if not self.target_worker:
-                logging.info("No target worker given. Cannot connect.")
+            if not id_token:
+                logging.error("Failed to get anonymous ID token. Exiting client.")
                 return
             
-            # Create and send SDP offer to worker peer.
-            await self.pc.setLocalDescription(await self.pc.createOffer())
-            await websocket.send(json.dumps({
-                'type': self.pc.localDescription.type, # type: 'offer'
-                'sender': self.peer_id, # should be own peer_id (Zoom username)
-                'target': self.target_worker, # should match Worker's peer_id (Zoom username)
-                'sdp': self.pc.localDescription.sdp
-            }))
-            logging.info('Offer sent to worker')
+            logging.info(f"Anonymous ID token received: {id_token}")
 
-            # Handle incoming messages from server (e.g. answer from worker).
-            await self.handle_connection()
+            # No room creation needed for GUI Client since using Worker credentials.
+            # Only needs its own Cognito ID token and peer ID 
+            # Create the room and get the room ID and token.
+            # room_json = self.request_create_room(id_token)
+            # logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
 
-        # Exit.
-        await self.pc.close()
-        await websocket.close()
+            # Initate the WebSocket connection to the signaling server.
+            async with websockets.connect(f"{self.DNS}:{self.port_number}") as websocket:
+
+                # Initate the websocket for the GUI client (so other functions can use). 
+                self.websocket = websocket
+
+                # Prompt for session string.
+                if not session_string:
+                    session_str_json = None
+                    while True:
+                        session_string = input("Please enter RTC session string (or type 'exit' to quit): ")
+                        if session_string.lower() == "exit":
+                            print("Exiting client.")
+                            return
+                        try:
+                            session_str_json = self.parse_session_string(session_string)
+                            break  # Exit loop if parsing succeeds
+                        except ValueError as e:
+                            print(f"Error: {e}")
+                            print("Please try again or type 'exit' to quit.")
+                else:
+                    session_str_json = self.parse_session_string(session_string)
+                
+                # Extract worker credentials from session string.
+                worker_room_id = session_str_json.get("room_id")
+                worker_token = session_str_json.get("token")
+                worker_peer_id = session_str_json.get("peer_id")
+
+                # Register the client with the signaling server.
+                logging.info(f"Registering {self.peer_id} with signaling server...")
+                await self.websocket.send(json.dumps({
+                    'type': 'register', 
+                    'peer_id': self.peer_id, # should be own peer_id (Zoom username)
+                    'room_id': worker_room_id, # should match Worker's room_id (Zoom meeting ID)
+                    'token': worker_token, # should match Worker's token (Zoom meeting password)
+                    'id_token': id_token, # should be own Cognito ID token
+                }))
+                # await websocket.send(json.dumps({'type': 'register', 'peer_id': self.peer_id}))
+                logging.info(f"{self.peer_id} sent to signaling server for registration!")
+
+                # # Query for available workers.
+                # await websocket.send(json.dumps({'type': 'query'}))
+                # response = await websocket.recv()
+                # available_workers = json.loads(response)["peers"]
+                # logging.info(f"Available workers: {available_workers}")
+
+                # Select a worker to connect to.
+                # target_worker = available_workers[0] if available_workers else None
+
+                # self.peer_id should match Worker's peer_id (Zoom username).
+                self.target_worker = worker_peer_id
+                logging.info(f"Selected worker: {self.target_worker}")
+
+                if not self.target_worker:
+                    logging.info("No target worker given. Cannot connect.")
+                    return
+                
+                # Create and send SDP offer to worker peer.
+                await self.pc.setLocalDescription(await self.pc.createOffer())
+                await websocket.send(json.dumps({
+                    'type': self.pc.localDescription.type, # type: 'offer'
+                    'sender': self.peer_id, # should be own peer_id (Zoom username)
+                    'target': self.target_worker, # should match Worker's peer_id (Zoom username)
+                    'sdp': self.pc.localDescription.sdp
+                }))
+                logging.info('Offer sent to worker')
+
+                # Handle incoming messages from server (e.g. answer from worker).
+                await self.handle_connection()
+
+            # Send POST req to server to delete this User, Worker, and associated Room.
+            logging.info("Cleaning up Cognito and DynamoDB entries...")
+            self.request_peer_room_deletion(self.peer_id)
+
+            # # Exit.
+            # await self.pc.close()
+            # await websocket.close()
+        except Exception as e:
+            logging.error(f"Error in run_client: {e}")
+        finally:
+            await self.clean_exit()

@@ -51,11 +51,29 @@ class RTCWorkerClient:
         return f"sleap-session:{encoded}"
 
 
+    def request_peer_room_deletion(self, peer_id: str):
+        """Requests the signaling server to delete the room and associated user/worker."""
+        
+        url = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001/delete-peers-and-room"
+        json = {
+            "peer_id": peer_id,
+        }
+
+        # Pass the Cognito usernmae (peer_id) to identify which room/peers to delete.
+        response = requests.post(url, json=json)
+
+        if response.status_code == 200:
+            return # Success
+        else:
+            logging.error(f"Failed to delete room and peer: {response.text}")
+            return None
+
+
     def request_create_room(self, id_token):
         """Requests the signaling server to create a room and returns the room ID and token.
 
         Args:
-            id_token (str): Firebase ID token for authentication.
+            id_token (str): Cognito ID token for authentication.
         Returns:
             dict: Contains room_id and token if successful, otherwise raises an exception.
         """
@@ -82,7 +100,7 @@ class RTCWorkerClient:
         response = requests.post(url)
 
         if response.status_code == 200:
-            return response.json()["id_token"] # should be string type
+            return response.json() # should be string type
         else:
             logging.error(f"Failed to get anonymous token: {response.text}")
             return None
@@ -333,10 +351,17 @@ class RTCWorkerClient:
         """
 
         logging.info("Closing WebRTC connection...") 
-        await self.pc.close()
+        if self.pc:
+            await self.pc.close()
 
         logging.info("Closing websocket connection...")
-        await self.websocket.close()
+        if self.websocket:
+            await self.websocket.close()
+
+        logging.info("Cleaning up Cognito and DynamoDB entries...")
+        if self.cognito_username:
+            self.request_peer_room_deletion(self.cognito_username)
+            self.cognito_username = None
 
         logging.info("Client shutdown complete. Exiting...")
 
@@ -737,66 +762,73 @@ class RTCWorkerClient:
             logging.info("ICE connection is checking...")
             
 
-    async def run_worker(self, pc, peer_id: str, DNS: str, port_number):
+    async def run_worker(self, pc, DNS: str, port_number):
         """Main function to run the worker. Contains several event handlers for the WebRTC connection and data channel.
         
         Args:
             pc: RTCPeerConnection object
-            peer_id: ID of the worker peer
             DNS: DNS address of the signaling server
             port_number: Port number of the signaling server
         Returns:
             None
         """
+        try:
+            # Set the RTCPeerConnection object for the worker.
+            logging.info(f"Setting RTCPeerConnection...")
+            self.pc = pc
 
-        # Set the RTCPeerConnection object for the worker.
-        logging.info(f"Setting RTCPeerConnection for {peer_id}...")
-        self.pc = pc
+            # Register PeerConnection functions with PC object.
+            logging.info(f"Registering PeerConnection functions...")
+            self.pc.on("datachannel", self.on_datachannel)
+            self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
 
-        # Register PeerConnection functions with PC object.
-        logging.info(f"Registering PeerConnection functions for {peer_id}...")
-        self.pc.on("datachannel", self.on_datachannel)
-        self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
-
-        # Sign-in anonymously with AWS Cognito to get an ID token (str).
-        id_token = self.request_anonymous_signin()
+            # Sign-in anonymously with AWS Cognito to get an ID token (str).
+            sign_in_json = self.request_anonymous_signin()
+            id_token = sign_in_json['id_token']
+            peer_id = sign_in_json['username']
+            self.cognito_username = peer_id
+            
+            if not id_token:
+                logging.error("Failed to sign in anonymously. No ID token given. Exiting...")
+                return
+            
+            logging.info(f"Anonymous sign-in successful. ID token: {id_token}")
         
-        if not id_token:
-            logging.error("Failed to sign in anonymously. No ID token given. Exiting...")
-            return
-        
-        logging.info(f"Anonymous sign-in successful. ID token: {id_token}")
-       
-        # Create the room and get the room ID and token.
-        room_json = self.request_create_room(id_token)
+            # Create the room and get the room ID, token, and cognito username.
+            room_json = self.request_create_room(id_token)
 
-        if not room_json or 'room_id' not in room_json or 'token' not in room_json:
-            logging.error("Failed to create room or get room ID/token. Exiting...")
-            return
-        logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
+            if not room_json or 'room_id' not in room_json or 'token' not in room_json:
+                logging.error("Failed to create room or get room ID/token. Exiting...")
+                return
+            logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
 
-        # Establish a WebSocket connection to the signaling server.
-        logging.info(f"Connecting to signaling server at {DNS}:{port_number}...")
-        async with websockets.connect(f"{DNS}:{port_number}") as websocket:
+            # Establish a WebSocket connection to the signaling server.
+            logging.info(f"Connecting to signaling server at {DNS}:{port_number}...")
+            async with websockets.connect(f"{DNS}:{port_number}") as websocket:
 
-            # Set the WebSocket connection for the worker.
-            self.websocket = websocket
+                # Set the WebSocket connection for the worker.
+                self.websocket = websocket
 
-            # Register the worker with the server.
-            logging.info(f"Registering {peer_id} with signaling server...")
-            await self.websocket.send(json.dumps({
-                'type': 'register', 
-                'peer_id': peer_id, # identify a peer uniquely in the room (Zoom username)
-                'room_id': room_json['room_id'], # from backend API call for room identification (Zoom meeting ID)
-                'token': room_json['token'], # from backend API call for room joining (Zoom meeting password)
-                'id_token': id_token, # from anon. Cognito sign-in (Prevent peer spoofing, even anonymously)
-                # w/ id_token, only Cognito authenticated users can register.
-            }))
-            logging.info(f"{peer_id} sent to signaling server for registration!")
+                # Register the worker with the server.
+                logging.info(f"Registering {peer_id} with signaling server...")
+                await self.websocket.send(json.dumps({
+                    'type': 'register', 
+                    'peer_id': peer_id, # identify a peer uniquely in the room (Zoom username)
+                    'room_id': room_json['room_id'], # from backend API call for room identification (Zoom meeting ID)
+                    'token': room_json['token'], # from backend API call for room joining (Zoom meeting password)
+                    'id_token': id_token, # from anon. Cognito sign-in (Prevent peer spoofing, even anonymously)
+                    # w/ id_token, only Cognito authenticated users can register.
+                }))
+                logging.info(f"{peer_id} sent to signaling server for registration!")
 
-            # Handle incoming messages from server (e.g. answers).
-            await self.handle_connection(self.pc, self.websocket, peer_id)
-            logging.info(f"{peer_id} connected with client!")
+                # Handle incoming messages from server (e.g. answers).
+                await self.handle_connection(self.pc, self.websocket, peer_id)
+                logging.info(f"{peer_id} connected with client!")
+        except Exception as e:
+            logging.error(f"Error in run_worker: {e}")
+        finally:
+            await self.clean_exit()
+
 
 if __name__ == "__main__":
     # Create the worker instance.
@@ -806,14 +838,14 @@ if __name__ == "__main__":
     pc = RTCPeerConnection()
 
     # Generate a unique peer ID for the worker.
-    peer_id = f"worker-{uuid.uuid4()}"
+    # peer_id = f"worker-{uuid.uuid4()}"
 
     # Run the worker 
     try:
         asyncio.run(
             worker.run_worker(
                 pc=pc,
-                peer_id=peer_id,
+                # peer_id=peer_id,
                 DNS="ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
                 port_number=8080
             )
