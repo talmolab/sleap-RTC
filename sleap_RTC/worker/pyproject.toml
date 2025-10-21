@@ -10,7 +10,7 @@ dependencies = [
     "pyzmq",
     "requests",
     "websockets",
-    "sleap-nn[torch]",
+    # "sleap-nn[torch]",
 ]
 
 [project.optional-dependencies]
