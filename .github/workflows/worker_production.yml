@@ -38,6 +38,18 @@ jobs:
           sanitized_platform="${sanitized_platform/\//-}" # Replace / with -
           echo "sanitized_platform=$sanitized_platform" >> $GITHUB_OUTPUT
 
+      # Free up ~30GB of disk space by removing unused tools
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
       - name: Set up Docker Buildx
         # https://github.com/docker/setup-buildx-action
         uses: docker/setup-buildx-action@v3

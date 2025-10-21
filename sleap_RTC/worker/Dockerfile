@@ -7,13 +7,11 @@ WORKDIR /app
 # Set non-interactive mode
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install sleap-rtc specific packages not in base image
+# Install sleap-rtc specific packages not in base image and clean up in one layer
 RUN apt-get update && apt-get install -y --no-install-recommends \
     zip unzip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Clean up apt cache and unnecessary files to free space
-RUN apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Add WebRTC and communication dependencies to existing virtual environment
 # sleap-nn is already installed in base image, so we only add worker-specific packages
