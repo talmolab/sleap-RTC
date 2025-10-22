@@ -1,5 +1,5 @@
 # Base image with sleap-nn and GPU support (cu128)
-FROM ghcr.io/talmolab/sleap-nn-cuda:linux-amd64-cc6006114d9aec1bfac5e624ccc193a7692e288e-test
+FROM ghcr.io/talmolab/sleap-nn-cuda:linux-amd64-5476ba636dd8f4c8a701876e62f1904f0ada5a89-test
 
 # Set working directory
 WORKDIR /app
