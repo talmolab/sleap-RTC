@@ -255,9 +255,6 @@ class RTCWorkerClient:
             None
         """
 
-        if dir_path is None:
-            dir_path = self.save_dir
-
         logging.info("Zipping results...")
         if Path(dir_path):
             try:
@@ -270,7 +267,7 @@ class RTCWorkerClient:
             logging.info(f"{dir_path} does not exist!")
             return
 
-    async def unzip_results(self, file_path: str, dir_path: str = None):
+    async def unzip_results(self, file_path: str):
         """Unzips the contents of the given file path.
 
         Args:
@@ -279,16 +276,13 @@ class RTCWorkerClient:
             None
         """
 
-        if dir_path is None:
-            logging.info("No directory path given. Using save_dir instead.")
-            dir_path = self.save_dir
-
         logging.info("Unzipping results...")
         if Path(file_path):
             try:
-                shutil.unpack_archive(file_path, dir_path)
-                logging.info(f"Results unzipped from {file_path}")
-                logging.info(f"Unzipped contents to {dir_path}")
+                shutil.unpack_archive(file_path, self.save_dir)
+                logging.info(f"Results unzipped from {file_path} to {self.save_dir}")
+                self.unzipped_dir = f"{self.save_dir}/{file_path.split(".")[0]}"
+                logging.info(f"Unzipped contents to {self.unzipped_dir}")
             except Exception as e:
                 logging.error(f"Error unzipping results: {e}")
                 return
