@@ -24,7 +24,6 @@ logging.basicConfig(level=logging.INFO)
 class RTCWorkerClient:
     def __init__(self, chunk_size=32 * 1024):
         # Use /app/shared_data in production, current dir + shared_data in dev
-        logging.info("Using app/shared_data as save directory.")
         self.save_dir = "."
         self.chunk_size = chunk_size
         self.received_files = {}
@@ -101,25 +100,26 @@ class RTCWorkerClient:
             return None
 
 
-    def parse_training_script(self, training_script_path: str):
+    def parse_training_script(self, train_script_path: str):
         jobs = []
-        # Updated pattern to match both 'sleap-train' and 'sleap-nn train' commands
+        # Updated pattern to match 'sleap-nn train' and extract --config-name
+        # Example: sleap-nn train --config-name centroid.yaml...
         pattern = re.compile(r"^\s*sleap-(?:nn\s+)?train\s+.*--config-name\s+(\S+)")
 
-        with open(training_script_path, "r") as f:
+        with open(train_script_path, "r") as f:
             for line in f:
                 match = pattern.match(line)
                 if match:
                     config_name = match.group(1)
                     # For sleap-nn, we don't need separate labels file - it's configured in the YAML
-                    jobs.append((config_name, None))
+                    jobs.append(config_name)
         return jobs
 
 
-    async def run_all_training_jobs(self, channel: RTCDataChannel, train_script_path: str, save_dir: str):
+    async def run_all_training_jobs(self, channel: RTCDataChannel, train_script_path: str):
         training_jobs = self.parse_training_script(train_script_path)
 
-        for config_name, labels_name in training_jobs:
+        for config_name in training_jobs:
             job_name = Path(config_name).stem
 
             # Send RTC msg over channel to indicate job start.
@@ -127,9 +127,8 @@ class RTCWorkerClient:
             channel.send(f"TRAIN_JOB_START::{job_name}")
 
             # Use sleap-nn train command for newer SLEAP versions
-            # Run directly in the extracted directory with current directory as config-dir
+            # Run directly in the extracted directory with config-dir from training script
             cmd = [
-                "uv", "run",
                 "sleap-nn", "train",
                 "--config-name", config_name,
                 "--config-dir", ".",
@@ -139,32 +138,12 @@ class RTCWorkerClient:
                 "trainer_config.zmq.publish_port=9001"
             ]
             logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.zip_dir})")
-            logging.info(f"Working directory exists: {os.path.exists(self.zip_dir)}")
-            logging.info(f"Config files in directory: {os.listdir(self.zip_dir)}")
-
-            # Force unbuffered output and simulate terminal environment
-            env = {
-                **os.environ, 
-                "PYTHONUNBUFFERED": "1", 
-                "FORCE_COLOR": "1",
-                "TERM": "xterm-256color",  # Simulate terminal
-                "COLUMNS": "80",           # Set terminal width
-                "LINES": "24"              # Set terminal height
-            }
-            
-            # Copy to container-local storage for better performance on Mac/Docker
-            # This avoids slow bind-mount I/O
-            container_work_dir = f"/tmp/sleap_work_{job_name}"
-            if not os.path.exists(container_work_dir):
-                shutil.copytree(self.zip_dir, container_work_dir)
-                logging.info(f"Copied files to container-local storage: {container_work_dir}")
             
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                cwd=container_work_dir,  # Use container-local directory (much faster)
-                env=env
+                cwd=self.unzipped_dir # run this command in the extracted directory
             )
 
             assert process.stdout is not None
@@ -193,24 +172,6 @@ class RTCWorkerClient:
                 logging.warning(f"[FAILED] Job {job_name} exited with code {process.returncode}.")
                 if channel.readyState == "open":
                     channel.send(f"TRAIN_JOB_ERROR::{job_name}::{process.returncode}")
-
-            # try:
-            #     subprocess.run([
-            #         "sleap-train",
-            #         config_name,
-            #         labels_name,
-            #         "--zmq",
-            #         "--controller_port",
-            #         "9000",
-            #         "--publish_port",
-            #         "9001"
-            #     ], check=True)
-            # except subprocess.CalledProcessError as e:
-            #     channel.send(f"TRAIN_JOB_ERROR::{job_name}::{e.stderr}")
-            #     logging.error(f"Training job {job_name} failed with error: {e.stderr}")
-            #     continue
-
-            # channel.send(f"TRAIN_JOB_END::{job_name}")
 
         channel.send("TRAINING_JOBS_DONE")
 
