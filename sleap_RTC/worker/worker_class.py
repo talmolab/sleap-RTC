@@ -575,21 +575,13 @@ class RTCWorkerClient:
 
                     # Unzip results if needed.
                     if file_path.endswith(".zip"):
-                        await self.unzip_results(file_path, self.save_dir)
+                        await self.unzip_results(file_path)
                         logging.info(f"Unzipped results from {file_path}")
 
                     # Reset dictionary for next file and train model.
                     self.received_files.clear()
-
-                    # Remove .zip extension from file_path to get directory name
-                    if file_path.endswith(".zip"):
-                        extracted_dir = os.path.splitext(os.path.basename(file_path))[0]
-                    else:
-                        extracted_dir = os.path.basename(file_path)
-
-                    self.zip_dir = os.path.join(self.save_dir, extracted_dir)
                     
-                    train_script_path = os.path.join(self.zip_dir, "train-script.sh")
+                    train_script_path = os.path.join(self.unzipped_dir, "train-script.sh")
 
                     if Path(train_script_path):
                         try:
@@ -615,7 +607,7 @@ class RTCWorkerClient:
                             os.chmod(train_script_path, os.stat(train_script_path).st_mode | stat.S_IEXEC)
 
                             # Run the training script in the save directory
-                            await self.run_all_training_jobs(channel, train_script_path=train_script_path, save_dir=self.save_dir)
+                            await self.run_all_training_jobs(channel, train_script_path=train_script_path)
 
                             # Finish training.
                             logging.info("Training completed successfully.")
@@ -625,7 +617,8 @@ class RTCWorkerClient:
                             # Zip the results.
                             logging.info("Zipping results...")
                             zipped_file_name = f"trained_{file_name}"
-                            await self.zip_results(zipped_file_name, f"{self.save_dir}/{self.output_dir}") # normally, "/app/shared_data /models"
+                            await self.zip_results(zipped_file_name, f"{self.unzipped_dir}/{self.output_dir}") # normally, "./labels_dir/models"
+                            # Zipped file saved to current directory.
 
                             # Send the zipped file to the client.
                             logging.info(f"Sending zipped file to client: {zipped_file_name}")
