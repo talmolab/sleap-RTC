@@ -22,15 +22,10 @@ from websockets.client import ClientConnection
 logging.basicConfig(level=logging.INFO)
 
 class RTCWorkerClient:
-    def __init__(self, remote_save_dir="app/shared_data", chunk_size=32 * 1024):
+    def __init__(self, chunk_size=32 * 1024):
         # Use /app/shared_data in production, current dir + shared_data in dev
-        if os.path.exists("app/shared_data"):
-            logging.info("Using app/shared_data as save directory.")
-            self.save_dir = remote_save_dir
-        else:
-            logging.info("Using current working directory + shared_data as save directory.")
-            self.save_dir = os.path.join(os.getcwd(), "app/shared_data")
-            os.makedirs(self.save_dir, exist_ok=True)
+        logging.info("Using app/shared_data as save directory.")
+        self.save_dir = "."
         self.chunk_size = chunk_size
         self.received_files = {}
         self.output_dir = ""
