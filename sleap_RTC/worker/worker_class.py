@@ -22,15 +22,9 @@ from websockets.client import ClientConnection
 logging.basicConfig(level=logging.INFO)
 
 class RTCWorkerClient:
-    def __init__(self, remote_save_dir="app/shared_data", chunk_size=32 * 1024):
+    def __init__(self, chunk_size=32 * 1024):
         # Use /app/shared_data in production, current dir + shared_data in dev
-        if os.path.exists("app/shared_data"):
-            logging.info("Using app/shared_data as save directory.")
-            self.save_dir = remote_save_dir
-        else:
-            logging.info("Using current working directory + shared_data as save directory.")
-            self.save_dir = os.path.join(os.getcwd(), "app/shared_data")
-            os.makedirs(self.save_dir, exist_ok=True)
+        self.save_dir = "."
         self.chunk_size = chunk_size
         self.received_files = {}
         self.output_dir = ""
@@ -106,25 +100,26 @@ class RTCWorkerClient:
             return None
 
 
-    def parse_training_script(self, training_script_path: str):
+    def parse_training_script(self, train_script_path: str):
         jobs = []
-        # Updated pattern to match both 'sleap-train' and 'sleap-nn train' commands
+        # Updated pattern to match 'sleap-nn train' and extract --config-name
+        # Example: sleap-nn train --config-name centroid.yaml...
         pattern = re.compile(r"^\s*sleap-(?:nn\s+)?train\s+.*--config-name\s+(\S+)")
 
-        with open(training_script_path, "r") as f:
+        with open(train_script_path, "r") as f:
             for line in f:
                 match = pattern.match(line)
                 if match:
                     config_name = match.group(1)
                     # For sleap-nn, we don't need separate labels file - it's configured in the YAML
-                    jobs.append((config_name, None))
+                    jobs.append(config_name)
         return jobs
 
 
-    async def run_all_training_jobs(self, channel: RTCDataChannel, train_script_path: str, save_dir: str):
+    async def run_all_training_jobs(self, channel: RTCDataChannel, train_script_path: str):
         training_jobs = self.parse_training_script(train_script_path)
 
-        for config_name, labels_name in training_jobs:
+        for config_name in training_jobs:
             job_name = Path(config_name).stem
 
             # Send RTC msg over channel to indicate job start.
@@ -132,9 +127,8 @@ class RTCWorkerClient:
             channel.send(f"TRAIN_JOB_START::{job_name}")
 
             # Use sleap-nn train command for newer SLEAP versions
-            # Run directly in the extracted directory with current directory as config-dir
+            # Run directly in the extracted directory with config-dir from training script
             cmd = [
-                "uv", "run",
                 "sleap-nn", "train",
                 "--config-name", config_name,
                 "--config-dir", ".",
@@ -144,32 +138,12 @@ class RTCWorkerClient:
                 "trainer_config.zmq.publish_port=9001"
             ]
             logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.zip_dir})")
-            logging.info(f"Working directory exists: {os.path.exists(self.zip_dir)}")
-            logging.info(f"Config files in directory: {os.listdir(self.zip_dir)}")
-
-            # Force unbuffered output and simulate terminal environment
-            env = {
-                **os.environ, 
-                "PYTHONUNBUFFERED": "1", 
-                "FORCE_COLOR": "1",
-                "TERM": "xterm-256color",  # Simulate terminal
-                "COLUMNS": "80",           # Set terminal width
-                "LINES": "24"              # Set terminal height
-            }
-            
-            # Copy to container-local storage for better performance on Mac/Docker
-            # This avoids slow bind-mount I/O
-            container_work_dir = f"/tmp/sleap_work_{job_name}"
-            if not os.path.exists(container_work_dir):
-                shutil.copytree(self.zip_dir, container_work_dir)
-                logging.info(f"Copied files to container-local storage: {container_work_dir}")
             
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                cwd=container_work_dir,  # Use container-local directory (much faster)
-                env=env
+                cwd=self.unzipped_dir # run this command in the extracted directory
             )
 
             assert process.stdout is not None
@@ -198,24 +172,6 @@ class RTCWorkerClient:
                 logging.warning(f"[FAILED] Job {job_name} exited with code {process.returncode}.")
                 if channel.readyState == "open":
                     channel.send(f"TRAIN_JOB_ERROR::{job_name}::{process.returncode}")
-
-            # try:
-            #     subprocess.run([
-            #         "sleap-train",
-            #         config_name,
-            #         labels_name,
-            #         "--zmq",
-            #         "--controller_port",
-            #         "9000",
-            #         "--publish_port",
-            #         "9001"
-            #     ], check=True)
-            # except subprocess.CalledProcessError as e:
-            #     channel.send(f"TRAIN_JOB_ERROR::{job_name}::{e.stderr}")
-            #     logging.error(f"Training job {job_name} failed with error: {e.stderr}")
-            #     continue
-
-            # channel.send(f"TRAIN_JOB_END::{job_name}")
 
         channel.send("TRAINING_JOBS_DONE")
 
@@ -299,9 +255,6 @@ class RTCWorkerClient:
             None
         """
 
-        if dir_path is None:
-            dir_path = self.save_dir
-
         logging.info("Zipping results...")
         if Path(dir_path):
             try:
@@ -314,7 +267,7 @@ class RTCWorkerClient:
             logging.info(f"{dir_path} does not exist!")
             return
 
-    async def unzip_results(self, file_path: str, dir_path: str = None):
+    async def unzip_results(self, file_path: str):
         """Unzips the contents of the given file path.
 
         Args:
@@ -323,16 +276,13 @@ class RTCWorkerClient:
             None
         """
 
-        if dir_path is None:
-            logging.info("No directory path given. Using save_dir instead.")
-            dir_path = self.save_dir
-
         logging.info("Unzipping results...")
         if Path(file_path):
             try:
-                shutil.unpack_archive(file_path, dir_path)
-                logging.info(f"Results unzipped from {file_path}")
-                logging.info(f"Unzipped contents to {dir_path}")
+                shutil.unpack_archive(file_path, self.save_dir)
+                logging.info(f"Results unzipped from {file_path} to {self.save_dir}")
+                self.unzipped_dir = f"{self.save_dir}/{file_path.split(".")[0]}"
+                logging.info(f"Unzipped contents to {self.unzipped_dir}")
             except Exception as e:
                 logging.error(f"Error unzipping results: {e}")
                 return
@@ -625,21 +575,13 @@ class RTCWorkerClient:
 
                     # Unzip results if needed.
                     if file_path.endswith(".zip"):
-                        await self.unzip_results(file_path, self.save_dir)
+                        await self.unzip_results(file_path)
                         logging.info(f"Unzipped results from {file_path}")
 
                     # Reset dictionary for next file and train model.
                     self.received_files.clear()
-
-                    # Remove .zip extension from file_path to get directory name
-                    if file_path.endswith(".zip"):
-                        extracted_dir = os.path.splitext(os.path.basename(file_path))[0]
-                    else:
-                        extracted_dir = os.path.basename(file_path)
-
-                    self.zip_dir = os.path.join(self.save_dir, extracted_dir)
                     
-                    train_script_path = os.path.join(self.zip_dir, "train-script.sh")
+                    train_script_path = os.path.join(self.unzipped_dir, "train-script.sh")
 
                     if Path(train_script_path):
                         try:
@@ -665,7 +607,7 @@ class RTCWorkerClient:
                             os.chmod(train_script_path, os.stat(train_script_path).st_mode | stat.S_IEXEC)
 
                             # Run the training script in the save directory
-                            await self.run_all_training_jobs(channel, train_script_path=train_script_path, save_dir=self.save_dir)
+                            await self.run_all_training_jobs(channel, train_script_path=train_script_path)
 
                             # Finish training.
                             logging.info("Training completed successfully.")
@@ -675,7 +617,8 @@ class RTCWorkerClient:
                             # Zip the results.
                             logging.info("Zipping results...")
                             zipped_file_name = f"trained_{file_name}"
-                            await self.zip_results(zipped_file_name, f"{self.save_dir}/{self.output_dir}") # normally, "/app/shared_data /models"
+                            await self.zip_results(zipped_file_name, f"{self.unzipped_dir}/{self.output_dir}") # normally, "./labels_dir/models"
+                            # Zipped file saved to current directory.
 
                             # Send the zipped file to the client.
                             logging.info(f"Sending zipped file to client: {zipped_file_name}")
