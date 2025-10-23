@@ -15,9 +15,6 @@ def run_RTCworker():
     # Create the RTCPeerConnection object.
     pc = RTCPeerConnection()
 
-    # Generate a unique peer ID for the worker.
-    peer_id = f"worker-{uuid.uuid4()}"
-
     # Run the worker.
     try:
         asyncio.run(
