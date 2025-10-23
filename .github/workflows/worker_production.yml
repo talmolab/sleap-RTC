@@ -1,4 +1,4 @@
-name: Build and Push sleap-rtc-worker (Test Workflow)
+name: Build and Push sleap-rtc-worker (Production Workflow)
 
 on:
   push:
@@ -69,8 +69,9 @@ jobs:
           file: ./sleap_RTC/worker/Dockerfile # Path to Dockerfile wrt the root of the repository
           platforms: ${{ matrix.platform }}
           push: true # Push the image to Docker Hub
-          # Tags all include "-test" to differentiate from production images
+          # Tags all include "-production" to differentiate from test images
           tags: |
-            ghcr.io/${{ github.repository_owner }}/sleap-rtc-worker:${{ steps.sanitize_platform.outputs.sanitized_platform }}-test
-            ghcr.io/${{ github.repository_owner }}/sleap-rtc-worker:${{ steps.sanitize_platform.outputs.sanitized_platform }}-sleap-cuda-test
+            ghcr.io/${{ github.repository_owner }}/sleap-rtc-worker:latest
+            ghcr.io/${{ github.repository_owner }}/sleap-rtc-worker:${{ steps.sanitize_platform.outputs.sanitized_platform }}
+            ghcr.io/${{ github.repository_owner }}/sleap-rtc-worker:${{ steps.sanitize_platform.outputs.sanitized_platform }}-sleap-rtc-worker-cuda
             ghcr.io/${{ github.repository_owner }}/sleap-rtc-worker:${{ steps.sanitize_platform.outputs.sanitized_platform }}-${{ steps.get_sha.outputs.sha }}-test	
