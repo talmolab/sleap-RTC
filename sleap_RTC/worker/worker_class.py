@@ -135,9 +135,9 @@ class RTCWorkerClient:
                 "trainer_config.ckpt_dir=models",
                 f"trainer_config.run_name={job_name}",
                 "trainer_config.zmq.controller_port=9000",
-                "trainer_config.zmq.publish_port=9001"
+                "trainer_config.zmq.publish_port=9001",
             ]
-            logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.zip_dir})")
+            logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.unzipped_dir})")
             
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -281,7 +281,7 @@ class RTCWorkerClient:
             try:
                 shutil.unpack_archive(file_path, self.save_dir)
                 logging.info(f"Results unzipped from {file_path} to {self.save_dir}")
-                self.unzipped_dir = f"{self.save_dir}/{file_path.split(".")[0]}"
+                self.unzipped_dir = f"{self.save_dir}/{file_path[:-4]}"  # remove .zip extension
                 logging.info(f"Unzipped contents to {self.unzipped_dir}")
             except Exception as e:
                 logging.error(f"Error unzipping results: {e}")
@@ -591,15 +591,16 @@ class RTCWorkerClient:
                             # Start ZMQ progress listener.
                             # Don't need to send ZMQ progress reports if User just using CLI sleap-rtc.
                             # (Will print sleap-nn train logs directly to terminal instead.)
-                            progress_listener_task = asyncio.create_task(self.start_progress_listener(channel))
-                            logging.info(f'{channel.label} progress listener started')
+                            if self.gui:
+                                progress_listener_task = asyncio.create_task(self.start_progress_listener(channel))
+                                logging.info(f'{channel.label} progress listener started')
 
-                            # Start ZMQ control socket.
-                            self.start_zmq_control()
-                            logging.info(f'{channel.label} ZMQ control socket started')
-                            
-                            # Give SUB socket time to connect.
-                            await asyncio.sleep(1)
+                                # Start ZMQ control socket.
+                                self.start_zmq_control()
+                                logging.info(f'{channel.label} ZMQ control socket started')
+                                
+                                # Give SUB socket time to connect.
+                                await asyncio.sleep(1)
 
                             logging.info(f"Running training script: {train_script_path}")
 
