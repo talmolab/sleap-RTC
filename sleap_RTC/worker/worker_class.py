@@ -162,7 +162,7 @@ class RTCWorkerClient:
                 #             channel.send(f"TRAIN_LOG:{decoded_line}")
                 #         except Exception as e:
                 #             logging.error(f"Failed to send log line: {e}")
-                buffer = b""
+                buf = b""
                 try:
                     while True:
                         chunk = await process.stdout.read(read_size)
