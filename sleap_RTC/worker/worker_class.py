@@ -21,6 +21,9 @@ from websockets.client import ClientConnection
 # Setup logging.
 logging.basicConfig(level=logging.INFO)
 
+# Set chunk separator
+SEP = re.compile(rb'[\r\n]')
+
 class RTCWorkerClient:
     def __init__(self, chunk_size=32 * 1024):
         # Use /app/shared_data in production, current dir + shared_data in dev
@@ -143,21 +146,71 @@ class RTCWorkerClient:
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                cwd=self.unzipped_dir # run this command in the extracted directory
+                cwd=self.unzipped_dir, # run this command in the extracted directory
+                env={**os.environ, "PYTHONUNBUFFERED": "1"}
             )
 
             assert process.stdout is not None
             logging.info(f"Process started with PID: {process.pid}")
 
-            async def stream_logs():
-                async for line in process.stdout:
-                    decoded_line = line.decode().rstrip()
+            async def stream_logs(emit_on_cr=True, read_size=512, max_flush=64*1024):
+                # async for line in process.stdout:
+                #     decoded_line = line.decode().rstrip()
 
-                    if channel.readyState == "open":
-                        try:
-                            channel.send(f"TRAIN_LOG:{decoded_line}")
-                        except Exception as e:
-                            logging.error(f"Failed to send log line: {e}")
+                #     if channel.readyState == "open":
+                #         try:
+                #             channel.send(f"TRAIN_LOG:{decoded_line}")
+                #         except Exception as e:
+                #             logging.error(f"Failed to send log line: {e}")
+                buffer = b""
+                try:
+                    while True:
+                        chunk = await process.stdout.read(read_size)
+                        if not chunk:
+                            # process ended; flush any remaining text as a final line
+                            if buf:
+                                await channel.send(buf.decode(errors="replace") + "\n")
+                            break
+
+                        buf += chunk
+
+                        while True:
+                            m = SEP.search(buf)
+                            if not m:
+                                # If tqdm keeps extending one long line, occasionally flush
+                                if len(buf) > max_flush:
+                                    text = buf.decode(errors="replace")
+                                    if emit_on_cr and text:
+                                        # send as a CR-style redraw
+                                        await channel.send("\r" + text)
+                                    buf = b""
+                                break
+
+                            sep = buf[m.start():m.end()]     # b'\n' or b'\r'
+                            payload = buf[:m.start()]
+                            buf = buf[m.end():]
+
+                            text = payload.decode(errors="replace")
+                            if not text:
+                                continue
+
+                            if sep == b'\n':
+                                # NORMAL LOG LINE: preserve newline so your client appends it
+                                await channel.send(text + "\n")
+                            else:  # sep == b'\r'
+                                if emit_on_cr:
+                                    # PROGRESS REDRAW: send a carriage-return update
+                                    # Client should treat this as "replace current progress line"
+                                    await channel.send("\r" + text)
+
+                except Exception as e:
+                    logging.exception("stream_logs failed: %s", e)
+                    # Optional: notify client without crashing the emitter
+                    try:
+                        await channel.send(f"[log-stream error] {e}\n")
+                    except Exception:
+                        pass
+
 
             await stream_logs()
             logging.info("Waiting for process to complete...")
