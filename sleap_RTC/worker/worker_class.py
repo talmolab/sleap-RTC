@@ -312,7 +312,7 @@ class RTCWorkerClient:
         logging.info("Zipping results...")
         if Path(dir_path):
             try:
-                shutil.make_archive(file_name.split(".")[0], 'zip', dir_path)
+                shutil.make_archive(file_name, 'zip', dir_path)
                 logging.info(f"Results zipped to {file_name}")
             except Exception as e:
                 logging.error(f"Error zipping results: {e}")
@@ -672,7 +672,7 @@ class RTCWorkerClient:
 
                             # Zip the results.
                             logging.info("Zipping results...")
-                            zipped_file_name = f"trained_{file_name}"
+                            zipped_file_name = f"trained_{self.original_file_name}"
                             await self.zip_results(zipped_file_name, f"{self.unzipped_dir}/{self.output_dir}") # normally, "./labels_dir/models"
                             # Zipped file saved to current directory.
 
