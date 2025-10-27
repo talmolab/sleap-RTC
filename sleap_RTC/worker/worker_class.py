@@ -281,7 +281,7 @@ class RTCWorkerClient:
             try:
                 shutil.unpack_archive(file_path, self.save_dir)
                 logging.info(f"Results unzipped from {file_path} to {self.save_dir}")
-                self.unzipped_dir = f"{self.save_dir}/{file_path[:-4]}"  # remove .zip extension
+                self.unzipped_dir = f"{self.save_dir}/{self.original_file_name[:-4]}"  # remove .zip extension
                 logging.info(f"Unzipped contents to {self.unzipped_dir}")
             except Exception as e:
                 logging.error(f"Error unzipping results: {e}")
@@ -567,6 +567,7 @@ class RTCWorkerClient:
 
                     # File transfer complete, save to disk.
                     file_name, file_data = list(self.received_files.items())[0]
+                    self.original_file_name = file_name
                     file_path = os.path.join(self.save_dir, file_name)
 
                     with open(file_path, "wb") as file:
