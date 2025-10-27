@@ -139,6 +139,7 @@ class RTCWorkerClient:
                 f"trainer_config.run_name={job_name}",
                 "trainer_config.zmq.controller_port=9000",
                 "trainer_config.zmq.publish_port=9001",
+                # "trainer_config.enable_progress_bar=false"
             ]
             logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.unzipped_dir})")
             
@@ -169,7 +170,7 @@ class RTCWorkerClient:
                         if not chunk:
                             # process ended; flush any remaining text as a final line
                             if buf:
-                                await channel.send(buf.decode(errors="replace") + "\n")
+                                channel.send(buf.decode(errors="replace") + "\n")
                             break
 
                         buf += chunk
@@ -182,7 +183,7 @@ class RTCWorkerClient:
                                     text = buf.decode(errors="replace")
                                     if emit_on_cr and text:
                                         # send as a CR-style redraw
-                                        await channel.send("\r" + text)
+                                        channel.send("\r" + text)
                                     buf = b""
                                 break
 
@@ -196,18 +197,18 @@ class RTCWorkerClient:
 
                             if sep == b'\n':
                                 # NORMAL LOG LINE: preserve newline so your client appends it
-                                await channel.send(text + "\n")
+                                channel.send(text + "\n")
                             else:  # sep == b'\r'
                                 if emit_on_cr:
                                     # PROGRESS REDRAW: send a carriage-return update
                                     # Client should treat this as "replace current progress line"
-                                    await channel.send("\r" + text)
+                                    channel.send("\r" + text)
 
                 except Exception as e:
                     logging.exception("stream_logs failed: %s", e)
                     # Optional: notify client without crashing the emitter
                     try:
-                        await channel.send(f"[log-stream error] {e}\n")
+                        channel.send(f"[log-stream error] {e}\n")
                     except Exception:
                         pass
 
