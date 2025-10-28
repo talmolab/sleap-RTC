@@ -410,6 +410,7 @@ class RTCClient:
             
             if message == "END_OF_FILE":
                 # File transfer complete, save to disk.
+                logging.info("File transfer complete. Saving file to disk...")
                 file_name, file_data = list(self.received_files.items())[0]
 
                 try:
@@ -598,7 +599,7 @@ class RTCClient:
     async def run_client(
             self, 
             file_path: str = None, 
-            output_dir: str = "", 
+            output_dir: str = ".", 
             zmq_ports: list = None, 
             config_info_list: list = None,
             session_string: str = None
