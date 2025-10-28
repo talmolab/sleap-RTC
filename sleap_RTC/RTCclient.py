@@ -26,7 +26,7 @@ def run_RTCclient(session_string: str, pkg_path: str, zmq_ports: dict, **kwargs)
     # For now, we'll pass pkg_path as file_path
     method_kwargs = {
         'file_path': pkg_path,
-        'output_dir': '',
+        'output_dir': '.',
         'zmq_ports': [zmq_ports.get('controller', 9000), zmq_ports.get('publish', 9001)],  # Convert dict to list
         'config_info_list': None, # None since CLI (used for updating LossViewer)
         # 'win': None, # None since CLI

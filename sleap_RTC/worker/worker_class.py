@@ -21,6 +21,9 @@ from websockets.client import ClientConnection
 # Setup logging.
 logging.basicConfig(level=logging.INFO)
 
+# Set chunk separator
+SEP = re.compile(rb'[\r\n]')
+
 class RTCWorkerClient:
     def __init__(self, chunk_size=32 * 1024):
         # Use /app/shared_data in production, current dir + shared_data in dev
@@ -135,29 +138,80 @@ class RTCWorkerClient:
                 "trainer_config.ckpt_dir=models",
                 f"trainer_config.run_name={job_name}",
                 "trainer_config.zmq.controller_port=9000",
-                "trainer_config.zmq.publish_port=9001"
+                "trainer_config.zmq.publish_port=9001",
+                # "trainer_config.enable_progress_bar=false"
             ]
-            logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.zip_dir})")
+            logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.unzipped_dir})")
             
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                cwd=self.unzipped_dir # run this command in the extracted directory
+                cwd=self.unzipped_dir, # run this command in the extracted directory
+                env={**os.environ, "PYTHONUNBUFFERED": "1"}
             )
 
             assert process.stdout is not None
             logging.info(f"Process started with PID: {process.pid}")
 
-            async def stream_logs():
-                async for line in process.stdout:
-                    decoded_line = line.decode().rstrip()
+            async def stream_logs(emit_on_cr=True, read_size=512, max_flush=64*1024):
+                # async for line in process.stdout:
+                #     decoded_line = line.decode().rstrip()
 
-                    if channel.readyState == "open":
-                        try:
-                            channel.send(f"TRAIN_LOG:{decoded_line}")
-                        except Exception as e:
-                            logging.error(f"Failed to send log line: {e}")
+                #     if channel.readyState == "open":
+                #         try:
+                #             channel.send(f"TRAIN_LOG:{decoded_line}")
+                #         except Exception as e:
+                #             logging.error(f"Failed to send log line: {e}")
+                buf = b""
+                try:
+                    while True:
+                        chunk = await process.stdout.read(read_size)
+                        if not chunk:
+                            # process ended; flush any remaining text as a final line
+                            if buf:
+                                channel.send(buf.decode(errors="replace") + "\n")
+                            break
+
+                        buf += chunk
+
+                        while True:
+                            m = SEP.search(buf)
+                            if not m:
+                                # If tqdm keeps extending one long line, occasionally flush
+                                if len(buf) > max_flush:
+                                    text = buf.decode(errors="replace")
+                                    if emit_on_cr and text:
+                                        # send as a CR-style redraw
+                                        channel.send("\r" + text)
+                                    buf = b""
+                                break
+
+                            sep = buf[m.start():m.end()]     # b'\n' or b'\r'
+                            payload = buf[:m.start()]
+                            buf = buf[m.end():]
+
+                            text = payload.decode(errors="replace")
+                            if not text:
+                                continue
+
+                            if sep == b'\n':
+                                # NORMAL LOG LINE: preserve newline so your client appends it
+                                channel.send(text + "\n")
+                            else:  # sep == b'\r'
+                                if emit_on_cr:
+                                    # PROGRESS REDRAW: send a carriage-return update
+                                    # Client should treat this as "replace current progress line"
+                                    channel.send("\r" + text)
+
+                except Exception as e:
+                    logging.exception("stream_logs failed: %s", e)
+                    # Optional: notify client without crashing the emitter
+                    try:
+                        channel.send(f"[log-stream error] {e}\n")
+                    except Exception:
+                        pass
+
 
             await stream_logs()
             logging.info("Waiting for process to complete...")
@@ -258,8 +312,9 @@ class RTCWorkerClient:
         logging.info("Zipping results...")
         if Path(dir_path):
             try:
-                shutil.make_archive(file_name.split(".")[0], 'zip', dir_path)
-                logging.info(f"Results zipped to {file_name}")
+                shutil.make_archive(file_name, 'zip', dir_path)
+                self.zipped_file = f"{file_name}.zip"
+                logging.info(f"Results zipped to {self.zipped_file}")
             except Exception as e:
                 logging.error(f"Error zipping results: {e}")
                 return
@@ -281,7 +336,7 @@ class RTCWorkerClient:
             try:
                 shutil.unpack_archive(file_path, self.save_dir)
                 logging.info(f"Results unzipped from {file_path} to {self.save_dir}")
-                self.unzipped_dir = f"{self.save_dir}/{file_path.split(".")[0]}"
+                self.unzipped_dir = f"{self.save_dir}/{self.original_file_name[:-4]}"  # remove .zip extension
                 logging.info(f"Unzipped contents to {self.unzipped_dir}")
             except Exception as e:
                 logging.error(f"Error unzipping results: {e}")
@@ -350,9 +405,9 @@ class RTCWorkerClient:
                 logging.info("File does not exist.")
                 return
             else:
-                logging.info(f"Sending {file_path} to client...")
-                file_name = os.path.basename(file_path)
-                file_size = os.path.getsize(file_path)
+                logging.info(f"Sending {self.zipped_file} to client...") # trained_labels.v001.slp.training_job.zip
+                file_name = os.path.basename(self.zipped_file)
+                file_size = os.path.getsize(self.zipped_file)
                 file_save_dir = self.output_dir 
                 
                 # Send metadata first
@@ -507,19 +562,19 @@ class RTCWorkerClient:
                 logging.info("File does not exist.")
                 return
             else: 
-                logging.info(f"Sending {file_path} to client...")
+                logging.info(f"Sending {self.zipped_file} to client...")
 
                 # Obtain metadata.
-                file_name = os.path.basename(file_path)
-                file_size = os.path.getsize(file_path)
+                file_name = os.path.basename(self.zipped_file) 
+                file_size = os.path.getsize(self.zipped_file)
                 file_save_dir = self.output_dir
                 
                 # Send metadata first.
                 channel.send(f"FILE_META::{file_name}:{file_size}:{file_save_dir}")
 
                 # Send file in chunks (32 KB).
-                with open(file_path, "rb") as file:
-                    logging.info(f"File opened: {file_path}")
+                with open(self.zipped_file, "rb") as file:
+                    logging.info(f"File opened: {self.zipped_file}")
                     while chunk := file.read(self.chunk_size):
                         while channel.bufferedAmount is not None and channel.bufferedAmount > 16 * 1024 * 1024: # Wait if buffer >16MB 
                             await asyncio.sleep(0.1)
@@ -567,6 +622,7 @@ class RTCWorkerClient:
 
                     # File transfer complete, save to disk.
                     file_name, file_data = list(self.received_files.items())[0]
+                    self.original_file_name = file_name
                     file_path = os.path.join(self.save_dir, file_name)
 
                     with open(file_path, "wb") as file:
@@ -591,15 +647,16 @@ class RTCWorkerClient:
                             # Start ZMQ progress listener.
                             # Don't need to send ZMQ progress reports if User just using CLI sleap-rtc.
                             # (Will print sleap-nn train logs directly to terminal instead.)
-                            progress_listener_task = asyncio.create_task(self.start_progress_listener(channel))
-                            logging.info(f'{channel.label} progress listener started')
+                            if self.gui:
+                                progress_listener_task = asyncio.create_task(self.start_progress_listener(channel))
+                                logging.info(f'{channel.label} progress listener started')
 
-                            # Start ZMQ control socket.
-                            self.start_zmq_control()
-                            logging.info(f'{channel.label} ZMQ control socket started')
-                            
-                            # Give SUB socket time to connect.
-                            await asyncio.sleep(1)
+                                # Start ZMQ control socket.
+                                self.start_zmq_control()
+                                logging.info(f'{channel.label} ZMQ control socket started')
+                                
+                                # Give SUB socket time to connect.
+                                await asyncio.sleep(1)
 
                             logging.info(f"Running training script: {train_script_path}")
 
@@ -616,7 +673,7 @@ class RTCWorkerClient:
 
                             # Zip the results.
                             logging.info("Zipping results...")
-                            zipped_file_name = f"trained_{file_name}"
+                            zipped_file_name = f"trained_{self.original_file_name[:-4]}"
                             await self.zip_results(zipped_file_name, f"{self.unzipped_dir}/{self.output_dir}") # normally, "./labels_dir/models"
                             # Zipped file saved to current directory.
 
