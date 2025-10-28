@@ -672,7 +672,7 @@ class RTCWorkerClient:
 
                             # Zip the results.
                             logging.info("Zipping results...")
-                            zipped_file_name = f"trained_{self.original_file_name}"
+                            zipped_file_name = f"trained_{self.original_file_name[:-4]}"
                             await self.zip_results(zipped_file_name, f"{self.unzipped_dir}/{self.output_dir}") # normally, "./labels_dir/models"
                             # Zipped file saved to current directory.
 
