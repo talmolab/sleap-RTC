@@ -562,11 +562,11 @@ class RTCWorkerClient:
                 logging.info("File does not exist.")
                 return
             else: 
-                logging.info(f"Sending {file_path} to client...")
+                logging.info(f"Sending {self.zipped_file} to client...")
 
                 # Obtain metadata.
-                file_name = os.path.basename(file_path)
-                file_size = os.path.getsize(file_path)
+                file_name = os.path.basename(self.zipped_file) 
+                file_size = os.path.getsize(self.zipped_file)
                 file_save_dir = self.output_dir
                 
                 # Send metadata first.
