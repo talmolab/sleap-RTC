@@ -313,7 +313,8 @@ class RTCWorkerClient:
         if Path(dir_path):
             try:
                 shutil.make_archive(file_name, 'zip', dir_path)
-                logging.info(f"Results zipped to {file_name}")
+                self.zipped_file = f"{file_name}.zip"
+                logging.info(f"Results zipped to {self.zipped_file}")
             except Exception as e:
                 logging.error(f"Error zipping results: {e}")
                 return
@@ -404,9 +405,9 @@ class RTCWorkerClient:
                 logging.info("File does not exist.")
                 return
             else:
-                logging.info(f"Sending {file_path} to client...")
-                file_name = os.path.basename(file_path)
-                file_size = os.path.getsize(file_path)
+                logging.info(f"Sending {self.zipped_file} to client...") # trained_labels.v001.slp.training_job.zip
+                file_name = os.path.basename(self.zipped_file)
+                file_size = os.path.getsize(self.zipped_file)
                 file_save_dir = self.output_dir 
                 
                 # Send metadata first
