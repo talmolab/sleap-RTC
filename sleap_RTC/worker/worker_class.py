@@ -573,8 +573,8 @@ class RTCWorkerClient:
                 channel.send(f"FILE_META::{file_name}:{file_size}:{file_save_dir}")
 
                 # Send file in chunks (32 KB).
-                with open(file_path, "rb") as file:
-                    logging.info(f"File opened: {file_path}")
+                with open(self.zipped_file, "rb") as file:
+                    logging.info(f"File opened: {self.zipped_file}")
                     while chunk := file.read(self.chunk_size):
                         while channel.bufferedAmount is not None and channel.bufferedAmount > 16 * 1024 * 1024: # Wait if buffer >16MB 
                             await asyncio.sleep(0.1)
