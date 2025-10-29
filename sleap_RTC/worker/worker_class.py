@@ -756,6 +756,10 @@ class RTCWorkerClient:
                     self.package_type = "track"
                     logging.info("Received track package (inference mode)")
                     return
+                elif "PACKAGE_TYPE::train" in message:
+                    self.package_type = "train"
+                    logging.info("Received train package (training mode)")
+                    return
 
                 if message == "END_OF_FILE":
                     logging.info("End of file transfer received.")
