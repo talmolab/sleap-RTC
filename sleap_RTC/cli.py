@@ -3,8 +3,8 @@
 import click
 from loguru import logger
 from pathlib import Path
-from sleap_RTC.RTCworker import run_RTCworker
-from sleap_RTC.RTCclient import run_RTCclient
+from sleap_rtc.rtc_worker import run_RTCworker
+from sleap_rtc.rtc_client import run_RTCclient
 import sys
 
 @click.group()

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import List, Optional, Text, Tuple
 from websockets.client import ClientConnection
 
-from sleap_RTC.config import get_config
+from sleap_rtc.config import get_config
 
 # Setup logging.
 logging.basicConfig(level=logging.INFO)

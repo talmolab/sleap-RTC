@@ -13,7 +13,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 from websockets.client import ClientConnection
 from pathlib import Path
 
-from sleap_RTC.config import get_config
+from sleap_rtc.config import get_config
 
 # import sleap
 # from sleap.nn.training import main
