@@ -7,16 +7,16 @@ from sleap_RTC.client.client_class import RTCClient
 
 def run_RTCclient(session_string: str, pkg_path: str, zmq_ports: dict, **kwargs):
     """Standalone function to run the RTC client with CLI arguments.
-    
+
     Args:
         session_string: Session string to connect to the worker
-        pkg_path: Path to the SLEAP training/inference package  
+        pkg_path: Path to the SLEAP training/inference package
         zmq_ports: Dict with 'controller' and 'publish' port numbers
         **kwargs: Additional arguments (currently unused)
     """
-    # Create client instance
+    # Create client instance (DNS will be loaded from config)
     client = RTCClient(
-        DNS="ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
+        DNS=None,  # Use config
         port_number="8080",
         gui=False  # Indicate that this is running in CLI mode
     )

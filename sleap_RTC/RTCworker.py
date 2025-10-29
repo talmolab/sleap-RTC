@@ -6,6 +6,7 @@ import logging
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 from pathlib import Path
 from sleap_RTC.worker.worker_class import RTCWorkerClient
+from sleap_RTC.config import get_config
 
 def run_RTCworker():
     """Create RTCWorkerClient and start it."""
@@ -15,12 +16,15 @@ def run_RTCworker():
     # Create the RTCPeerConnection object.
     pc = RTCPeerConnection()
 
+    # Get configuration
+    config = get_config()
+
     # Run the worker.
     try:
         asyncio.run(
             worker.run_worker(
                 pc=pc,
-                DNS="ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
+                DNS=config.signaling_websocket,
                 port_number=8080
             )
         )

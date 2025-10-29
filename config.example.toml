@@ -1,0 +1,26 @@
+# Example SLEAP-RTC Configuration File
+# Copy this to ~/.sleap-rtc/config.toml or sleap-rtc.toml in your project directory
+#
+# Select environment with: export SLEAP_RTC_ENV=development
+# Valid environments: development, staging, production
+# Default: production
+
+[default]
+# Shared settings across all environments
+connection_timeout = 30
+chunk_size = 65536
+
+[environments.development]
+# Local development signaling server
+signaling_websocket = "ws://localhost:8080"
+signaling_http = "http://localhost:8001"
+
+[environments.staging]
+# Staging/testing signaling server
+signaling_websocket = "ws://staging-server.example.com:8080"
+signaling_http = "http://staging-server.example.com:8001"
+
+[environments.production]
+# Production signaling server (current default)
+signaling_websocket = "ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8080"
+signaling_http = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001"

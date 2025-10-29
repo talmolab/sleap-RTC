@@ -14,6 +14,8 @@ from sleap.gui.learning.configs import ConfigFileInfo
 from sleap.nn.config.training_job import TrainingJobConfig
 from websockets.client import ClientConnection
 
+from sleap_RTC.config import get_config
+
 # Setup logging.
 logging.basicConfig(level=logging.INFO)
 
@@ -559,7 +561,10 @@ def entrypoint():
     """
     parser = argparse.ArgumentParser(description="SLEAP webRTC Client")
 
-    parser.add_argument("--server", type=str, default="ws://ec2-54-153-105-27.us-west-1.compute.amazonaws.com", help="WebSocket server DNS/address, ex. 'ws://ec2-54-158-36-90.compute-1.amazonaws.com'")
+    # Get config for default value
+    config = get_config()
+
+    parser.add_argument("--server", type=str, default=config.signaling_websocket, help="WebSocket server DNS/address, ex. 'ws://ec2-54-158-36-90.compute-1.amazonaws.com'")
     parser.add_argument("--port", type=int, default=8080, help="WebSocket server port number, ex. '8080'")
     parser.add_argument("--peer_id", type=str, default="client1", help="Unique identifier for the client")
 
