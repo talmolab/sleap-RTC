@@ -1,4 +1,4 @@
-# sleap-RTC
+# sleap-rtc
 - Remote training and inference w/ SLEAP
 - Remote Authenticated CLI Training w/ SLEAP
 
