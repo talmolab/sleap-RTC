@@ -341,8 +341,11 @@ class RTCClient:
         if not Path(file_path).exists():
             logging.info("File does not exist.")
             return
-        else: 
+        else:
             logging.info(f"Sending {file_path} to worker...")
+
+            # Send package type indicator
+            self.data_channel.send("PACKAGE_TYPE::train")
 
             # Send output directory (where models will be saved).
             output_dir = "models"

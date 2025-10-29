@@ -36,6 +36,7 @@ class RTCWorkerClient:
         self.ctrl_socket = None
         self.pc = None  # RTCPeerConnection will be set later
         self.websocket = None  # WebSocket connection will be set later
+        self.package_type = "train"  # Default to training, can be "track" for inference
 
 
     def generate_session_string(self, room_id: str, token: str, peer_id: str):
@@ -119,6 +120,36 @@ class RTCWorkerClient:
                     # For sleap-nn, we don't need separate labels file - it's configured in the YAML
                     jobs.append(config_name)
         return jobs
+
+
+    def parse_track_script(self, track_script_path: str):
+        """Parses track-script.sh and extracts sleap-nn track commands.
+
+        Args:
+            track_script_path: Path to track-script.sh
+
+        Returns:
+            List of command argument lists
+        """
+        commands = []
+        pattern = re.compile(r"^\s*sleap-nn\s+track\s+(.+)")
+
+        with open(track_script_path, "r") as f:
+            script_content = f.read()
+
+        # Handle multi-line commands with backslashes
+        script_content = script_content.replace("\\\n", " ")
+
+        for line in script_content.split("\n"):
+            match = pattern.match(line)
+            if match:
+                # Split arguments while preserving quoted strings
+                args_str = match.group(1)
+                # Simple split (for more complex parsing, use shlex.split)
+                args = ["sleap-nn", "track"] + args_str.split()
+                commands.append(args)
+
+        return commands
 
 
     async def run_all_training_jobs(self, channel: RTCDataChannel, train_script_path: str):
@@ -230,6 +261,107 @@ class RTCWorkerClient:
                     channel.send(f"TRAIN_JOB_ERROR::{job_name}::{process.returncode}")
 
         channel.send("TRAINING_JOBS_DONE")
+
+
+    async def run_track_workflow(self, channel: RTCDataChannel, track_script_path: str):
+        """Executes inference workflow on received track package.
+
+        Args:
+            channel: RTC data channel for sending progress
+            track_script_path: Path to track-script.sh
+        """
+        if not Path(track_script_path).exists():
+            logging.error("No track-script.sh found in package")
+            channel.send("INFERENCE_ERROR::No track script found")
+            return
+
+        logging.info("Starting inference workflow...")
+        channel.send("INFERENCE_START")
+
+        # Make script executable
+        os.chmod(track_script_path, os.stat(track_script_path).st_mode | stat.S_IEXEC)
+
+        # Parse and run track commands
+        track_commands = self.parse_track_script(track_script_path)
+
+        for cmd_args in track_commands:
+            job_name = "inference"
+            channel.send(f"INFERENCE_JOB_START::{job_name}")
+
+            # Run sleap-nn track
+            process = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=self.unzipped_dir,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"}
+            )
+
+            # Stream logs
+            async for line in process.stdout:
+                decoded_line = line.decode().rstrip()
+                if channel.readyState == "open":
+                    try:
+                        channel.send(f"TRACK_LOG:{decoded_line}")
+                    except Exception as e:
+                        logging.error(f"Failed to send track log: {e}")
+
+            await process.wait()
+
+            if process.returncode == 0:
+                logging.info("Inference completed successfully")
+                channel.send(f"INFERENCE_JOB_END::{job_name}")
+            else:
+                logging.error(f"Inference failed with code {process.returncode}")
+                channel.send(f"INFERENCE_JOB_ERROR::{job_name}::{process.returncode}")
+
+        # Find and send predictions file
+        predictions_files = list(Path(self.unzipped_dir).glob("*.predictions.slp"))
+
+        if predictions_files:
+            predictions_path = predictions_files[0]
+            logging.info(f"Sending predictions: {predictions_path}")
+
+            # Send predictions back to client
+            await self.send_file(channel, str(predictions_path))
+        else:
+            logging.warning("No predictions file found")
+
+        channel.send("INFERENCE_JOBS_DONE")
+
+
+    async def send_file(self, channel: RTCDataChannel, file_path: str):
+        """Sends a file to the client via data channel.
+
+        Args:
+            channel: RTC data channel
+            file_path: Path to file to send
+        """
+        if channel.readyState != "open":
+            logging.error(f"Data channel not open: {channel.readyState}")
+            return
+
+        file_name = os.path.basename(file_path)
+        file_size = os.path.getsize(file_path)
+
+        # Send file metadata
+        channel.send(f"FILE_META::{file_name}:{file_size}:{self.output_dir}")
+        logging.info(f"Sending file: {file_name} ({file_size} bytes)")
+
+        # Send file in chunks
+        with open(file_path, "rb") as file:
+            bytes_sent = 0
+            while chunk := file.read(self.chunk_size):
+                # Flow control
+                while channel.bufferedAmount is not None and channel.bufferedAmount > 16 * 1024 * 1024:
+                    await asyncio.sleep(0.1)
+
+                channel.send(chunk)
+                bytes_sent += len(chunk)
+
+        # Signal end of file
+        channel.send("END_OF_FILE")
+        logging.info("File sent successfully")
 
 
     def start_zmq_control(self, zmq_address: str = "tcp://127.0.0.1:9000"):
@@ -619,6 +751,16 @@ class RTCWorkerClient:
                     logging.info("Keep alive message received.")
                     return
 
+                # Detect package type (track or train)
+                if "PACKAGE_TYPE::track" in message:
+                    self.package_type = "track"
+                    logging.info("Received track package (inference mode)")
+                    return
+                elif "PACKAGE_TYPE::train" in message:
+                    self.package_type = "train"
+                    logging.info("Received train package (training mode)")
+                    return
+
                 if message == "END_OF_FILE":
                     logging.info("End of file transfer received.")
 
@@ -636,58 +778,70 @@ class RTCWorkerClient:
                         await self.unzip_results(file_path)
                         logging.info(f"Unzipped results from {file_path}")
 
-                    # Reset dictionary for next file and train model.
+                    # Reset dictionary for next file
                     self.received_files.clear()
-                    
-                    train_script_path = os.path.join(self.unzipped_dir, "train-script.sh")
 
-                    if Path(train_script_path):
-                        try:
-                            logging.info("self.gui is: " + str(self.gui))
-                            progress_listener_task = None
-                            # if self.gui:
-                            # Start ZMQ progress listener.
-                            # Don't need to send ZMQ progress reports if User just using CLI sleap-rtc.
-                            # (Will print sleap-nn train logs directly to terminal instead.)
-                            if self.gui:
-                                progress_listener_task = asyncio.create_task(self.start_progress_listener(channel))
-                                logging.info(f'{channel.label} progress listener started')
+                    # Route to appropriate workflow based on package type
+                    if self.package_type == "track":
+                        # Inference workflow
+                        track_script_path = os.path.join(self.unzipped_dir, "track-script.sh")
 
-                                # Start ZMQ control socket.
-                                self.start_zmq_control()
-                                logging.info(f'{channel.label} ZMQ control socket started')
-                                
-                                # Give SUB socket time to connect.
-                                await asyncio.sleep(1)
+                        if Path(track_script_path).exists():
+                            await self.run_track_workflow(channel, track_script_path)
+                        else:
+                            logging.error(f"No track script found in {self.unzipped_dir}. Skipping inference.")
 
-                            logging.info(f"Running training script: {train_script_path}")
-
-                            # Make the script executable
-                            os.chmod(train_script_path, os.stat(train_script_path).st_mode | stat.S_IEXEC)
-
-                            # Run the training script in the save directory
-                            await self.run_all_training_jobs(channel, train_script_path=train_script_path)
-
-                            # Finish training.
-                            logging.info("Training completed successfully.")
-                            if progress_listener_task:
-                                progress_listener_task.cancel()
-
-                            # Zip the results.
-                            logging.info("Zipping results...")
-                            zipped_file_name = f"trained_{self.original_file_name[:-4]}"
-                            await self.zip_results(zipped_file_name, f"{self.unzipped_dir}/{self.output_dir}") # normally, "./labels_dir/models"
-                            # Zipped file saved to current directory.
-
-                            # Send the zipped file to the client.
-                            logging.info(f"Sending zipped file to client: {zipped_file_name}")
-                            await send_worker_file(zipped_file_name)
-
-                        except subprocess.CalledProcessError as e:
-                            logging.error(f"Training failed with error:\n{e.stderr}")
-                            await self.clean_exit()
                     else:
-                        logging.info(f"No training script found in {self.save_dir}. Skipping training.")
+                        # Training workflow (default)
+                        train_script_path = os.path.join(self.unzipped_dir, "train-script.sh")
+
+                        if Path(train_script_path):
+                            try:
+                                logging.info("self.gui is: " + str(self.gui))
+                                progress_listener_task = None
+                                # if self.gui:
+                                # Start ZMQ progress listener.
+                                # Don't need to send ZMQ progress reports if User just using CLI sleap-rtc.
+                                # (Will print sleap-nn train logs directly to terminal instead.)
+                                if self.gui:
+                                    progress_listener_task = asyncio.create_task(self.start_progress_listener(channel))
+                                    logging.info(f'{channel.label} progress listener started')
+
+                                    # Start ZMQ control socket.
+                                    self.start_zmq_control()
+                                    logging.info(f'{channel.label} ZMQ control socket started')
+
+                                    # Give SUB socket time to connect.
+                                    await asyncio.sleep(1)
+
+                                logging.info(f"Running training script: {train_script_path}")
+
+                                # Make the script executable
+                                os.chmod(train_script_path, os.stat(train_script_path).st_mode | stat.S_IEXEC)
+
+                                # Run the training script in the save directory
+                                await self.run_all_training_jobs(channel, train_script_path=train_script_path)
+
+                                # Finish training.
+                                logging.info("Training completed successfully.")
+                                if progress_listener_task:
+                                    progress_listener_task.cancel()
+
+                                # Zip the results.
+                                logging.info("Zipping results...")
+                                zipped_file_name = f"trained_{self.original_file_name[:-4]}"
+                                await self.zip_results(zipped_file_name, f"{self.unzipped_dir}/{self.output_dir}") # normally, "./labels_dir/models"
+                                # Zipped file saved to current directory.
+
+                                # Send the zipped file to the client.
+                                logging.info(f"Sending zipped file to client: {zipped_file_name}")
+                                await send_worker_file(zipped_file_name)
+
+                            except subprocess.CalledProcessError as e:
+                                logging.error(f"Training failed with error:\n{e.stderr}")
+                                await self.clean_exit()
+                        else:
+                            logging.info(f"No training script found in {self.save_dir}. Skipping training.")
 
                 elif "OUTPUT_DIR::" in message:
                     logging.info(f"Output directory received: {message}")
