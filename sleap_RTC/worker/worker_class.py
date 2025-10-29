@@ -18,6 +18,8 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 from pathlib import Path
 from websockets.client import ClientConnection
 
+from sleap_RTC.config import get_config
+
 # Setup logging.
 logging.basicConfig(level=logging.INFO)
 
@@ -50,8 +52,9 @@ class RTCWorkerClient:
 
     def request_peer_room_deletion(self, peer_id: str):
         """Requests the signaling server to delete the room and associated user/worker."""
-        
-        url = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001/delete-peers-and-room"
+
+        config = get_config()
+        url = config.get_http_endpoint("/delete-peers-and-room")
         json = {
             "peer_id": peer_id,
         }
@@ -74,10 +77,9 @@ class RTCWorkerClient:
         Returns:
             dict: Contains room_id and token if successful, otherwise raises an exception.
         """
-        
-        # Port 8001 for server_routes.py
-        # CHANGE TO EC2 INSTANCE DNS LATER
-        url = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001/create-room"
+
+        config = get_config()
+        url = config.get_http_endpoint("/create-room")
         headers = {"Authorization": f"Bearer {id_token}"} # Use the ID token string for authentication
 
         response = requests.post(url, headers=headers)
@@ -91,9 +93,9 @@ class RTCWorkerClient:
 
     def request_anonymous_signin(self) -> str:
         """Request an anonymous token from Signaling Server."""
-        
-        # CHANGE TO EC2 INSTANCE DNS LATER
-        url = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001/anonymous-signin"
+
+        config = get_config()
+        url = config.get_http_endpoint("/anonymous-signin")
         response = requests.post(url)
 
         if response.status_code == 200:
@@ -842,11 +844,12 @@ if __name__ == "__main__":
 
     # Run the worker 
     try:
+        config = get_config()
         asyncio.run(
             worker.run_worker(
                 pc=pc,
                 # peer_id=peer_id,
-                DNS="ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
+                DNS=config.signaling_websocket,
                 port_number=8080
             )
         )

@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import List, Optional, Text, Tuple
 from websockets.client import ClientConnection
 
+from sleap_RTC.config import get_config
+
 # Setup logging.
 logging.basicConfig(level=logging.INFO)
 
@@ -27,8 +29,8 @@ RETRY_DELAY = 5  # seconds
 
 class RTCClient:
     def __init__(
-        self, 
-        DNS: str = "ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com",
+        self,
+        DNS: Optional[str] = None,
         port_number: str = "8080",
         gui: bool = False
     ):
@@ -39,7 +41,9 @@ class RTCClient:
         self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
 
         # Initialize given parameters.
-        self.DNS = DNS
+        # Use config if DNS not provided via CLI
+        config = get_config()
+        self.DNS = DNS if DNS is not None else config.signaling_websocket
         self.port_number = port_number
         self.gui = gui
 
@@ -70,11 +74,12 @@ class RTCClient:
     def request_peer_room_deletion(self, peer_id: str):
         """Requests the signaling server to delete the room and associated user/worker."""
 
-        url = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001/delete-peers-and-room"
+        config = get_config()
+        url = config.get_http_endpoint("/delete-peers-and-room")
         json = {
             "peer_id": peer_id,
         }
-        
+
         # Pass the Cognito usernmae (peer_id) to identify which room/peers to delete.
         response = requests.post(url, json=json)
 
@@ -88,7 +93,8 @@ class RTCClient:
     def request_anonymous_signin(self) -> str:
         """Request an anonymous token from Signaling Server."""
 
-        url = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001/anonymous-signin"
+        config = get_config()
+        url = config.get_http_endpoint("/anonymous-signin")
         response = requests.post(url)
 
         if response.status_code == 200:
