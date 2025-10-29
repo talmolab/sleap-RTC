@@ -5,8 +5,8 @@ import logging
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 from pathlib import Path
-from sleap_RTC.worker.worker_class import RTCWorkerClient
-from sleap_RTC.config import get_config
+from sleap_rtc.worker.worker_class import RTCWorkerClient
+from sleap_rtc.config import get_config
 
 def run_RTCworker():
     """Create RTCWorkerClient and start it."""

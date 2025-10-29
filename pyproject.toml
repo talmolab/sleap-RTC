@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.scripts]
-sleap-rtc = "sleap_RTC.cli:cli"
+sleap-rtc = "sleap_rtc.cli:cli"
 
 [project.optional-dependencies]
 dev = [

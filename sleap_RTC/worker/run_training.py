@@ -4,7 +4,7 @@ import subprocess
 import re
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
-from sleap_RTC.worker.worker_class import RTCWorkerClient
+from sleap_rtc.worker.worker_class import RTCWorkerClient
 from pathlib import Path
 
 

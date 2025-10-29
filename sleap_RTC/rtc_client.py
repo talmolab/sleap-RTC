@@ -2,7 +2,7 @@ import asyncio
 import uuid
 import logging
 
-from sleap_RTC.client.client_class import RTCClient
+from sleap_rtc.client.client_class import RTCClient
 
 
 def run_RTCclient(session_string: str, pkg_path: str, zmq_ports: dict, **kwargs):
