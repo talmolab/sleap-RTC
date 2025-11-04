@@ -12,6 +12,9 @@ import os
 import re
 import requests
 import zmq
+import socket
+import platform
+import time
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 # from run_training import run_all_training_jobs
@@ -27,7 +30,7 @@ logging.basicConfig(level=logging.INFO)
 SEP = re.compile(rb'[\r\n]')
 
 class RTCWorkerClient:
-    def __init__(self, chunk_size=32 * 1024):
+    def __init__(self, chunk_size=32 * 1024, gpu_id=0):
         # Use /app/shared_data in production, current dir + shared_data in dev
         self.save_dir = "."
         self.chunk_size = chunk_size
@@ -38,6 +41,331 @@ class RTCWorkerClient:
         self.websocket = None  # WebSocket connection will be set later
         self.package_type = "train"  # Default to training, can be "track" for inference
 
+        # Worker state and capabilities (for v2.0 features)
+        self.gpu_id = gpu_id
+        self.status = "available"  # "available", "busy", "reserved", "maintenance"
+        self.current_job = None
+        self.gpu_memory_mb = self._detect_gpu_memory()
+        self.gpu_model = self._detect_gpu_model()
+        self.cuda_version = self._detect_cuda_version()
+        self.supported_models = ["base", "centroid", "topdown"]
+        self.supported_job_types = ["training", "inference"]
+        self.max_concurrent_jobs = 1
+
+    def _detect_gpu_memory(self) -> int:
+        """Detect GPU memory in MB.
+
+        Returns:
+            GPU memory in MB, or 0 if no GPU available
+        """
+        try:
+            import torch
+            if torch.cuda.is_available() and torch.cuda.device_count() > self.gpu_id:
+                return torch.cuda.get_device_properties(self.gpu_id).total_memory // (1024 * 1024)
+        except (ImportError, RuntimeError) as e:
+            logging.warning(f"Failed to detect GPU memory: {e}")
+        return 0
+
+    def _detect_gpu_model(self) -> str:
+        """Detect GPU model name.
+
+        Returns:
+            GPU model name, or "CPU" if no GPU available
+        """
+        try:
+            import torch
+            if torch.cuda.is_available() and torch.cuda.device_count() > self.gpu_id:
+                return torch.cuda.get_device_properties(self.gpu_id).name
+        except (ImportError, RuntimeError) as e:
+            logging.warning(f"Failed to detect GPU model: {e}")
+        return "CPU"
+
+    def _detect_cuda_version(self) -> str:
+        """Detect CUDA version.
+
+        Returns:
+            CUDA version string, or "N/A" if CUDA not available
+        """
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return torch.version.cuda if torch.version.cuda else "N/A"
+        except (ImportError, RuntimeError) as e:
+            logging.warning(f"Failed to detect CUDA version: {e}")
+        return "N/A"
+
+    async def update_status(self, status: str, **extra_properties):
+        """Update worker status in signaling server.
+
+        Args:
+            status: "available", "busy", "reserved", or "maintenance"
+            **extra_properties: Additional properties to update (e.g., current_job_id)
+        """
+        self.status = status
+
+        metadata = {
+            "properties": {
+                "status": status,
+                **extra_properties
+            }
+        }
+
+        try:
+            await self.websocket.send(json.dumps({
+                "type": "update_metadata",
+                "peer_id": self.cognito_username,
+                "metadata": metadata
+            }))
+
+            # Wait for confirmation (optional but recommended)
+            response = await asyncio.wait_for(self.websocket.recv(), timeout=2.0)
+            response_data = json.loads(response)
+
+            if response_data.get("type") == "metadata_updated":
+                logging.info(f"Status updated to: {status}")
+            else:
+                logging.warning(f"Unexpected response to status update: {response_data}")
+        except asyncio.TimeoutError:
+            logging.warning(f"Timeout waiting for status update confirmation")
+        except Exception as e:
+            logging.error(f"Failed to update status: {e}")
+
+    async def _send_peer_message(self, to_peer_id: str, payload: dict):
+        """Send peer message via signaling server.
+
+        Args:
+            to_peer_id: Target peer ID
+            payload: Application-specific message payload
+        """
+        try:
+            await self.websocket.send(json.dumps({
+                "type": "peer_message",
+                "from_peer_id": self.cognito_username,
+                "to_peer_id": to_peer_id,
+                "payload": payload
+            }))
+            logging.info(f"Sent peer message to {to_peer_id}: {payload.get('app_message_type', 'unknown')}")
+        except Exception as e:
+            logging.error(f"Failed to send peer message: {e}")
+
+    def _check_job_compatibility(self, request: dict) -> bool:
+        """Check if this worker can handle the job.
+
+        Args:
+            request: Job request dictionary
+
+        Returns:
+            True if worker can handle the job, False otherwise
+        """
+        job_spec = request.get("config", {})
+        requirements = request.get("requirements", {})
+
+        # Check GPU memory
+        min_gpu_mb = requirements.get("min_gpu_memory_mb", 0)
+        if self.gpu_memory_mb < min_gpu_mb:
+            logging.info(f"Job requires {min_gpu_mb}MB GPU memory, worker has {self.gpu_memory_mb}MB")
+            return False
+
+        # Check model support
+        model_type = job_spec.get("model_type")
+        if model_type and model_type not in self.supported_models:
+            logging.info(f"Job requires model type '{model_type}', worker supports {self.supported_models}")
+            return False
+
+        # Check job type
+        job_type = request.get("job_type")
+        if job_type and job_type not in self.supported_job_types:
+            logging.info(f"Job type '{job_type}' not supported, worker supports {self.supported_job_types}")
+            return False
+
+        return True
+
+    def _estimate_job_duration(self, request: dict) -> int:
+        """Estimate job duration in minutes.
+
+        Args:
+            request: Job request dictionary
+
+        Returns:
+            Estimated duration in minutes
+        """
+        # Simple estimation based on job type and config
+        job_type = request.get("job_type", "training")
+        config = request.get("config", {})
+
+        if job_type == "training":
+            epochs = config.get("epochs", 100)
+            # Rough estimate: 0.5 minutes per epoch
+            return int(epochs * 0.5)
+        elif job_type == "inference":
+            frame_count = request.get("dataset_info", {}).get("frame_count", 1000)
+            # Rough estimate: 100 frames per minute
+            return max(1, int(frame_count / 100))
+
+        return 60  # Default 60 minutes
+
+    def _get_gpu_utilization(self) -> float:
+        """Get current GPU utilization percentage.
+
+        Returns:
+            GPU utilization as a float between 0.0 and 1.0
+        """
+        try:
+            import torch
+            if torch.cuda.is_available() and torch.cuda.device_count() > self.gpu_id:
+                # Simple check: return 0.0 if available, 1.0 if busy
+                return 0.0 if self.status == "available" else 0.9
+        except (ImportError, RuntimeError):
+            pass
+        return 0.0
+
+    def _get_available_memory(self) -> int:
+        """Get available GPU memory in MB.
+
+        Returns:
+            Available memory in MB
+        """
+        try:
+            import torch
+            if torch.cuda.is_available() and torch.cuda.device_count() > self.gpu_id:
+                free_memory = torch.cuda.mem_get_info(self.gpu_id)[0]
+                return int(free_memory / (1024 * 1024))
+        except (ImportError, RuntimeError):
+            pass
+        return self.gpu_memory_mb
+
+    async def handle_peer_message(self, message: dict):
+        """Handle incoming peer messages (job requests).
+
+        Args:
+            message: Peer message from signaling server
+        """
+        if message.get("type") != "peer_message":
+            return
+
+        payload = message.get("payload", {})
+        app_message_type = payload.get("app_message_type")
+        from_peer_id = message.get("from_peer_id")
+
+        logging.info(f"Received peer message from {from_peer_id}: {app_message_type}")
+
+        if app_message_type == "job_request":
+            await self._handle_job_request(from_peer_id, payload)
+        elif app_message_type == "job_assignment":
+            await self._handle_job_assignment(from_peer_id, payload)
+        elif app_message_type == "job_cancel":
+            await self._handle_job_cancel(payload)
+        else:
+            logging.warning(f"Unhandled peer message type: {app_message_type}")
+
+    async def _handle_job_request(self, client_id: str, request: dict):
+        """Respond to job request from client.
+
+        Args:
+            client_id: Client peer ID
+            request: Job request payload
+        """
+        job_id = request.get("job_id")
+        job_type = request.get("job_type")
+
+        logging.info(f"Handling job request {job_id} of type {job_type} from {client_id}")
+
+        # Check if we can accept this job
+        can_accept = (
+            self.status == "available" and
+            self._check_job_compatibility(request)
+        )
+
+        if not can_accept:
+            # Send rejection
+            reason = "busy" if self.status != "available" else "incompatible"
+            logging.info(f"Rejecting job {job_id}: {reason}")
+
+            await self._send_peer_message(client_id, {
+                "app_message_type": "job_response",
+                "job_id": job_id,
+                "accepted": False,
+                "reason": reason
+            })
+            return
+
+        # Estimate job duration
+        estimated_duration = self._estimate_job_duration(request)
+
+        # Send acceptance
+        logging.info(f"Accepting job {job_id}, estimated duration: {estimated_duration} minutes")
+
+        await self._send_peer_message(client_id, {
+            "app_message_type": "job_response",
+            "job_id": job_id,
+            "accepted": True,
+            "estimated_start_time_sec": 0,
+            "estimated_duration_minutes": estimated_duration,
+            "worker_info": {
+                "gpu_utilization": self._get_gpu_utilization(),
+                "available_memory_mb": self._get_available_memory()
+            }
+        })
+
+        # Update status to "reserved" (prevent other clients from requesting)
+        await self.update_status("reserved", pending_job_id=job_id)
+
+    async def _handle_job_assignment(self, client_id: str, assignment: dict):
+        """Handle job assignment from client.
+
+        Args:
+            client_id: Client peer ID
+            assignment: Job assignment payload
+        """
+        job_id = assignment.get("job_id")
+
+        logging.info(f"Handling job assignment {job_id} from {client_id}")
+
+        # Update status to busy
+        await self.update_status("busy", current_job_id=job_id)
+
+        # Store job info for execution
+        self.current_job = {
+            "job_id": job_id,
+            "client_id": client_id,
+            "assigned_at": time.time()
+        }
+
+        logging.info(f"Job {job_id} assigned and ready for WebRTC connection")
+
+        # Note: WebRTC connection will be initiated by the client
+        # The existing on_datachannel handler will handle the data transfer
+
+    async def _handle_job_cancel(self, payload: dict):
+        """Handle job cancellation request.
+
+        Args:
+            payload: Job cancel payload
+        """
+        job_id = payload.get("job_id")
+        reason = payload.get("reason", "unknown")
+
+        logging.info(f"Handling job cancellation for {job_id}: {reason}")
+
+        if self.current_job and self.current_job.get("job_id") == job_id:
+            # Cancel the current job
+            client_id = self.current_job.get("client_id")
+
+            # Send cancellation acknowledgment
+            await self._send_peer_message(client_id, {
+                "app_message_type": "job_cancelled",
+                "job_id": job_id,
+                "status": "cancelled",
+                "cleanup_complete": True
+            })
+
+            # Reset job state
+            self.current_job = None
+            await self.update_status("available")
+
+            logging.info(f"Job {job_id} cancelled successfully")
+        else:
+            logging.warning(f"Cannot cancel job {job_id}: not currently running")
 
     def generate_session_string(self, room_id: str, token: str, peer_id: str):
         """Generates an encoded session string for the room."""
@@ -153,114 +481,201 @@ class RTCWorkerClient:
 
 
     async def run_all_training_jobs(self, channel: RTCDataChannel, train_script_path: str):
+        """Execute training jobs with progress updates.
+
+        Args:
+            channel: RTC data channel for sending logs
+            train_script_path: Path to training script
+        """
         training_jobs = self.parse_training_script(train_script_path)
 
-        for config_name in training_jobs:
-            job_name = Path(config_name).stem
+        # Get job ID and client ID from current_job if available
+        job_id = self.current_job.get("job_id") if self.current_job else None
+        client_id = self.current_job.get("client_id") if self.current_job else None
 
-            # Send RTC msg over channel to indicate job start.
-            logging.info(f"Starting training job: {job_name} with config: {config_name}")
-            channel.send(f"TRAIN_JOB_START::{job_name}")
+        try:
+            for config_name in training_jobs:
+                job_name = Path(config_name).stem
 
-            # Use sleap-nn train command for newer SLEAP versions
-            # Run directly in the extracted directory with config-dir from training script
-            cmd = [
-                "sleap-nn", "train",
-                "--config-name", config_name,
-                "--config-dir", ".",
-                "trainer_config.ckpt_dir=models",
-                f"trainer_config.run_name={job_name}",
-                "trainer_config.zmq.controller_port=9000",
-                "trainer_config.zmq.publish_port=9001",
-                # "trainer_config.enable_progress_bar=false"
-            ]
-            logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.unzipped_dir})")
-            
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=self.unzipped_dir, # run this command in the extracted directory
-                env={**os.environ, "PYTHONUNBUFFERED": "1"}
-            )
+                # Send RTC msg over channel to indicate job start.
+                logging.info(f"Starting training job: {job_name} with config: {config_name}")
+                channel.send(f"TRAIN_JOB_START::{job_name}")
 
-            assert process.stdout is not None
-            logging.info(f"Process started with PID: {process.pid}")
+                # Send starting status via peer message
+                if job_id and client_id:
+                    await self._send_peer_message(client_id, {
+                        "app_message_type": "job_status",
+                        "job_id": job_id,
+                        "status": "starting",
+                        "progress": 0.0,
+                        "message": f"Initializing training: {job_name}"
+                    })
 
-            async def stream_logs(emit_on_cr=True, read_size=512, max_flush=64*1024):
-                # async for line in process.stdout:
-                #     decoded_line = line.decode().rstrip()
+                # Use sleap-nn train command for newer SLEAP versions
+                # Run directly in the extracted directory with config-dir from training script
+                cmd = [
+                    "sleap-nn", "train",
+                    "--config-name", config_name,
+                    "--config-dir", ".",
+                    "trainer_config.ckpt_dir=models",
+                    f"trainer_config.run_name={job_name}",
+                    "trainer_config.zmq.controller_port=9000",
+                    "trainer_config.zmq.publish_port=9001",
+                    # "trainer_config.enable_progress_bar=false"
+                ]
+                logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.unzipped_dir})")
 
-                #     if channel.readyState == "open":
-                #         try:
-                #             channel.send(f"TRAIN_LOG:{decoded_line}")
-                #         except Exception as e:
-                #             logging.error(f"Failed to send log line: {e}")
-                buf = b""
-                try:
-                    while True:
-                        chunk = await process.stdout.read(read_size)
-                        if not chunk:
-                            # process ended; flush any remaining text as a final line
-                            if buf:
-                                channel.send(buf.decode(errors="replace") + "\n")
-                            break
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=self.unzipped_dir, # run this command in the extracted directory
+                    env={**os.environ, "PYTHONUNBUFFERED": "1"}
+                )
 
-                        buf += chunk
+                assert process.stdout is not None
+                logging.info(f"Process started with PID: {process.pid}")
 
+                async def stream_logs(emit_on_cr=True, read_size=512, max_flush=64*1024):
+                    buf = b""
+                    try:
                         while True:
-                            m = SEP.search(buf)
-                            if not m:
-                                # If tqdm keeps extending one long line, occasionally flush
-                                if len(buf) > max_flush:
-                                    text = buf.decode(errors="replace")
-                                    if emit_on_cr and text:
-                                        # send as a CR-style redraw
-                                        channel.send("\r" + text)
-                                    buf = b""
+                            chunk = await process.stdout.read(read_size)
+                            if not chunk:
+                                # process ended; flush any remaining text as a final line
+                                if buf:
+                                    channel.send(buf.decode(errors="replace") + "\n")
                                 break
 
-                            sep = buf[m.start():m.end()]     # b'\n' or b'\r'
-                            payload = buf[:m.start()]
-                            buf = buf[m.end():]
+                            buf += chunk
 
-                            text = payload.decode(errors="replace")
-                            if not text:
-                                continue
+                            while True:
+                                m = SEP.search(buf)
+                                if not m:
+                                    # If tqdm keeps extending one long line, occasionally flush
+                                    if len(buf) > max_flush:
+                                        text = buf.decode(errors="replace")
+                                        if emit_on_cr and text:
+                                            # send as a CR-style redraw
+                                            channel.send("\r" + text)
+                                        buf = b""
+                                    break
 
-                            if sep == b'\n':
-                                # NORMAL LOG LINE: preserve newline so your client appends it
-                                channel.send(text + "\n")
-                            else:  # sep == b'\r'
-                                if emit_on_cr:
-                                    # PROGRESS REDRAW: send a carriage-return update
-                                    # Client should treat this as "replace current progress line"
-                                    channel.send("\r" + text)
+                                sep = buf[m.start():m.end()]     # b'\n' or b'\r'
+                                payload = buf[:m.start()]
+                                buf = buf[m.end():]
 
-                except Exception as e:
-                    logging.exception("stream_logs failed: %s", e)
-                    # Optional: notify client without crashing the emitter
-                    try:
-                        channel.send(f"[log-stream error] {e}\n")
-                    except Exception:
-                        pass
+                                text = payload.decode(errors="replace")
+                                if not text:
+                                    continue
 
+                                if sep == b'\n':
+                                    # NORMAL LOG LINE: preserve newline so your client appends it
+                                    channel.send(text + "\n")
+                                else:  # sep == b'\r'
+                                    if emit_on_cr:
+                                        # PROGRESS REDRAW: send a carriage-return update
+                                        # Client should treat this as "replace current progress line"
+                                        channel.send("\r" + text)
 
-            await stream_logs()
-            logging.info("Waiting for process to complete...")
-            await process.wait()
-            logging.info(f"Process completed with return code: {process.returncode}")
+                    except Exception as e:
+                        logging.exception("stream_logs failed: %s", e)
+                        # Optional: notify client without crashing the emitter
+                        try:
+                            channel.send(f"[log-stream error] {e}\n")
+                        except Exception:
+                            pass
 
-            if process.returncode == 0:
-                logging.info(f"[DONE] Job {job_name} completed successfully.")
-                if channel.readyState == "open":
-                    channel.send(f"TRAIN_JOB_END::{job_name}")
-            else:
-                logging.warning(f"[FAILED] Job {job_name} exited with code {process.returncode}.")
-                if channel.readyState == "open":
-                    channel.send(f"TRAIN_JOB_ERROR::{job_name}::{process.returncode}")
+                # Track start time for duration calculation
+                start_time = time.time()
 
-        channel.send("TRAINING_JOBS_DONE")
+                await stream_logs()
+                logging.info("Waiting for process to complete...")
+                await process.wait()
+                logging.info(f"Process completed with return code: {process.returncode}")
+
+                # Calculate training duration
+                training_duration = (time.time() - start_time) / 60  # Convert to minutes
+
+                if process.returncode == 0:
+                    logging.info(f"[DONE] Job {job_name} completed successfully.")
+                    if channel.readyState == "open":
+                        channel.send(f"TRAIN_JOB_END::{job_name}")
+
+                    # Send completion status via peer message
+                    if job_id and client_id:
+                        # Try to get model size if it exists
+                        model_path = Path(self.unzipped_dir) / self.output_dir / job_name
+                        model_size_mb = 0
+                        if model_path.exists():
+                            # Check for model files
+                            model_files = list(model_path.glob("*.ckpt")) + list(model_path.glob("*.h5"))
+                            if model_files:
+                                model_size_mb = sum(f.stat().st_size for f in model_files) / (1024 * 1024)
+
+                        await self._send_peer_message(client_id, {
+                            "app_message_type": "job_status",
+                            "job_id": job_id,
+                            "status": "running",
+                            "progress": 1.0,
+                            "message": f"Training completed: {job_name}"
+                        })
+                else:
+                    logging.warning(f"[FAILED] Job {job_name} exited with code {process.returncode}.")
+                    if channel.readyState == "open":
+                        channel.send(f"TRAIN_JOB_ERROR::{job_name}::{process.returncode}")
+
+                    # Send failure status via peer message
+                    if job_id and client_id:
+                        await self._send_peer_message(client_id, {
+                            "app_message_type": "job_failed",
+                            "job_id": job_id,
+                            "status": "failed",
+                            "error": {
+                                "code": "TRAINING_FAILED",
+                                "message": f"Training job {job_name} failed with exit code {process.returncode}",
+                                "recoverable": False
+                            }
+                        })
+
+            # All jobs completed - send final completion message
+            channel.send("TRAINING_JOBS_DONE")
+
+            # Send job completion message via peer message
+            if job_id and client_id:
+                await self._send_peer_message(client_id, {
+                    "app_message_type": "job_complete",
+                    "job_id": job_id,
+                    "status": "completed",
+                    "result": {
+                        "training_duration_minutes": training_duration,
+                        "total_jobs": len(training_jobs)
+                    },
+                    "transfer_method": "webrtc_datachannel",
+                    "ready_for_download": True
+                })
+
+        except Exception as e:
+            # Handle any unexpected errors during training
+            logging.error(f"Error during training execution: {e}")
+            if job_id and client_id:
+                await self._send_peer_message(client_id, {
+                    "app_message_type": "job_failed",
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": {
+                        "code": "EXECUTION_ERROR",
+                        "message": str(e),
+                        "recoverable": False
+                    }
+                })
+            raise
+
+        finally:
+            # Update status back to available when done
+            if self.current_job:
+                await self.update_status("available")
+                self.current_job = None
 
 
     async def run_track_workflow(self, channel: RTCDataChannel, track_script_path: str):
@@ -270,64 +685,162 @@ class RTCWorkerClient:
             channel: RTC data channel for sending progress
             track_script_path: Path to track-script.sh
         """
-        if not Path(track_script_path).exists():
-            logging.error("No track-script.sh found in package")
-            channel.send("INFERENCE_ERROR::No track script found")
-            return
+        # Get job ID and client ID from current_job if available
+        job_id = self.current_job.get("job_id") if self.current_job else None
+        client_id = self.current_job.get("client_id") if self.current_job else None
 
-        logging.info("Starting inference workflow...")
-        channel.send("INFERENCE_START")
+        try:
+            if not Path(track_script_path).exists():
+                logging.error("No track-script.sh found in package")
+                channel.send("INFERENCE_ERROR::No track script found")
 
-        # Make script executable
-        os.chmod(track_script_path, os.stat(track_script_path).st_mode | stat.S_IEXEC)
+                # Send error via peer message
+                if job_id and client_id:
+                    await self._send_peer_message(client_id, {
+                        "app_message_type": "job_failed",
+                        "job_id": job_id,
+                        "status": "failed",
+                        "error": {
+                            "code": "TRACK_SCRIPT_NOT_FOUND",
+                            "message": "No track script found in package",
+                            "recoverable": False
+                        }
+                    })
+                return
 
-        # Parse and run track commands
-        track_commands = self.parse_track_script(track_script_path)
+            logging.info("Starting inference workflow...")
+            channel.send("INFERENCE_START")
 
-        for cmd_args in track_commands:
-            job_name = "inference"
-            channel.send(f"INFERENCE_JOB_START::{job_name}")
+            # Send starting status via peer message
+            if job_id and client_id:
+                await self._send_peer_message(client_id, {
+                    "app_message_type": "job_status",
+                    "job_id": job_id,
+                    "status": "starting",
+                    "progress": 0.0,
+                    "message": "Initializing inference"
+                })
 
-            # Run sleap-nn track
-            process = await asyncio.create_subprocess_exec(
-                *cmd_args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=self.unzipped_dir,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"}
-            )
+            # Make script executable
+            os.chmod(track_script_path, os.stat(track_script_path).st_mode | stat.S_IEXEC)
 
-            # Stream logs
-            async for line in process.stdout:
-                decoded_line = line.decode().rstrip()
-                if channel.readyState == "open":
-                    try:
-                        channel.send(f"TRACK_LOG:{decoded_line}")
-                    except Exception as e:
-                        logging.error(f"Failed to send track log: {e}")
+            # Parse and run track commands
+            track_commands = self.parse_track_script(track_script_path)
+            start_time = time.time()
 
-            await process.wait()
+            for cmd_args in track_commands:
+                job_name = "inference"
+                channel.send(f"INFERENCE_JOB_START::{job_name}")
 
-            if process.returncode == 0:
-                logging.info("Inference completed successfully")
-                channel.send(f"INFERENCE_JOB_END::{job_name}")
+                # Run sleap-nn track
+                process = await asyncio.create_subprocess_exec(
+                    *cmd_args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=self.unzipped_dir,
+                    env={**os.environ, "PYTHONUNBUFFERED": "1"}
+                )
+
+                # Stream logs
+                async for line in process.stdout:
+                    decoded_line = line.decode().rstrip()
+                    if channel.readyState == "open":
+                        try:
+                            channel.send(f"TRACK_LOG:{decoded_line}")
+                        except Exception as e:
+                            logging.error(f"Failed to send track log: {e}")
+
+                await process.wait()
+
+                if process.returncode == 0:
+                    logging.info("Inference completed successfully")
+                    channel.send(f"INFERENCE_JOB_END::{job_name}")
+                else:
+                    logging.error(f"Inference failed with code {process.returncode}")
+                    channel.send(f"INFERENCE_JOB_ERROR::{job_name}::{process.returncode}")
+
+                    # Send failure via peer message
+                    if job_id and client_id:
+                        await self._send_peer_message(client_id, {
+                            "app_message_type": "job_failed",
+                            "job_id": job_id,
+                            "status": "failed",
+                            "error": {
+                                "code": "INFERENCE_FAILED",
+                                "message": f"Inference failed with exit code {process.returncode}",
+                                "recoverable": False
+                            }
+                        })
+                    return
+
+            # Calculate inference duration
+            inference_duration = (time.time() - start_time) / 60  # Convert to minutes
+
+            # Find and send predictions file
+            predictions_files = list(Path(self.unzipped_dir).glob("*.predictions.slp"))
+
+            if predictions_files:
+                predictions_path = predictions_files[0]
+                logging.info(f"Sending predictions: {predictions_path}")
+
+                # Send predictions back to client
+                await self.send_file(channel, str(predictions_path))
+
+                # Send completion via peer message
+                if job_id and client_id:
+                    predictions_size_mb = predictions_path.stat().st_size / (1024 * 1024)
+                    await self._send_peer_message(client_id, {
+                        "app_message_type": "job_complete",
+                        "job_id": job_id,
+                        "status": "completed",
+                        "result": {
+                            "predictions_size_mb": predictions_size_mb,
+                            "inference_duration_seconds": int((time.time() - start_time)),
+                            "predictions_file": predictions_path.name
+                        },
+                        "transfer_method": "webrtc_datachannel",
+                        "ready_for_download": True
+                    })
             else:
-                logging.error(f"Inference failed with code {process.returncode}")
-                channel.send(f"INFERENCE_JOB_ERROR::{job_name}::{process.returncode}")
+                logging.warning("No predictions file found")
 
-        # Find and send predictions file
-        predictions_files = list(Path(self.unzipped_dir).glob("*.predictions.slp"))
+                # Send warning via peer message
+                if job_id and client_id:
+                    await self._send_peer_message(client_id, {
+                        "app_message_type": "job_complete",
+                        "job_id": job_id,
+                        "status": "completed",
+                        "result": {
+                            "inference_duration_seconds": int((time.time() - start_time)),
+                            "warning": "No predictions file generated"
+                        },
+                        "transfer_method": "webrtc_datachannel",
+                        "ready_for_download": False
+                    })
 
-        if predictions_files:
-            predictions_path = predictions_files[0]
-            logging.info(f"Sending predictions: {predictions_path}")
+            channel.send("INFERENCE_JOBS_DONE")
 
-            # Send predictions back to client
-            await self.send_file(channel, str(predictions_path))
-        else:
-            logging.warning("No predictions file found")
+        except Exception as e:
+            # Handle any unexpected errors during inference
+            logging.error(f"Error during inference execution: {e}")
+            if job_id and client_id:
+                await self._send_peer_message(client_id, {
+                    "app_message_type": "job_failed",
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": {
+                        "code": "EXECUTION_ERROR",
+                        "message": str(e),
+                        "recoverable": False
+                    }
+                })
+            raise
 
-        channel.send("INFERENCE_JOBS_DONE")
+        finally:
+            # Update status back to available when done
+            if self.current_job:
+                await self.update_status("available")
+                self.current_job = None
 
 
     async def send_file(self, channel: RTCDataChannel, file_path: str):
@@ -636,9 +1149,12 @@ class RTCWorkerClient:
                     await self.clean_exit()
                     return
 
+                elif msg_type == 'peer_message':  # NEW: Handle peer messages (job requests, etc.)
+                    await self.handle_peer_message(data)
+
                 # Error handling
                 else:
-                    logging.ERROR(f"Unhandled message: {data}")
+                    logging.warning(f"Unhandled message type: {msg_type}")
                     
         
         except json.JSONDecodeError:
@@ -959,23 +1475,46 @@ class RTCWorkerClient:
             logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
 
             # Establish a WebSocket connection to the signaling server.
-            logging.info(f"Connecting to signaling server at {DNS}:{port_number}...")
-            async with websockets.connect(f"{DNS}:{port_number}") as websocket:
+            logging.info(f"Connecting to signaling server at {DNS}...")
+            async with websockets.connect(DNS) as websocket:
 
                 # Set the WebSocket connection for the worker.
                 self.websocket = websocket
 
-                # Register the worker with the server.
+                # Register the worker with the server (with v2.0 metadata).
                 logging.info(f"Registering {peer_id} with signaling server...")
+
+                # Try to get SLEAP version
+                try:
+                    import sleap
+                    sleap_version = sleap.__version__
+                except (ImportError, AttributeError):
+                    sleap_version = "unknown"
+
                 await self.websocket.send(json.dumps({
-                    'type': 'register', 
+                    'type': 'register',
                     'peer_id': peer_id, # identify a peer uniquely in the room (Zoom username)
                     'room_id': room_json['room_id'], # from backend API call for room identification (Zoom meeting ID)
                     'token': room_json['token'], # from backend API call for room joining (Zoom meeting password)
                     'id_token': id_token, # from anon. Cognito sign-in (Prevent peer spoofing, even anonymously)
-                    # w/ id_token, only Cognito authenticated users can register.
+                    'role': 'worker',  # NEW: worker role for discovery
+                    'metadata': {  # NEW: worker capabilities and status
+                        'tags': ['sleap-rtc', 'training-worker', 'inference-worker'],
+                        'properties': {
+                            'gpu_memory_mb': self.gpu_memory_mb,
+                            'gpu_model': self.gpu_model,
+                            'sleap_version': sleap_version,
+                            'cuda_version': self.cuda_version,
+                            'hostname': socket.gethostname(),
+                            'status': self.status,
+                            'max_concurrent_jobs': self.max_concurrent_jobs,
+                            'supported_models': self.supported_models,
+                            'supported_job_types': self.supported_job_types
+                        }
+                    }
                 }))
-                logging.info(f"{peer_id} sent to signaling server for registration!")
+                logging.info(f"{peer_id} sent to signaling server for registration with metadata!")
+                logging.info(f"Worker capabilities: GPU={self.gpu_model}, Memory={self.gpu_memory_mb}MB, CUDA={self.cuda_version}")
 
                 # Handle incoming messages from server (e.g. answers).
                 await self.handle_connection(self.pc, self.websocket, peer_id)
