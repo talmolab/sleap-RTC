@@ -605,10 +605,14 @@ class RTCClient:
         except Exception as e:
             logging.error(f"Failed to send peer message: {e}")
 
-    async def discover_workers(self, **filter_requirements) -> list:
-        """Discover available workers matching requirements (with fallback for old signaling servers).
+    async def discover_workers(self, room_id: str = None, **filter_requirements) -> list:
+        """Discover available workers matching requirements (DEPRECATED: use _discover_workers_in_room).
+
+        NOTE: This method is deprecated. For room-based discovery, use _discover_workers_in_room() instead.
+        This method is kept for backward compatibility but now requires room_id for security.
 
         Args:
+            room_id: Room ID to scope discovery (REQUIRED for security)
             **filter_requirements: Keyword arguments for filtering
                 - min_gpu_memory_mb: Minimum GPU memory
                 - model_type: Required model support
@@ -617,9 +621,15 @@ class RTCClient:
         Returns:
             List of worker peer info dicts
         """
-        # Build filters
+        # SECURITY: Require room_id to prevent global discovery
+        if not room_id:
+            logging.error("SECURITY: room_id required for worker discovery. Global discovery is disabled.")
+            return []
+
+        # Build filters with room_id for security
         filters = {
             "role": "worker",
+            "room_id": room_id,  # SECURITY: Always scope to room
             "tags": ["sleap-rtc"],
             "properties": {
                 "status": "available"
@@ -655,7 +665,7 @@ class RTCClient:
 
             if response_data.get("type") == "peer_list":
                 workers = response_data.get("peers", [])
-                logging.info(f"Discovered {len(workers)} available workers")
+                logging.info(f"Discovered {len(workers)} available workers in room {room_id}")
                 return workers
             elif response_data.get("type") == "error" and response_data.get("code") == "UNKNOWN_MESSAGE_TYPE":
                 # Old signaling server, fall back to manual peer_id
@@ -701,6 +711,193 @@ class RTCClient:
         # No fallback available
         logging.error("No workers discovered and no fallback peer_id available")
         return []
+
+    async def _register_with_room(self, room_id: str, token: str, id_token: str):
+        """Register client with room on signaling server.
+
+        Args:
+            room_id: Room ID to join
+            token: Room authentication token
+            id_token: Cognito ID token for this client
+        """
+        # Try to get SLEAP version
+        try:
+            import sleap
+            sleap_version = sleap.__version__
+        except (ImportError, AttributeError):
+            sleap_version = "unknown"
+
+        logging.info(f"Registering {self.peer_id} with room {room_id}...")
+
+        await self.websocket.send(json.dumps({
+            'type': 'register',
+            'peer_id': self.peer_id,
+            'room_id': room_id,
+            'token': token,
+            'id_token': id_token,
+            'role': 'client',
+            'metadata': {
+                'tags': ['sleap-rtc', 'training-client'],
+                'properties': {
+                    'sleap_version': sleap_version,
+                    'platform': platform.system(),
+                    'user_id': os.environ.get('USER', 'unknown')
+                }
+            }
+        }))
+
+        # Wait for registration confirmation
+        try:
+            response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
+            response_data = json.loads(response)
+            if response_data.get("type") == "registered_auth":
+                logging.info(f"Client {self.peer_id} successfully registered with room {room_id}")
+            else:
+                logging.warning(f"Unexpected registration response: {response_data}")
+        except asyncio.TimeoutError:
+            logging.error("Registration confirmation timeout")
+        except Exception as e:
+            logging.error(f"Registration error: {e}")
+
+    async def _discover_workers_in_room(self, room_id: str, min_gpu_memory: int = None) -> list:
+        """Discover available workers in the specified room.
+
+        Args:
+            room_id: Room ID to search for workers
+            min_gpu_memory: Minimum GPU memory in MB (optional filter)
+
+        Returns:
+            List of worker peer info dicts
+        """
+        # Build filters for room-scoped discovery
+        filters = {
+            "role": "worker",
+            "room_id": room_id,  # CRITICAL: Scope discovery to this room only
+            "tags": ["sleap-rtc"],
+            "properties": {
+                "status": "available"
+            }
+        }
+
+        # Add GPU memory filter if specified
+        if min_gpu_memory:
+            filters["properties"]["gpu_memory_mb"] = {
+                "$gte": min_gpu_memory
+            }
+
+        logging.info(f"Discovering workers in room {room_id}...")
+
+        try:
+            # Send discovery request
+            await self.websocket.send(json.dumps({
+                "type": "discover_peers",
+                "from_peer_id": self.peer_id,
+                "filters": filters
+            }))
+
+            # Wait for response
+            response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
+            response_data = json.loads(response)
+
+            if response_data.get("type") == "peer_list":
+                workers = response_data.get("peers", [])
+                logging.info(f"Discovered {len(workers)} available workers in room")
+                return workers
+            else:
+                logging.error(f"Unexpected discovery response: {response_data}")
+                return []
+
+        except asyncio.TimeoutError:
+            logging.error("Worker discovery timed out")
+            return []
+        except Exception as e:
+            logging.error(f"Worker discovery error: {e}")
+            return []
+
+    def _auto_select_worker(self, workers: list) -> str:
+        """Automatically select best worker based on GPU memory.
+
+        Args:
+            workers: List of worker peer info dicts
+
+        Returns:
+            Selected worker peer_id
+        """
+        if not workers:
+            raise ValueError("No workers available for auto-selection")
+
+        # Sort by GPU memory (descending)
+        sorted_workers = sorted(
+            workers,
+            key=lambda w: w.get('metadata', {}).get('properties', {}).get('gpu_memory_mb', 0),
+            reverse=True
+        )
+
+        selected = sorted_workers[0]
+        peer_id = selected['peer_id']
+        gpu_memory = selected.get('metadata', {}).get('properties', {}).get('gpu_memory_mb', 'unknown')
+
+        logging.info(f"Auto-selected worker {peer_id} (GPU memory: {gpu_memory}MB)")
+        return peer_id
+
+    async def _prompt_worker_selection(self, workers: list) -> str:
+        """Display workers and prompt user to select one.
+
+        Args:
+            workers: List of worker peer info dicts
+
+        Returns:
+            Selected worker peer_id
+        """
+        while True:
+            print("\n" + "=" * 80)
+            print("Available Workers:")
+            print("=" * 80)
+
+            for i, worker in enumerate(workers, 1):
+                peer_id = worker['peer_id']
+                metadata = worker.get('metadata', {}).get('properties', {})
+                gpu_model = metadata.get('gpu_model', 'Unknown')
+                gpu_memory = metadata.get('gpu_memory_mb', 0)
+                cuda_version = metadata.get('cuda_version', 'Unknown')
+                hostname = metadata.get('hostname', 'Unknown')
+
+                print(f"\n  {i}. {peer_id}")
+                print(f"     GPU Model:    {gpu_model}")
+                print(f"     GPU Memory:   {gpu_memory} MB")
+                print(f"     CUDA Version: {cuda_version}")
+                print(f"     Hostname:     {hostname}")
+
+            print("\n" + "=" * 80)
+            print("Commands: Enter worker number (1-{}), or 'refresh' to update list".format(len(workers)))
+            print("=" * 80)
+
+            choice = input("\nSelect worker: ").strip().lower()
+
+            if choice == 'refresh':
+                logging.info("Refreshing worker list...")
+                # Re-query workers
+                new_workers = await self._discover_workers_in_room(
+                    room_id=self.current_room_id,
+                    min_gpu_memory=None
+                )
+                if new_workers:
+                    workers = new_workers
+                    continue
+                else:
+                    print("No workers found. Showing previous list.")
+                    continue
+
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(workers):
+                    selected_worker = workers[idx]['peer_id']
+                    print(f"\nSelected: {selected_worker}")
+                    return selected_worker
+                else:
+                    print(f"Invalid selection. Please enter a number between 1 and {len(workers)}")
+            except ValueError:
+                print("Invalid input. Please enter a number or 'refresh'")
 
     async def _collect_job_responses(self, job_id: str, timeout: float) -> list:
         """Collect job responses from workers.
@@ -787,12 +984,16 @@ class RTCClient:
                     f"Job failed with code {error.get('code', 'UNKNOWN')}: {error.get('message', 'Unknown error')}"
                 )
 
-    async def submit_training_job(self, dataset_path: str, config: dict, **job_requirements):
-        """Submit training job to available workers.
+    async def submit_training_job(self, dataset_path: str, config: dict, room_id: str = None, **job_requirements):
+        """Submit training job to available workers (DEPRECATED: use room-based connection flow).
+
+        NOTE: This method is deprecated. Use the room-based connection flow with
+        _discover_workers_in_room() instead.
 
         Args:
             dataset_path: Path to training dataset
             config: Training configuration
+            room_id: Room ID to scope worker discovery (REQUIRED for security)
             **job_requirements: Job requirements (min_gpu_memory_mb, etc.)
 
         Returns:
@@ -802,8 +1003,9 @@ class RTCClient:
             NoWorkersAvailableError: No workers found matching requirements
             NoWorkersAcceptedError: No workers accepted the job request
         """
-        # 1. Discover available workers
+        # 1. Discover available workers (room-scoped for security)
         workers = await self.discover_workers(
+            room_id=room_id,
             job_type="training",
             **job_requirements
         )
@@ -915,22 +1117,31 @@ class RTCClient:
 
 
     async def run_client(
-            self, 
-            file_path: str = None, 
-            output_dir: str = ".", 
-            zmq_ports: list = None, 
+            self,
+            file_path: str = None,
+            output_dir: str = ".",
+            zmq_ports: list = None,
             config_info_list: list = None,
-            session_string: str = None
+            session_string: str = None,
+            room_id: str = None,
+            token: str = None,
+            worker_id: str = None,
+            auto_select: bool = False,
+            min_gpu_memory: int = None
         ):
         """Sends initial SDP offer to worker peer and establishes both connection & datachannel to be used by both parties.
-        
+
         Args:
-            peer_id: Unique str identifier for client
-            DNS: DNS address of the signaling server
-            port_number: Port number of the signaling server
             file_path: Path to a file to be sent to worker peer (usually zip file)
-            CLI: Boolean indicating if the client is running in CLI mode
             output_dir: Directory to save files received from worker peer
+            zmq_ports: List of ZMQ ports [controller, publish]
+            config_info_list: Config info for updating GUI (None for CLI)
+            session_string: Session string for direct connection to specific worker
+            room_id: Room ID for room-based worker discovery
+            token: Room token for authentication
+            worker_id: Specific worker peer-id to connect to (skips discovery)
+            auto_select: Automatically select best worker by GPU memory
+            min_gpu_memory: Minimum GPU memory in MB for worker filtering
         Returns:
             None
         """
@@ -974,73 +1185,89 @@ class RTCClient:
             # logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
 
             # Initate the WebSocket connection to the signaling server.
-            async with websockets.connect(f"{self.DNS}:{self.port_number}") as websocket:
+            async with websockets.connect(self.DNS) as websocket:
 
-                # Initate the websocket for the GUI client (so other functions can use). 
+                # Initate the websocket for the GUI client (so other functions can use).
                 self.websocket = websocket
 
-                # Prompt for session string.
-                if not session_string:
-                    session_str_json = None
-                    while True:
-                        session_string = input("Please enter RTC session string (or type 'exit' to quit): ")
-                        if session_string.lower() == "exit":
-                            print("Exiting client.")
-                            return
-                        try:
-                            session_str_json = self.parse_session_string(session_string)
-                            break  # Exit loop if parsing succeeds
-                        except ValueError as e:
-                            print(f"Error: {e}")
-                            print("Please try again or type 'exit' to quit.")
+                # BRANCH 1: Session string (direct connection to specific worker)
+                if session_string:
+                    logging.info("Using session string for direct worker connection")
+
+                    # Prompt for session string if not provided
+                    if not session_string:
+                        session_str_json = None
+                        while True:
+                            session_string = input("Please enter RTC session string (or type 'exit' to quit): ")
+                            if session_string.lower() == "exit":
+                                print("Exiting client.")
+                                return
+                            try:
+                                session_str_json = self.parse_session_string(session_string)
+                                break  # Exit loop if parsing succeeds
+                            except ValueError as e:
+                                print(f"Error: {e}")
+                                print("Please try again or type 'exit' to quit.")
+                    else:
+                        session_str_json = self.parse_session_string(session_string)
+
+                    # Extract worker credentials from session string.
+                    worker_room_id = session_str_json.get("room_id")
+                    worker_token = session_str_json.get("token")
+                    worker_peer_id = session_str_json.get("peer_id")
+
+                    # Register with room
+                    await self._register_with_room(
+                        room_id=worker_room_id,
+                        token=worker_token,
+                        id_token=id_token
+                    )
+
+                    # Set target worker from session string
+                    self.target_worker = worker_peer_id
+                    logging.info(f"Selected worker from session string: {self.target_worker}")
+
+                # BRANCH 2: Room-based discovery
+                elif room_id:
+                    logging.info(f"Using room-based worker discovery: room_id={room_id}")
+
+                    # Store room info for discovery
+                    self.current_room_id = room_id
+
+                    # Register with room
+                    await self._register_with_room(
+                        room_id=room_id,
+                        token=token,
+                        id_token=id_token
+                    )
+
+                    # Discover workers in room
+                    workers = await self._discover_workers_in_room(
+                        room_id=room_id,
+                        min_gpu_memory=min_gpu_memory
+                    )
+
+                    if not workers:
+                        logging.error("No available workers found in room")
+                        return
+
+                    # Select worker based on mode
+                    if worker_id:
+                        # Direct worker selection
+                        self.target_worker = worker_id
+                        logging.info(f"Using specified worker: {worker_id}")
+                    elif auto_select:
+                        # Auto-select best worker
+                        self.target_worker = self._auto_select_worker(workers)
+                        logging.info(f"Auto-selected worker: {self.target_worker}")
+                    else:
+                        # Interactive worker selection
+                        self.target_worker = await self._prompt_worker_selection(workers)
+                        logging.info(f"User selected worker: {self.target_worker}")
+
                 else:
-                    session_str_json = self.parse_session_string(session_string)
-                
-                # Extract worker credentials from session string.
-                worker_room_id = session_str_json.get("room_id")
-                worker_token = session_str_json.get("token")
-                worker_peer_id = session_str_json.get("peer_id")
-
-                # Register the client with the signaling server (with v2.0 metadata).
-                logging.info(f"Registering {self.peer_id} with signaling server...")
-
-                # Try to get SLEAP version
-                try:
-                    import sleap
-                    sleap_version = sleap.__version__
-                except (ImportError, AttributeError):
-                    sleap_version = "unknown"
-
-                await self.websocket.send(json.dumps({
-                    'type': 'register',
-                    'peer_id': self.peer_id, # should be own peer_id (Zoom username)
-                    'room_id': worker_room_id, # should match Worker's room_id (Zoom meeting ID)
-                    'token': worker_token, # should match Worker's token (Zoom meeting password)
-                    'id_token': id_token, # should be own Cognito ID token
-                    'role': 'client',  # NEW: client role for discovery
-                    'metadata': {  # NEW: client info
-                        'tags': ['sleap-rtc', 'training-client'],
-                        'properties': {
-                            'sleap_version': sleap_version,
-                            'platform': platform.system(),
-                            'user_id': os.environ.get('USER', 'unknown')
-                        }
-                    }
-                }))
-                logging.info(f"{self.peer_id} sent to signaling server for registration with metadata!")
-
-                # # Query for available workers.
-                # await websocket.send(json.dumps({'type': 'query'}))
-                # response = await websocket.recv()
-                # available_workers = json.loads(response)["peers"]
-                # logging.info(f"Available workers: {available_workers}")
-
-                # Select a worker to connect to.
-                # target_worker = available_workers[0] if available_workers else None
-
-                # self.peer_id should match Worker's peer_id (Zoom username).
-                self.target_worker = worker_peer_id
-                logging.info(f"Selected worker: {self.target_worker}")
+                    logging.error("No connection method provided (session_string or room_id required)")
+                    return
 
                 if not self.target_worker:
                     logging.info("No target worker given. Cannot connect.")

@@ -552,7 +552,7 @@ async def run_worker(pc, peer_id: str, DNS: str, port_number):
 
 
     # Establish a WebSocket connection to the signaling server.
-    async with websockets.connect(f"{DNS}:{port_number}") as websocket:
+    async with websockets.connect(DNS) as websocket:
 
         # Register the worker with the server.
         await websocket.send(json.dumps({'type': 'register', 'peer_id': peer_id}))

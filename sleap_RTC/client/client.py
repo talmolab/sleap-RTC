@@ -520,7 +520,7 @@ async def run_client(
     
 
     # Initate the WebSocket connection to the signaling server.
-    async with websockets.connect(f"{DNS}:{port_number}") as websocket:
+    async with websockets.connect(DNS) as websocket:
 
         # Register the client with the signaling server.
         await websocket.send(json.dumps({'type': 'register', 'peer_id': peer_id}))

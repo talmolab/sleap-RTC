@@ -54,11 +54,36 @@ def worker(room_id, token):
 
 @cli.command(name="client-train")
 @click.option(
+    "--session-string",
     "--session_string",
     "-s",
     type=str,
     required=False,
-    help="Session string to connect to the sleap-RTC signaling server (optional with worker discovery).",
+    help="Session string for direct connection to a specific worker.",
+)
+@click.option(
+    "--room-id",
+    type=str,
+    required=False,
+    help="Room ID for room-based worker discovery.",
+)
+@click.option(
+    "--token",
+    type=str,
+    required=False,
+    help="Room token for authentication (required with --room-id).",
+)
+@click.option(
+    "--worker-id",
+    type=str,
+    required=False,
+    help="Specific worker peer-id to connect to (skips discovery).",
+)
+@click.option(
+    "--auto-select",
+    is_flag=True,
+    default=False,
+    help="Automatically select best worker by GPU memory (use with --room-id).",
 )
 @click.option(
     "--pkg_path",
@@ -86,44 +111,90 @@ def worker(room_id, token):
     type=int,
     required=False,
     default=None,
-    help="Minimum GPU memory in MB required for training (enables worker discovery).",
-)
-@click.option(
-    "--discover-workers",
-    is_flag=True,
-    default=False,
-    help="Enable automatic worker discovery (requires signaling server v2.0+).",
+    help="Minimum GPU memory in MB required for training.",
 )
 def client_train(**kwargs):
     """Run remote training on a worker.
 
-    With --discover-workers flag, automatically finds and selects the best
-    available worker. Otherwise, uses the session string for manual connection.
+    Connection modes (mutually exclusive):
+
+    1. Session string (direct): --session-string SESSION
+       Connect directly to a specific worker using its session string.
+
+    2. Room-based discovery: --room-id ROOM --token TOKEN
+       Join a room and discover available workers. Supports:
+       - Interactive selection (default)
+       - Auto-select: --auto-select
+       - Direct worker: --worker-id PEER_ID
+       - GPU filter: --min-gpu-memory MB
     """
+    # Extract connection options
+    session_string = kwargs.pop("session_string", None)
+    room_id = kwargs.pop("room_id", None)
+    token = kwargs.pop("token", None)
+    worker_id = kwargs.pop("worker_id", None)
+    auto_select = kwargs.pop("auto_select", False)
+    min_gpu_memory = kwargs.pop("min_gpu_memory", None)
+
+    # Validation: Must provide either session string OR room credentials
+    has_session = session_string is not None
+    has_room = room_id is not None
+
+    if has_session and has_room:
+        logger.error("Connection modes are mutually exclusive. Use only one of:")
+        logger.error("  --session-string (direct connection)")
+        logger.error("  --room-id and --token (room-based discovery)")
+        sys.exit(1)
+
+    if not has_session and not has_room:
+        logger.error("Must provide a connection method:")
+        logger.error("  --session-string SESSION (direct connection)")
+        logger.error("  --room-id ROOM --token TOKEN (room-based discovery)")
+        sys.exit(1)
+
+    # Validation: room-id and token must be together
+    if (room_id and not token) or (token and not room_id):
+        logger.error("Both --room-id and --token must be provided together")
+        sys.exit(1)
+
+    # Validation: worker selection options require room-id
+    if (worker_id or auto_select) and not room_id:
+        logger.error("--worker-id and --auto-select require --room-id and --token")
+        sys.exit(1)
+
+    # Validation: worker-id and auto-select are mutually exclusive
+    if worker_id and auto_select:
+        logger.error("Cannot use both --worker-id and --auto-select")
+        sys.exit(1)
+
+    # Setup ZMQ ports
     logger.info(f"Using controller port: {kwargs['controller_port']}")
     logger.info(f"Using publish port: {kwargs['publish_port']}")
     kwargs["zmq_ports"] = dict()
     kwargs["zmq_ports"]["controller"] = kwargs.pop("controller_port")
     kwargs["zmq_ports"]["publish"] = kwargs.pop("publish_port")
 
-    # Store discovery options
-    discover_workers = kwargs.pop("discover_workers", False)
-    min_gpu_memory = kwargs.pop("min_gpu_memory", None)
+    # Handle room-based connection
+    if room_id:
+        logger.info(f"Room-based connection: room_id={room_id}")
+        kwargs["room_id"] = room_id
+        kwargs["token"] = token
 
-    if discover_workers:
-        logger.info("Worker discovery enabled")
+        if worker_id:
+            logger.info(f"Direct worker connection: worker_id={worker_id}")
+            kwargs["worker_id"] = worker_id
+        elif auto_select:
+            logger.info("Auto-select mode enabled")
+            kwargs["auto_select"] = True
+        else:
+            logger.info("Interactive worker selection mode")
+
         if min_gpu_memory:
-            logger.info(f"Minimum GPU memory requirement: {min_gpu_memory}MB")
-        kwargs["job_requirements"] = {
-            "min_gpu_memory_mb": min_gpu_memory
-        } if min_gpu_memory else {}
-    else:
-        if not kwargs.get("session_string"):
-            logger.error("Either --session_string or --discover-workers must be provided")
-            sys.exit(1)
+            logger.info(f"Minimum GPU memory filter: {min_gpu_memory}MB")
+            kwargs["min_gpu_memory"] = min_gpu_memory
 
     return run_RTCclient(
-        session_string=kwargs.pop("session_string", None),
+        session_string=session_string,
         pkg_path=kwargs.pop("pkg_path"),
         zmq_ports=kwargs.pop("zmq_ports"),
         **kwargs
@@ -131,11 +202,36 @@ def client_train(**kwargs):
 
 @cli.command(name="client-track")
 @click.option(
+    "--session-string",
     "--session_string",
     "-s",
     type=str,
     required=False,
-    help="Session string to connect to the sleap-RTC signaling server (optional with worker discovery).",
+    help="Session string for direct connection to a specific worker.",
+)
+@click.option(
+    "--room-id",
+    type=str,
+    required=False,
+    help="Room ID for room-based worker discovery.",
+)
+@click.option(
+    "--token",
+    type=str,
+    required=False,
+    help="Room token for authentication (required with --room-id).",
+)
+@click.option(
+    "--worker-id",
+    type=str,
+    required=False,
+    help="Specific worker peer-id to connect to (skips discovery).",
+)
+@click.option(
+    "--auto-select",
+    is_flag=True,
+    default=False,
+    help="Automatically select best worker by GPU memory (use with --room-id).",
 )
 @click.option(
     "--data_path",
@@ -169,40 +265,85 @@ def client_train(**kwargs):
     type=int,
     required=False,
     default=None,
-    help="Minimum GPU memory in MB required for inference (enables worker discovery).",
-)
-@click.option(
-    "--discover-workers",
-    is_flag=True,
-    default=False,
-    help="Enable automatic worker discovery (requires signaling server v2.0+).",
+    help="Minimum GPU memory in MB required for inference.",
 )
 def client_track(**kwargs):
     """Run remote inference on a worker with pre-trained models.
 
-    With --discover-workers flag, automatically finds and selects the best
-    available worker. Otherwise, uses the session string for manual connection.
-    """
-    logger.info(f"Running inference with models: {kwargs['model_paths']}")
+    Connection modes (mutually exclusive):
 
-    # Store discovery options
-    discover_workers = kwargs.pop("discover_workers", False)
+    1. Session string (direct): --session-string SESSION
+       Connect directly to a specific worker using its session string.
+
+    2. Room-based discovery: --room-id ROOM --token TOKEN
+       Join a room and discover available workers. Supports:
+       - Interactive selection (default)
+       - Auto-select: --auto-select
+       - Direct worker: --worker-id PEER_ID
+       - GPU filter: --min-gpu-memory MB
+    """
+    # Extract connection options
+    session_string = kwargs.pop("session_string", None)
+    room_id = kwargs.pop("room_id", None)
+    token = kwargs.pop("token", None)
+    worker_id = kwargs.pop("worker_id", None)
+    auto_select = kwargs.pop("auto_select", False)
     min_gpu_memory = kwargs.pop("min_gpu_memory", None)
 
-    if discover_workers:
-        logger.info("Worker discovery enabled for inference")
+    # Validation: Must provide either session string OR room credentials
+    has_session = session_string is not None
+    has_room = room_id is not None
+
+    if has_session and has_room:
+        logger.error("Connection modes are mutually exclusive. Use only one of:")
+        logger.error("  --session-string (direct connection)")
+        logger.error("  --room-id and --token (room-based discovery)")
+        sys.exit(1)
+
+    if not has_session and not has_room:
+        logger.error("Must provide a connection method:")
+        logger.error("  --session-string SESSION (direct connection)")
+        logger.error("  --room-id ROOM --token TOKEN (room-based discovery)")
+        sys.exit(1)
+
+    # Validation: room-id and token must be together
+    if (room_id and not token) or (token and not room_id):
+        logger.error("Both --room-id and --token must be provided together")
+        sys.exit(1)
+
+    # Validation: worker selection options require room-id
+    if (worker_id or auto_select) and not room_id:
+        logger.error("--worker-id and --auto-select require --room-id and --token")
+        sys.exit(1)
+
+    # Validation: worker-id and auto-select are mutually exclusive
+    if worker_id and auto_select:
+        logger.error("Cannot use both --worker-id and --auto-select")
+        sys.exit(1)
+
+    logger.info(f"Running inference with models: {kwargs['model_paths']}")
+
+    # Handle room-based connection
+    if room_id:
+        logger.info(f"Room-based connection: room_id={room_id}")
+        kwargs["room_id"] = room_id
+        kwargs["token"] = token
+
+        if worker_id:
+            logger.info(f"Direct worker connection: worker_id={worker_id}")
+            kwargs["worker_id"] = worker_id
+        elif auto_select:
+            logger.info("Auto-select mode enabled")
+            kwargs["auto_select"] = True
+        else:
+            logger.info("Interactive worker selection mode")
+
         if min_gpu_memory:
-            logger.info(f"Minimum GPU memory requirement: {min_gpu_memory}MB")
-        kwargs["job_requirements"] = {
-            "min_gpu_memory_mb": min_gpu_memory
-        } if min_gpu_memory else {}
-    else:
-        if not kwargs.get("session_string"):
-            logger.error("Either --session_string or --discover-workers must be provided")
-            sys.exit(1)
+            logger.info(f"Minimum GPU memory filter: {min_gpu_memory}MB")
+            kwargs["min_gpu_memory"] = min_gpu_memory
 
     return run_RTCclient_track(
-        session_string=kwargs.pop("session_string", None),
+        session_string=session_string,
         data_path=kwargs.pop("data_path"),
         model_paths=list(kwargs.pop("model_paths")),
         output=kwargs.pop("output"),

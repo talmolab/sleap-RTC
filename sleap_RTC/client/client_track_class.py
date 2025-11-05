@@ -442,7 +442,7 @@ sleap-nn track \\
             logging.info(f"Anonymous ID token received: {id_token}")
 
             # Connect to signaling server
-            async with websockets.connect(f"{self.DNS}:{self.port_number}") as websocket:
+            async with websockets.connect(self.DNS) as websocket:
                 self.websocket = websocket
 
                 # Parse session string
