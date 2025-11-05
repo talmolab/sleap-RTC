@@ -6,8 +6,9 @@ Currently, clients must use session strings that encode a specific worker's peer
 - Difficult to support multiple workers in the same room competing for jobs
 - Poor experience when the target worker is busy or offline
 - No support for load balancing across workers
+- **Critical issue**: Workers using session strings accept WebRTC connections regardless of their busy status (no status checking in the offer/answer flow at worker_class.py:1103-1121), which can lead to multiple clients connecting to the same worker simultaneously and causing job conflicts
 
-The primary use case requires many workers and at least one client connected to the same room, where clients can query which workers are available and select the best one for their job.
+The primary use case requires many workers and at least one client connected to the same room, where clients can query which workers are available and select the best one for their job. The new room-based connection approach solves the concurrent connection problem by using the v2.0 job negotiation protocol (worker_class.py:261-290) which properly checks worker status and rejects connections when busy.
 
 ## What Changes
 
