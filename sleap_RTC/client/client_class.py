@@ -745,7 +745,19 @@ class RTCClient:
                 }
             }
         }))
-        logging.info(f"Client {self.peer_id} registered with room {room_id}")
+
+        # Wait for registration confirmation
+        try:
+            response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
+            response_data = json.loads(response)
+            if response_data.get("type") == "registered_auth":
+                logging.info(f"Client {self.peer_id} successfully registered with room {room_id}")
+            else:
+                logging.warning(f"Unexpected registration response: {response_data}")
+        except asyncio.TimeoutError:
+            logging.error("Registration confirmation timeout")
+        except Exception as e:
+            logging.error(f"Registration error: {e}")
 
     async def _discover_workers_in_room(self, room_id: str, min_gpu_memory: int = None) -> list:
         """Discover available workers in the specified room.
@@ -1173,7 +1185,7 @@ class RTCClient:
             # logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
 
             # Initate the WebSocket connection to the signaling server.
-            async with websockets.connect(f"{self.DNS}:{self.port_number}") as websocket:
+            async with websockets.connect(self.DNS) as websocket:
 
                 # Initate the websocket for the GUI client (so other functions can use).
                 self.websocket = websocket
