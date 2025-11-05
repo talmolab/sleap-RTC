@@ -521,6 +521,11 @@ class RTCWorkerClient:
                     f"trainer_config.run_name={job_name}",
                     "trainer_config.zmq.controller_port=9000",
                     "trainer_config.zmq.publish_port=9001",
+                    # macOS compatibility: disable multiprocessing to avoid h5py pickling errors
+                    # "trainer_config.train_data_loader.num_workers=0",
+                    # "trainer_config.val_data_loader.num_workers=0",
+                    # Force CPU training to avoid MPS/GPU issues on macOS
+                    # "trainer_config.trainer_accelerator=cpu",
                     # "trainer_config.enable_progress_bar=false"
                 ]
                 logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.unzipped_dir})")
