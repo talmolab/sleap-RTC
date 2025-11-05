@@ -7,13 +7,16 @@ Currently, clients must use session strings that encode a specific worker's peer
 - Poor experience when the target worker is busy or offline
 - No support for load balancing across workers
 - **Critical issue**: Workers using session strings accept WebRTC connections regardless of their busy status (no status checking in the offer/answer flow at worker_class.py:1103-1121), which can lead to multiple clients connecting to the same worker simultaneously and causing job conflicts
+- **Security issue**: The `--discover-workers` flag allows global discovery across all rooms, potentially exposing compute resources to unauthorized clients
 
 The primary use case requires many workers and at least one client connected to the same room, where clients can query which workers are available and select the best one for their job. The new room-based connection approach solves the concurrent connection problem by using the v2.0 job negotiation protocol (worker_class.py:261-290) which properly checks worker status and rejects connections when busy.
+
+**Security Model**: Rooms are the security boundary. Workers are only discoverable within their own room, requiring clients to have explicit room credentials (room_id + token). This prevents unauthorized access to compute resources across room boundaries.
 
 ## What Changes
 
 - **Two-phase client connection**: Clients join rooms first, then discover and select workers before job submission
-- **Room-based worker discovery**: Clients can query all available workers in a room with their capabilities (GPU model, memory, status)
+- **Room-scoped worker discovery**: Clients can query all available workers within their room with capabilities (GPU model, memory, status)
 - **Worker selection modes**:
   - Interactive: Display list of workers and prompt user to select
   - Auto-select: Automatically choose best worker based on GPU memory
@@ -24,6 +27,7 @@ The primary use case requires many workers and at least one client connected to 
   - `--worker-id` to specify a particular worker
   - `--auto-select` flag for automatic worker selection
   - Existing `--session-string` remains for backward compatibility
+- **Security fix**: Remove `--discover-workers` flag (global discovery across all rooms) to enforce room-based access control
 - **Real-time status updates**: Workers update their status (available/busy/reserved) via signaling server
 - **Room credential sharing**: Workers print room credentials (room-id and token) for other workers and clients to join
 - **Worker-side status check safeguard**: Workers check their status before accepting WebRTC offers and reject connections when busy, preventing concurrent connection conflicts even for session string connections
@@ -32,12 +36,14 @@ The primary use case requires many workers and at least one client connected to 
 
 - Affected specs: client-connection, worker-discovery, cli (new capabilities)
 - Affected code:
-  - `sleap_rtc/cli.py:55-211` - Add room-based connection options
+  - `sleap_rtc/cli.py:55-201` - Add room-based connection options, **remove --discover-workers**
   - `sleap_rtc/rtc_client.py:8-44` - Add room credentials and worker selection parameters
   - `sleap_rtc/rtc_worker.py:11-42` - Print room credentials for sharing
-  - `sleap_rtc/client/client_class.py:608-704,917-1070` - Implement worker discovery and selection
+  - `sleap_rtc/client/client_class.py:608-704,917-1070` - Implement room-scoped worker discovery and selection
   - `sleap_rtc/worker/worker_class.py:1103-1121` - **Add status check in offer/answer handling** (safeguard)
   - `sleap_rtc/worker/worker_class.py:1437-1536` - Print room credentials on startup
   - `sleap_rtc/client/client_class.py:268-299` - Handle worker busy rejection errors
 - **Backward compatible**: Existing session string workflow continues to work
-- **Breaking changes**: None - all changes are additive (status check rejection is a bug fix)
+- **Breaking changes**:
+  - **SECURITY**: Removed `--discover-workers` flag (global discovery). Users must use `--room-id` + `--token` or `--session-string`
+  - Status check rejection is a bug fix that prevents concurrent connections
