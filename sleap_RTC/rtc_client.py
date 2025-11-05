@@ -1,5 +1,4 @@
 import asyncio
-import uuid
 import logging
 
 from sleap_rtc.client.client_class import RTCClient
