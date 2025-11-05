@@ -1124,14 +1124,26 @@ class RTCWorkerClient:
                     self.received_files.clear()
 
                 elif msg_type == 'registered_auth':
-                    logging.info(f"Worker authenticated with server. Please copy the following session string:")
-                    session_string = self.generate_session_string(
-                        data.get('room_id'), # room ID
-                        data.get('token'), # room password
-                        data.get('peer_id') # peer's ID
-                    )
-                    logging.info(session_string)
-                    # ex. 'sleap-session:eyJyb29tX2lkIjogImFiYzEyMyIsICJ0b2tlbiI6I'
+                    room_id = data.get('room_id')
+                    token = data.get('token')
+                    peer_id = data.get('peer_id')
+
+                    # Print session string for direct worker connection (backward compatibility)
+                    logging.info("=" * 80)
+                    logging.info("Worker authenticated with server")
+                    logging.info("=" * 80)
+                    logging.info("")
+                    logging.info("Session string for DIRECT connection to this worker:")
+                    session_string = self.generate_session_string(room_id, token, peer_id)
+                    logging.info(f"  {session_string}")
+                    logging.info("")
+                    logging.info("Room credentials for OTHER workers/clients to join this room:")
+                    logging.info(f"  Room ID: {room_id}")
+                    logging.info(f"  Token:   {token}")
+                    logging.info("")
+                    logging.info("Use session string with --session-string for direct connection")
+                    logging.info("Use room credentials with --room-id and --token for worker discovery")
+                    logging.info("=" * 80)
 
                 # Handle "trickle ICE" for non-local ICE candidates (might be unnecessary)
                 elif msg_type == 'candidate':
