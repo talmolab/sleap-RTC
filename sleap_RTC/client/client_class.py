@@ -10,6 +10,8 @@ import logging
 import os
 import re
 import zmq
+import platform
+import time
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 from functools import partial
@@ -18,6 +20,12 @@ from typing import List, Optional, Text, Tuple
 from websockets.client import ClientConnection
 
 from sleap_rtc.config import get_config
+from sleap_rtc.exceptions import (
+    NoWorkersAvailableError,
+    NoWorkersAcceptedError,
+    JobFailedError,
+    WorkerDiscoveryError
+)
 
 # Setup logging.
 logging.basicConfig(level=logging.INFO)
@@ -51,6 +59,7 @@ class RTCClient:
         self.received_files = {}
         self.target_worker = None
         self.reconnecting = False
+        self.current_job_id = None  # For tracking active job submissions
     
 
     def parse_session_string(self, session_string: str):
@@ -298,6 +307,14 @@ class RTCClient:
                 # Handle the "registered_auth" message from the signaling server.
                 elif data.get('type') == 'registered_auth':
                     logging.info(f"Client authenticated with server.")
+
+                # Handle peer messages (job responses, status updates, etc.)
+                elif data.get('type') == 'peer_message':
+                    # Peer messages are handled by _collect_job_responses and _monitor_job_progress
+                    # They should be processed by those methods, not here
+                    # Just log for debugging
+                    payload = data.get('payload', {})
+                    logging.debug(f"Received peer message: {payload.get('app_message_type', 'unknown')}")
 
                 # Unhandled message types.
                 else:
@@ -570,6 +587,298 @@ class RTCClient:
 
 
     # @pc.on("iceconnectionstatechange")
+    async def _send_peer_message(self, to_peer_id: str, payload: dict):
+        """Send peer message via signaling server.
+
+        Args:
+            to_peer_id: Target peer ID
+            payload: Application-specific message payload
+        """
+        try:
+            await self.websocket.send(json.dumps({
+                "type": "peer_message",
+                "from_peer_id": self.peer_id,
+                "to_peer_id": to_peer_id,
+                "payload": payload
+            }))
+            logging.info(f"Sent peer message to {to_peer_id}: {payload.get('app_message_type', 'unknown')}")
+        except Exception as e:
+            logging.error(f"Failed to send peer message: {e}")
+
+    async def discover_workers(self, **filter_requirements) -> list:
+        """Discover available workers matching requirements (with fallback for old signaling servers).
+
+        Args:
+            **filter_requirements: Keyword arguments for filtering
+                - min_gpu_memory_mb: Minimum GPU memory
+                - model_type: Required model support
+                - job_type: "training" or "inference"
+
+        Returns:
+            List of worker peer info dicts
+        """
+        # Build filters
+        filters = {
+            "role": "worker",
+            "tags": ["sleap-rtc"],
+            "properties": {
+                "status": "available"
+            }
+        }
+
+        # Add GPU memory requirement
+        if "min_gpu_memory_mb" in filter_requirements:
+            filters["properties"]["gpu_memory_mb"] = {
+                "$gte": filter_requirements["min_gpu_memory_mb"]
+            }
+
+        # Add job type requirement
+        if "job_type" in filter_requirements:
+            job_type = filter_requirements["job_type"]
+            if job_type == "training":
+                filters["tags"].append("training-worker")
+            elif job_type == "inference":
+                filters["tags"].append("inference-worker")
+
+        # Try new discovery API
+        try:
+            # Send discovery request
+            await self.websocket.send(json.dumps({
+                "type": "discover_peers",
+                "from_peer_id": self.peer_id,
+                "filters": filters
+            }))
+
+            # Wait for response
+            response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
+            response_data = json.loads(response)
+
+            if response_data.get("type") == "peer_list":
+                workers = response_data.get("peers", [])
+                logging.info(f"Discovered {len(workers)} available workers")
+                return workers
+            elif response_data.get("type") == "error" and response_data.get("code") == "UNKNOWN_MESSAGE_TYPE":
+                # Old signaling server, fall back to manual peer_id
+                logging.warning("Signaling server doesn't support discovery, using manual peer_id")
+                return await self._fallback_manual_peer_selection()
+            else:
+                logging.error(f"Unexpected response: {response_data}")
+                return []
+
+        except asyncio.TimeoutError:
+            logging.warning("Discovery timed out, falling back to manual peer_id")
+            return await self._fallback_manual_peer_selection()
+        except Exception as e:
+            logging.error(f"Discovery error: {e}, falling back to manual peer_id")
+            return await self._fallback_manual_peer_selection()
+
+    async def _fallback_manual_peer_selection(self) -> list:
+        """Fallback: Use manually configured worker peer_id.
+
+        Returns:
+            List with single worker entry if configured, empty list otherwise
+        """
+        # Check if we have a target worker already set (from session string)
+        if self.target_worker:
+            logging.info(f"Using target worker from session: {self.target_worker}")
+            return [{
+                "peer_id": self.target_worker,
+                "role": "worker",
+                "metadata": {}
+            }]
+
+        # Check environment variable
+        worker_peer_id = os.environ.get("SLEAP_RTC_WORKER_PEER_ID")
+
+        if worker_peer_id:
+            logging.info(f"Using worker from environment: {worker_peer_id}")
+            return [{
+                "peer_id": worker_peer_id,
+                "role": "worker",
+                "metadata": {}
+            }]
+
+        # No fallback available
+        logging.error("No workers discovered and no fallback peer_id available")
+        return []
+
+    async def _collect_job_responses(self, job_id: str, timeout: float) -> list:
+        """Collect job responses from workers.
+
+        Args:
+            job_id: Job ID to collect responses for
+            timeout: Timeout in seconds
+
+        Returns:
+            List of job response dicts
+        """
+        responses = []
+        deadline = time.time() + timeout
+
+        while time.time() < deadline:
+            try:
+                remaining = deadline - time.time()
+                msg = await asyncio.wait_for(
+                    self.websocket.recv(),
+                    timeout=max(0.1, remaining)
+                )
+
+                data = json.loads(msg)
+
+                if data.get("type") == "peer_message":
+                    payload = data.get("payload", {})
+                    if (payload.get("app_message_type") == "job_response" and
+                        payload.get("job_id") == job_id):
+
+                        responses.append({
+                            "worker_id": data.get("from_peer_id"),
+                            "accepted": payload.get("accepted"),
+                            "reason": payload.get("reason", ""),
+                            "estimated_duration_minutes": payload.get("estimated_duration_minutes", 0),
+                            "estimated_start_time_sec": payload.get("estimated_start_time_sec", 0),
+                            "worker_info": payload.get("worker_info", {})
+                        })
+
+            except asyncio.TimeoutError:
+                break
+
+        return responses
+
+    async def _monitor_job_progress(self, job_id: str):
+        """Monitor job progress and display updates.
+
+        Args:
+            job_id: Job ID to monitor
+        """
+        while True:
+            msg = await self.websocket.recv()
+            data = json.loads(msg)
+
+            if data.get("type") != "peer_message":
+                continue
+
+            payload = data.get("payload", {})
+
+            if payload.get("job_id") != job_id:
+                continue
+
+            app_msg_type = payload.get("app_message_type")
+
+            if app_msg_type == "job_status":
+                # Display progress
+                progress = payload.get("progress", 0)
+                message = payload.get("message", "")
+                details = payload.get("details", {})
+
+                logging.info(f"Job progress: {progress*100:.1f}% - {message}")
+                if details:
+                    logging.info(f"Details: {details}")
+
+            elif app_msg_type == "job_complete":
+                logging.info("Job completed successfully!")
+                result = payload.get("result", {})
+                logging.info(f"Result: {result}")
+                break
+
+            elif app_msg_type == "job_failed":
+                error = payload.get("error", {})
+                logging.error(f"Job failed: {error.get('message', 'Unknown error')}")
+                raise JobFailedError(
+                    f"Job failed with code {error.get('code', 'UNKNOWN')}: {error.get('message', 'Unknown error')}"
+                )
+
+    async def submit_training_job(self, dataset_path: str, config: dict, **job_requirements):
+        """Submit training job to available workers.
+
+        Args:
+            dataset_path: Path to training dataset
+            config: Training configuration
+            **job_requirements: Job requirements (min_gpu_memory_mb, etc.)
+
+        Returns:
+            Selected worker peer_id
+
+        Raises:
+            NoWorkersAvailableError: No workers found matching requirements
+            NoWorkersAcceptedError: No workers accepted the job request
+        """
+        # 1. Discover available workers
+        workers = await self.discover_workers(
+            job_type="training",
+            **job_requirements
+        )
+
+        if not workers:
+            raise NoWorkersAvailableError(
+                f"No workers found matching requirements: {job_requirements}"
+            )
+
+        logging.info(f"Found {len(workers)} workers, sending job requests...")
+
+        # 2. Create job request
+        job_id = str(uuid.uuid4())
+
+        # Get dataset info
+        dataset_size_mb = 0
+        if os.path.exists(dataset_path):
+            dataset_size_mb = os.path.getsize(dataset_path) / (1024 * 1024)
+
+        job_request = {
+            "app_message_type": "job_request",
+            "job_id": job_id,
+            "job_type": "training",
+            "dataset_info": {
+                "format": "slp",
+                "path": dataset_path,
+                "estimated_size_mb": dataset_size_mb
+            },
+            "config": config,
+            "requirements": job_requirements
+        }
+
+        # 3. Send job request to all discovered workers
+        for worker in workers:
+            await self._send_peer_message(worker["peer_id"], job_request)
+
+        # 4. Collect responses (with timeout)
+        responses = await self._collect_job_responses(job_id, timeout=5.0)
+
+        if not responses:
+            raise NoWorkersAcceptedError(
+                "No workers responded to job request (timeout)"
+            )
+
+        # Filter accepted responses
+        accepted = [r for r in responses if r["accepted"]]
+
+        if not accepted:
+            reasons = [r["reason"] for r in responses if not r["accepted"]]
+            raise NoWorkersAcceptedError(
+                f"All workers rejected job. Reasons: {reasons}"
+            )
+
+        # 5. Select best worker (e.g., fastest estimated time)
+        selected = min(accepted, key=lambda r: r.get("estimated_duration_minutes", 999999))
+
+        logging.info(f"Selected worker: {selected['worker_id']} "
+                     f"(estimate: {selected['estimated_duration_minutes']} min)")
+
+        # 6. Send job assignment to selected worker
+        await self._send_peer_message(selected["worker_id"], {
+            "app_message_type": "job_assignment",
+            "job_id": job_id,
+            "initiate_connection": True
+        })
+
+        # Store job info for monitoring
+        self.current_job_id = job_id
+        self.target_worker = selected["worker_id"]
+
+        # 7. Monitor job progress in background
+        asyncio.create_task(self._monitor_job_progress(job_id))
+
+        return selected["worker_id"]
+
     async def on_iceconnectionstatechange(self):
         """Event handler function for when the ICE connection state changes.
 
@@ -596,7 +905,7 @@ class RTCClient:
                 logging.info(f"No target worker available for reconnection. target_worker is {self.target_worker}.")
                 await self.clean_exit()
                 return
-            
+
             reconnection_success = await self.reconnect()
             self.reconnecting = False
             if not reconnection_success:
@@ -692,17 +1001,33 @@ class RTCClient:
                 worker_token = session_str_json.get("token")
                 worker_peer_id = session_str_json.get("peer_id")
 
-                # Register the client with the signaling server.
+                # Register the client with the signaling server (with v2.0 metadata).
                 logging.info(f"Registering {self.peer_id} with signaling server...")
+
+                # Try to get SLEAP version
+                try:
+                    import sleap
+                    sleap_version = sleap.__version__
+                except (ImportError, AttributeError):
+                    sleap_version = "unknown"
+
                 await self.websocket.send(json.dumps({
-                    'type': 'register', 
+                    'type': 'register',
                     'peer_id': self.peer_id, # should be own peer_id (Zoom username)
                     'room_id': worker_room_id, # should match Worker's room_id (Zoom meeting ID)
                     'token': worker_token, # should match Worker's token (Zoom meeting password)
                     'id_token': id_token, # should be own Cognito ID token
+                    'role': 'client',  # NEW: client role for discovery
+                    'metadata': {  # NEW: client info
+                        'tags': ['sleap-rtc', 'training-client'],
+                        'properties': {
+                            'sleap_version': sleap_version,
+                            'platform': platform.system(),
+                            'user_id': os.environ.get('USER', 'unknown')
+                        }
+                    }
                 }))
-                # await websocket.send(json.dumps({'type': 'register', 'peer_id': self.peer_id}))
-                logging.info(f"{self.peer_id} sent to signaling server for registration!")
+                logging.info(f"{self.peer_id} sent to signaling server for registration with metadata!")
 
                 # # Query for available workers.
                 # await websocket.send(json.dumps({'type': 'query'}))
