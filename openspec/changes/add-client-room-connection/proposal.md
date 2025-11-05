@@ -26,6 +26,7 @@ The primary use case requires many workers and at least one client connected to 
   - Existing `--session-string` remains for backward compatibility
 - **Real-time status updates**: Workers update their status (available/busy/reserved) via signaling server
 - **Room credential sharing**: Workers print room credentials (room-id and token) for other workers and clients to join
+- **Worker-side status check safeguard**: Workers check their status before accepting WebRTC offers and reject connections when busy, preventing concurrent connection conflicts even for session string connections
 
 ## Impact
 
@@ -35,6 +36,8 @@ The primary use case requires many workers and at least one client connected to 
   - `sleap_rtc/rtc_client.py:8-44` - Add room credentials and worker selection parameters
   - `sleap_rtc/rtc_worker.py:11-42` - Print room credentials for sharing
   - `sleap_rtc/client/client_class.py:608-704,917-1070` - Implement worker discovery and selection
+  - `sleap_rtc/worker/worker_class.py:1103-1121` - **Add status check in offer/answer handling** (safeguard)
   - `sleap_rtc/worker/worker_class.py:1437-1536` - Print room credentials on startup
+  - `sleap_rtc/client/client_class.py:268-299` - Handle worker busy rejection errors
 - **Backward compatible**: Existing session string workflow continues to work
-- **Breaking changes**: None - all changes are additive
+- **Breaking changes**: None - all changes are additive (status check rejection is a bug fix)

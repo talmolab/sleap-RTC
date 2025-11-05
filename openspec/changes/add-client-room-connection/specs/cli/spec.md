@@ -73,3 +73,29 @@ Workers SHALL print room credentials in addition to session strings to enable ro
 - **THEN** second worker prints session string and room credentials
 - **AND** both workers show same room-id and token
 - **AND** each worker shows unique peer-id in session string
+
+### Requirement: Worker Status Check on Connection
+
+Workers SHALL check their status before accepting WebRTC connections to prevent concurrent job conflicts.
+
+#### Scenario: Worker rejects connection when busy
+- **WHEN** worker receives WebRTC offer (type: "offer")
+- **AND** worker status is "busy" or "reserved"
+- **THEN** worker SHALL NOT accept the connection
+- **AND** worker sends error message to client via signaling server
+- **AND** error message indicates worker is currently busy
+- **AND** error message suggests using room-based discovery to find available workers
+
+#### Scenario: Worker accepts connection when available
+- **WHEN** worker receives WebRTC offer
+- **AND** worker status is "available"
+- **THEN** worker proceeds with normal offer/answer flow
+- **AND** worker updates status to "reserved" or "busy"
+- **AND** worker establishes WebRTC connection
+
+#### Scenario: Client receives busy rejection
+- **WHEN** client sends offer to busy worker via session string
+- **AND** worker rejects connection due to busy status
+- **THEN** client receives error message from signaling server
+- **AND** client logs clear error message
+- **AND** client suggests using `--room-id` and `--token` for worker discovery

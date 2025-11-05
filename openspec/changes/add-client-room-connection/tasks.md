@@ -42,20 +42,34 @@
 - [ ] 6.3 Handle discovery responses and parse worker metadata
 - [ ] 6.4 Filter workers by status (only show "available" workers)
 
-## 7. Testing and Validation
+## 7. Worker-Side Status Check Safeguard
 
-- [ ] 7.1 Test worker startup with room credential printing
-- [ ] 7.2 Test multiple workers joining same room
-- [ ] 7.3 Test client interactive worker selection
-- [ ] 7.4 Test client auto-select mode
-- [ ] 7.5 Test backward compatibility with session strings
-- [ ] 7.6 Test worker status updates (available → busy → available)
-- [ ] 7.7 Test refresh functionality during worker selection
-- [ ] 7.8 Test error handling (no workers available, invalid room credentials)
+- [ ] 7.1 Add status check in `worker_class.py:handle_connection()` before accepting WebRTC offers
+- [ ] 7.2 Implement rejection logic when worker status is "busy" or "reserved"
+- [ ] 7.3 Send error response to client via signaling server with busy status
+- [ ] 7.4 Include helpful error message suggesting room-based discovery
+- [ ] 7.5 Update worker status to "reserved" when accepting connection
+- [ ] 7.6 Add logging for connection acceptance/rejection decisions
 
-## 8. Documentation
+## 8. Testing and Validation
 
-- [ ] 8.1 Update README.md with new connection workflow examples
-- [ ] 8.2 Document room-based connection options
-- [ ] 8.3 Add examples showing multi-worker scenarios
-- [ ] 8.4 Update CLI help text and usage examples
+- [ ] 8.1 Test worker startup with room credential printing
+- [ ] 8.2 Test multiple workers joining same room
+- [ ] 8.3 Test client interactive worker selection
+- [ ] 8.4 Test client auto-select mode
+- [ ] 8.5 Test backward compatibility with session strings
+- [ ] 8.6 Test worker status updates (available → busy → available)
+- [ ] 8.7 Test refresh functionality during worker selection
+- [ ] 8.8 Test error handling (no workers available, invalid room credentials)
+- [ ] 8.9 Test worker rejects session string connection when busy
+- [ ] 8.10 Test worker accepts session string connection when available
+- [ ] 8.11 Test client receives and displays busy rejection message
+- [ ] 8.12 Test multiple clients attempting to connect to same busy worker
+
+## 9. Documentation
+
+- [ ] 9.1 Update README.md with new connection workflow examples
+- [ ] 9.2 Document room-based connection options
+- [ ] 9.3 Add examples showing multi-worker scenarios
+- [ ] 9.4 Update CLI help text and usage examples
+- [ ] 9.5 Document worker status check safeguard and busy rejection behavior

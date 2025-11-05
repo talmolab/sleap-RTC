@@ -116,6 +116,47 @@ elif room_credentials:
     target_worker = select_worker(workers, mode)
 ```
 
+### Decision 6: Worker-Side Status Check Safeguard
+
+**Choice**: Add status checking in worker's offer/answer handling to reject connections when busy, even for session string connections.
+
+**Rationale**:
+- Critical safeguard to prevent concurrent connection bugs
+- Protects against clients using stale/shared session strings
+- Applies to both session string and room-based connections
+- Provides helpful error messages directing users to room-based discovery
+
+**Implementation** (worker_class.py:handle_connection):
+```python
+if msg_type == "offer":
+    # NEW: Check status before accepting
+    if self.status in ["busy", "reserved"]:
+        logging.warning(f"Rejecting connection - worker is {self.status}")
+
+        # Send error to client via signaling server
+        await self.websocket.send(json.dumps({
+            "type": "error",
+            "target": data.get('sender'),
+            "reason": f"worker_busy",
+            "message": f"Worker is currently {self.status}. Use --room-id and --token for worker discovery.",
+            "suggest_room_discovery": True
+        }))
+        return
+
+    # Update status to reserved to prevent race conditions
+    await self.update_status("reserved")
+
+    # Proceed with normal offer/answer flow
+    await self.pc.setRemoteDescription(...)
+    await self.pc.setLocalDescription(await self.pc.createAnswer())
+    await self.websocket.send(json.dumps({...}))
+```
+
+**Alternatives considered**:
+- Only check status for session strings: Doesn't make sense, both paths need protection
+- Let signaling server handle rejection: Worker knows its status best, lower latency
+- Silent rejection without error message: Poor UX, users wouldn't know why connection failed
+
 ## Risks / Trade-offs
 
 ### Risk: Race Conditions During Worker Selection
