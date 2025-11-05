@@ -1434,13 +1434,15 @@ class RTCWorkerClient:
             logging.info("ICE connection is checking...")
             
 
-    async def run_worker(self, pc, DNS: str, port_number):
+    async def run_worker(self, pc, DNS: str, port_number, room_id=None, token=None):
         """Main function to run the worker. Contains several event handlers for the WebRTC connection and data channel.
-        
+
         Args:
             pc: RTCPeerConnection object
             DNS: DNS address of the signaling server
             port_number: Port number of the signaling server
+            room_id: Optional room ID to join. If not provided, a new room will be created.
+            token: Optional room token for authentication. Required if room_id is provided.
         Returns:
             None
         """
@@ -1465,14 +1467,23 @@ class RTCWorkerClient:
                 return
             
             logging.info(f"Anonymous sign-in successful. ID token: {id_token}")
-        
-            # Create the room and get the room ID, token, and cognito username.
-            room_json = self.request_create_room(id_token)
 
-            if not room_json or 'room_id' not in room_json or 'token' not in room_json:
-                logging.error("Failed to create room or get room ID/token. Exiting...")
-                return
-            logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
+            # Create the room or use existing room credentials
+            if room_id and token:
+                # Join existing room
+                logging.info(f"Joining existing room with ID: {room_id}")
+                room_json = {
+                    'room_id': room_id,
+                    'token': token
+                }
+            else:
+                # Create the room and get the room ID, token, and cognito username.
+                room_json = self.request_create_room(id_token)
+
+                if not room_json or 'room_id' not in room_json or 'token' not in room_json:
+                    logging.error("Failed to create room or get room ID/token. Exiting...")
+                    return
+                logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
 
             # Establish a WebSocket connection to the signaling server.
             logging.info(f"Connecting to signaling server at {DNS}...")
