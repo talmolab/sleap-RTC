@@ -1,4 +1,4 @@
-"""Entry point for sleap_RTC worker CLI."""
+"""Entry point for sleap_rtc worker CLI."""
 import asyncio
 import uuid
 import logging

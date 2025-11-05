@@ -174,13 +174,13 @@ Run these checks locally:
 
 ```bash
 # Format code
-black sleap_RTC/
+black sleap_rtc/
 
 # Lint
-ruff check sleap_RTC/
+ruff check sleap_rtc/
 
 # Type check (if configured)
-# mypy sleap_RTC/
+# mypy sleap_rtc/
 
 # Run tests
 pytest
