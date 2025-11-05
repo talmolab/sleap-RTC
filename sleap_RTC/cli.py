@@ -113,12 +113,6 @@ def worker(room_id, token):
     default=None,
     help="Minimum GPU memory in MB required for training.",
 )
-@click.option(
-    "--discover-workers",
-    is_flag=True,
-    default=False,
-    help="Enable global worker discovery (requires signaling server v2.0+).",
-)
 def client_train(**kwargs):
     """Run remote training on a worker.
 
@@ -132,9 +126,7 @@ def client_train(**kwargs):
        - Interactive selection (default)
        - Auto-select: --auto-select
        - Direct worker: --worker-id PEER_ID
-
-    3. Global discovery: --discover-workers
-       Discover workers across all rooms (legacy mode).
+       - GPU filter: --min-gpu-memory MB
     """
     # Extract connection options
     session_string = kwargs.pop("session_string", None)
@@ -142,27 +134,22 @@ def client_train(**kwargs):
     token = kwargs.pop("token", None)
     worker_id = kwargs.pop("worker_id", None)
     auto_select = kwargs.pop("auto_select", False)
-    discover_workers = kwargs.pop("discover_workers", False)
     min_gpu_memory = kwargs.pop("min_gpu_memory", None)
 
-    # Validation: Mutually exclusive connection modes
-    connection_modes = [
-        session_string is not None,
-        room_id is not None,
-        discover_workers
-    ]
-    if sum(connection_modes) > 1:
+    # Validation: Must provide either session string OR room credentials
+    has_session = session_string is not None
+    has_room = room_id is not None
+
+    if has_session and has_room:
         logger.error("Connection modes are mutually exclusive. Use only one of:")
         logger.error("  --session-string (direct connection)")
         logger.error("  --room-id and --token (room-based discovery)")
-        logger.error("  --discover-workers (global discovery)")
         sys.exit(1)
 
-    if sum(connection_modes) == 0:
-        logger.error("Must provide a connection mode:")
+    if not has_session and not has_room:
+        logger.error("Must provide a connection method:")
         logger.error("  --session-string SESSION (direct connection)")
         logger.error("  --room-id ROOM --token TOKEN (room-based discovery)")
-        logger.error("  --discover-workers (global discovery)")
         sys.exit(1)
 
     # Validation: room-id and token must be together
@@ -187,18 +174,12 @@ def client_train(**kwargs):
     kwargs["zmq_ports"]["controller"] = kwargs.pop("controller_port")
     kwargs["zmq_ports"]["publish"] = kwargs.pop("publish_port")
 
-    # Handle different connection modes
-    if discover_workers:
-        logger.info("Global worker discovery enabled")
-        if min_gpu_memory:
-            logger.info(f"Minimum GPU memory requirement: {min_gpu_memory}MB")
-        kwargs["job_requirements"] = {
-            "min_gpu_memory_mb": min_gpu_memory
-        } if min_gpu_memory else {}
-    elif room_id:
+    # Handle room-based connection
+    if room_id:
         logger.info(f"Room-based connection: room_id={room_id}")
         kwargs["room_id"] = room_id
         kwargs["token"] = token
+
         if worker_id:
             logger.info(f"Direct worker connection: worker_id={worker_id}")
             kwargs["worker_id"] = worker_id
@@ -286,12 +267,6 @@ def client_train(**kwargs):
     default=None,
     help="Minimum GPU memory in MB required for inference.",
 )
-@click.option(
-    "--discover-workers",
-    is_flag=True,
-    default=False,
-    help="Enable global worker discovery (requires signaling server v2.0+).",
-)
 def client_track(**kwargs):
     """Run remote inference on a worker with pre-trained models.
 
@@ -305,9 +280,7 @@ def client_track(**kwargs):
        - Interactive selection (default)
        - Auto-select: --auto-select
        - Direct worker: --worker-id PEER_ID
-
-    3. Global discovery: --discover-workers
-       Discover workers across all rooms (legacy mode).
+       - GPU filter: --min-gpu-memory MB
     """
     # Extract connection options
     session_string = kwargs.pop("session_string", None)
@@ -315,27 +288,22 @@ def client_track(**kwargs):
     token = kwargs.pop("token", None)
     worker_id = kwargs.pop("worker_id", None)
     auto_select = kwargs.pop("auto_select", False)
-    discover_workers = kwargs.pop("discover_workers", False)
     min_gpu_memory = kwargs.pop("min_gpu_memory", None)
 
-    # Validation: Mutually exclusive connection modes
-    connection_modes = [
-        session_string is not None,
-        room_id is not None,
-        discover_workers
-    ]
-    if sum(connection_modes) > 1:
+    # Validation: Must provide either session string OR room credentials
+    has_session = session_string is not None
+    has_room = room_id is not None
+
+    if has_session and has_room:
         logger.error("Connection modes are mutually exclusive. Use only one of:")
         logger.error("  --session-string (direct connection)")
         logger.error("  --room-id and --token (room-based discovery)")
-        logger.error("  --discover-workers (global discovery)")
         sys.exit(1)
 
-    if sum(connection_modes) == 0:
-        logger.error("Must provide a connection mode:")
+    if not has_session and not has_room:
+        logger.error("Must provide a connection method:")
         logger.error("  --session-string SESSION (direct connection)")
         logger.error("  --room-id ROOM --token TOKEN (room-based discovery)")
-        logger.error("  --discover-workers (global discovery)")
         sys.exit(1)
 
     # Validation: room-id and token must be together
@@ -355,18 +323,12 @@ def client_track(**kwargs):
 
     logger.info(f"Running inference with models: {kwargs['model_paths']}")
 
-    # Handle different connection modes
-    if discover_workers:
-        logger.info("Global worker discovery enabled for inference")
-        if min_gpu_memory:
-            logger.info(f"Minimum GPU memory requirement: {min_gpu_memory}MB")
-        kwargs["job_requirements"] = {
-            "min_gpu_memory_mb": min_gpu_memory
-        } if min_gpu_memory else {}
-    elif room_id:
+    # Handle room-based connection
+    if room_id:
         logger.info(f"Room-based connection: room_id={room_id}")
         kwargs["room_id"] = room_id
         kwargs["token"] = token
+
         if worker_id:
             logger.info(f"Direct worker connection: worker_id={worker_id}")
             kwargs["worker_id"] = worker_id
