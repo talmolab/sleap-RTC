@@ -605,10 +605,14 @@ class RTCClient:
         except Exception as e:
             logging.error(f"Failed to send peer message: {e}")
 
-    async def discover_workers(self, **filter_requirements) -> list:
-        """Discover available workers matching requirements (with fallback for old signaling servers).
+    async def discover_workers(self, room_id: str = None, **filter_requirements) -> list:
+        """Discover available workers matching requirements (DEPRECATED: use _discover_workers_in_room).
+
+        NOTE: This method is deprecated. For room-based discovery, use _discover_workers_in_room() instead.
+        This method is kept for backward compatibility but now requires room_id for security.
 
         Args:
+            room_id: Room ID to scope discovery (REQUIRED for security)
             **filter_requirements: Keyword arguments for filtering
                 - min_gpu_memory_mb: Minimum GPU memory
                 - model_type: Required model support
@@ -617,9 +621,15 @@ class RTCClient:
         Returns:
             List of worker peer info dicts
         """
-        # Build filters
+        # SECURITY: Require room_id to prevent global discovery
+        if not room_id:
+            logging.error("SECURITY: room_id required for worker discovery. Global discovery is disabled.")
+            return []
+
+        # Build filters with room_id for security
         filters = {
             "role": "worker",
+            "room_id": room_id,  # SECURITY: Always scope to room
             "tags": ["sleap-rtc"],
             "properties": {
                 "status": "available"
@@ -655,7 +665,7 @@ class RTCClient:
 
             if response_data.get("type") == "peer_list":
                 workers = response_data.get("peers", [])
-                logging.info(f"Discovered {len(workers)} available workers")
+                logging.info(f"Discovered {len(workers)} available workers in room {room_id}")
                 return workers
             elif response_data.get("type") == "error" and response_data.get("code") == "UNKNOWN_MESSAGE_TYPE":
                 # Old signaling server, fall back to manual peer_id
@@ -962,12 +972,16 @@ class RTCClient:
                     f"Job failed with code {error.get('code', 'UNKNOWN')}: {error.get('message', 'Unknown error')}"
                 )
 
-    async def submit_training_job(self, dataset_path: str, config: dict, **job_requirements):
-        """Submit training job to available workers.
+    async def submit_training_job(self, dataset_path: str, config: dict, room_id: str = None, **job_requirements):
+        """Submit training job to available workers (DEPRECATED: use room-based connection flow).
+
+        NOTE: This method is deprecated. Use the room-based connection flow with
+        _discover_workers_in_room() instead.
 
         Args:
             dataset_path: Path to training dataset
             config: Training configuration
+            room_id: Room ID to scope worker discovery (REQUIRED for security)
             **job_requirements: Job requirements (min_gpu_memory_mb, etc.)
 
         Returns:
@@ -977,8 +991,9 @@ class RTCClient:
             NoWorkersAvailableError: No workers found matching requirements
             NoWorkersAcceptedError: No workers accepted the job request
         """
-        # 1. Discover available workers
+        # 1. Discover available workers (room-scoped for security)
         workers = await self.discover_workers(
+            room_id=room_id,
             job_type="training",
             **job_requirements
         )
