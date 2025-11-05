@@ -1,0 +1,75 @@
+## ADDED Requirements
+
+### Requirement: Room Credential CLI Options
+
+The `client-train` and `client-track` commands SHALL accept `--room-id` and `--token` options for room-based connection.
+
+#### Scenario: Client train with room credentials
+- **WHEN** user runs `sleap-rtc client-train --room-id ROOM --token TOKEN --pkg-path PATH`
+- **THEN** client connects to room using provided credentials
+- **AND** client enters worker discovery and selection flow
+
+#### Scenario: Client track with room credentials
+- **WHEN** user runs `sleap-rtc client-track --room-id ROOM --token TOKEN --data-path PATH --model-paths M1 M2`
+- **THEN** client connects to room using provided credentials
+- **AND** client enters worker discovery and selection flow
+
+#### Scenario: Room-id without token
+- **WHEN** user provides `--room-id` without `--token`
+- **THEN** CLI returns validation error
+- **AND** error message indicates both options are required together
+
+#### Scenario: Token without room-id
+- **WHEN** user provides `--token` without `--room-id`
+- **THEN** CLI returns validation error
+- **AND** error message indicates both options are required together
+
+### Requirement: Worker Selection Mode Options
+
+The client commands SHALL accept `--worker-id` and `--auto-select` options to control worker selection.
+
+#### Scenario: Auto-select flag for automatic selection
+- **WHEN** user provides `--auto-select` flag with room credentials
+- **THEN** client automatically selects best worker by GPU memory
+- **AND** client skips interactive selection prompt
+
+#### Scenario: Worker-id for direct worker targeting
+- **WHEN** user provides `--worker-id PEER_ID` with room credentials
+- **THEN** client connects directly to specified worker
+- **AND** client skips worker discovery and interactive selection
+
+#### Scenario: Both auto-select and worker-id provided
+- **WHEN** user provides both `--auto-select` and `--worker-id` options
+- **THEN** CLI returns validation error
+- **AND** error message indicates options are mutually exclusive
+
+### Requirement: Mutual Exclusion Validation
+
+The CLI SHALL enforce mutual exclusion between session string and room credential options.
+
+#### Scenario: Session string with room credentials
+- **WHEN** user provides both `--session-string` and `--room-id` options
+- **THEN** CLI returns validation error before connection attempt
+- **AND** error message explains session string and room credentials cannot be used together
+
+#### Scenario: Session string with worker selection options
+- **WHEN** user provides `--session-string` with `--auto-select` or `--worker-id`
+- **THEN** CLI returns validation error
+- **AND** error message explains session string already encodes target worker
+
+### Requirement: Worker Room Credential Output
+
+Workers SHALL print room credentials in addition to session strings to enable room-based client connections.
+
+#### Scenario: Worker prints room credentials on startup
+- **WHEN** worker successfully creates or joins room
+- **THEN** worker logs session string for backward compatibility
+- **AND** worker logs room-id and token separately
+- **AND** output clearly labels session string vs room credentials
+- **AND** output explains room credentials are for other workers/clients to join
+
+#### Scenario: Multiple workers join same room
+- **WHEN** second worker joins room with room-id and token
+- **THEN** second worker prints session string and room credentials
+- **AND** both workers show same room-id and token
+- **AND** each worker shows unique peer-id in session string
