@@ -1106,9 +1106,32 @@ class RTCWorkerClient:
                     # Obtain the sender's peer ID (this is the new target)
                     target_pid = data.get('sender')
 
+                    # SAFEGUARD: Check worker status before accepting connection
+                    if self.status in ["busy", "reserved"]:
+                        logging.warning(f"Rejecting connection from {target_pid} - worker is {self.status}")
+
+                        # Send error response to client via signaling server
+                        await self.websocket.send(json.dumps({
+                            'type': 'error',
+                            'target': target_pid,
+                            'reason': 'worker_busy',
+                            'message': f"Worker is currently {self.status}. Please use --room-id and --token to discover available workers.",
+                            'current_status': self.status
+                        }))
+
+                        logging.info(f"Sent busy rejection to client {target_pid}")
+                        continue  # Skip this offer, continue listening
+
+                    # Status is "available" - proceed with connection
+                    logging.info(f"Accepting connection from {target_pid} (status: {self.status})")
+
+                    # Update status to "reserved" to prevent race conditions
+                    await self.update_status("reserved")
+                    logging.info("Worker status updated to 'reserved'")
+
                     # Set worker peer's remote description to the client's offer based on sdp data
-                    await self.pc.setRemoteDescription(RTCSessionDescription(sdp=data.get('sdp'), type='offer')) 
-                    
+                    await self.pc.setRemoteDescription(RTCSessionDescription(sdp=data.get('sdp'), type='offer'))
+
                     # Generate worker's answer SDP and set it as the local description
                     await self.pc.setLocalDescription(await self.pc.createAnswer())
 
@@ -1119,6 +1142,8 @@ class RTCWorkerClient:
                         'target': target_pid, # client's peer ID
                         'sdp': self.pc.localDescription.sdp # worker's answer SDP
                     }))
+
+                    logging.info(f"Connection accepted - answer sent to {target_pid}")
 
                     # Reset received_files dictionary
                     self.received_files.clear()
