@@ -546,7 +546,15 @@ def list_models(session_string, room_id, token, worker_id, registry_dir, status,
             sys.exit(1)
 
     else:
-        # Local registry query
+        # Local registry query (only works on worker machine)
+        if not registry_dir.exists():
+            logger.error(f"Registry directory not found: {registry_dir}")
+            logger.error("Local registry queries only work on worker machines.")
+            logger.error("To query a remote worker's registry, use:")
+            logger.error("  --room-id ROOM --token TOKEN")
+            logger.error("  or --session-string SESSION")
+            sys.exit(1)
+
         try:
             registry = ModelRegistry(registry_dir=registry_dir)
         except Exception as e:
@@ -671,7 +679,15 @@ def model_info(model_id, session_string, room_id, token, worker_id, registry_dir
             sys.exit(1)
 
     else:
-        # Local registry query
+        # Local registry query (only works on worker machine)
+        if not registry_dir.exists():
+            logger.error(f"Registry directory not found: {registry_dir}")
+            logger.error("Local registry queries only work on worker machines.")
+            logger.error("To query a remote worker's registry, use:")
+            logger.error("  --room-id ROOM --token TOKEN")
+            logger.error("  or --session-string SESSION")
+            sys.exit(1)
+
         try:
             registry = ModelRegistry(registry_dir=registry_dir)
         except Exception as e:

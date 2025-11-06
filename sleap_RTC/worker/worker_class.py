@@ -556,6 +556,7 @@ class RTCWorkerClient:
 
                 registered_id = self.registry.register(model_info)
                 self.current_model_id = registered_id
+                current_training_model_id = registered_id  # Store locally for this training job
                 logging.info(f"Registered model {registered_id} in registry")
 
                 # Send RTC msg over channel to indicate job start.
@@ -688,7 +689,8 @@ class RTCWorkerClient:
                         channel.send(f"TRAIN_JOB_END::{job_name}")
 
                     # Mark model as completed in registry
-                    if self.current_model_id:
+                    if current_training_model_id:
+                        logging.info(f"Marking model {current_training_model_id} as completed...")
                         # Try to extract final validation loss from training logs (simplified)
                         # In production, would parse actual training output
                         metrics = {
@@ -696,8 +698,13 @@ class RTCWorkerClient:
                             "epochs_completed": training_config.get('trainer_config', {}).get('max_epochs', 0),
                             "final_val_loss": 0.0  # TODO: Parse from training logs
                         }
-                        self.registry.mark_completed(self.current_model_id, metrics)
-                        logging.info(f"Marked model {self.current_model_id} as completed in registry")
+                        try:
+                            self.registry.mark_completed(current_training_model_id, metrics)
+                            logging.info(f"Successfully marked model {current_training_model_id} as completed in registry")
+                        except Exception as e:
+                            logging.error(f"Failed to mark model {current_training_model_id} as completed: {e}")
+                    else:
+                        logging.warning("No model ID for this training job, cannot mark as completed")
 
                     # Send completion status via peer message
                     if job_id and client_id:
