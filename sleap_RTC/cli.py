@@ -546,14 +546,22 @@ def list_models(session_string, room_id, token, worker_id, registry_dir, status,
             sys.exit(1)
 
     else:
-        # Local registry query (only works on worker machine)
+        # Local registry query
         if not registry_dir.exists():
             logger.error(f"Registry directory not found: {registry_dir}")
-            logger.error("Local registry queries only work on worker machines.")
+            logger.error("")
             logger.error("To query a remote worker's registry, use:")
-            logger.error("  --room-id ROOM --token TOKEN")
-            logger.error("  or --session-string SESSION")
+            logger.error("  sleap-rtc list-models --room-id ROOM --token TOKEN")
+            logger.error("  sleap-rtc list-models --session-string SESSION")
+            logger.error("")
+            logger.error("Local registry queries only work if:")
+            logger.error("  1. You are on the worker machine")
+            logger.error("  2. A worker has been run previously (creating the registry)")
             sys.exit(1)
+
+        # Warn about local access (useful for debugging/testing)
+        logger.info(f"Using local registry: {registry_dir}")
+        logger.info("(Use --room-id/--token for remote worker queries)")
 
         try:
             registry = ModelRegistry(registry_dir=registry_dir)
@@ -679,14 +687,22 @@ def model_info(model_id, session_string, room_id, token, worker_id, registry_dir
             sys.exit(1)
 
     else:
-        # Local registry query (only works on worker machine)
+        # Local registry query
         if not registry_dir.exists():
             logger.error(f"Registry directory not found: {registry_dir}")
-            logger.error("Local registry queries only work on worker machines.")
+            logger.error("")
             logger.error("To query a remote worker's registry, use:")
-            logger.error("  --room-id ROOM --token TOKEN")
-            logger.error("  or --session-string SESSION")
+            logger.error("  sleap-rtc model-info MODEL_ID --room-id ROOM --token TOKEN")
+            logger.error("  sleap-rtc model-info MODEL_ID --session-string SESSION")
+            logger.error("")
+            logger.error("Local registry queries only work if:")
+            logger.error("  1. You are on the worker machine")
+            logger.error("  2. A worker has been run previously (creating the registry)")
             sys.exit(1)
+
+        # Warn about local access (useful for debugging/testing)
+        logger.info(f"Using local registry: {registry_dir}")
+        logger.info("(Use --room-id/--token for remote worker queries)")
 
         try:
             registry = ModelRegistry(registry_dir=registry_dir)

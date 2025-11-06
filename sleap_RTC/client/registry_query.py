@@ -100,9 +100,9 @@ class RegistryQueryClient:
             # If worker_id specified, connect directly
             # Otherwise, discover workers and pick first one
             if not worker_id:
-                # Request worker list
+                # Request worker list using list_peers message
                 await websocket.send(json.dumps({
-                    'type': 'discover_workers',
+                    'type': 'list_peers',
                     'peer_id': client_peer_id
                 }))
 
@@ -110,16 +110,22 @@ class RegistryQueryClient:
                 response = await websocket.recv()
                 data = json.loads(response)
 
-                if data.get('type') == 'workers_discovered':
-                    workers = data.get('workers', [])
+                if data.get('type') == 'peer_list':
+                    # Filter for workers only
+                    all_peers = data.get('peers', [])
+                    workers = [p for p in all_peers if p.get('role') == 'worker']
+
                     if not workers:
                         raise RuntimeError("No workers available in room")
 
                     # Pick first available worker
                     worker_id = workers[0]['peer_id']
                     logging.info(f"Selected worker: {worker_id}")
+                elif data.get('type') == 'error':
+                    error_msg = data.get('message', 'Unknown error')
+                    raise RuntimeError(f"Worker discovery failed: {error_msg}. Try specifying --worker-id directly.")
                 else:
-                    raise RuntimeError(f"Worker discovery failed: {data}")
+                    raise RuntimeError(f"Unexpected response from signaling server: {data.get('type')}")
 
             # Create offer and connect to worker
             await self.pc.setLocalDescription(await self.pc.createOffer())
@@ -233,11 +239,15 @@ class RegistryQueryClient:
         Returns:
             Dictionary with 'username' and 'id_token'
         """
+        import asyncio
         import requests
 
         config = get_config()
         url = config.get_http_endpoint("/anonymous-signin")
-        response = requests.post(url)
+
+        # Run synchronous requests.post in thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, lambda: requests.post(url))
 
         if response.status_code == 200:
             return response.json()
