@@ -58,6 +58,7 @@ class RTCWorkerClient:
         self.registry = ModelRegistry()
         self.current_model_id = None  # Track currently training model ID
         self.training_job_hash = None  # Track hash of uploaded training package
+        self.is_query_only_connection = False  # Track if connection is only for registry queries
 
     def _detect_gpu_memory(self) -> int:
         """Detect GPU memory in MB.
@@ -1535,6 +1536,9 @@ class RTCWorkerClient:
 
                 elif "REGISTRY_QUERY_LIST" in message:
                     logging.info("Registry query list request received")
+                    # Mark this as a query-only connection (no training/inference)
+                    self.is_query_only_connection = True
+
                     # Parse optional filters from message
                     try:
                         _, filters_json = message.split("REGISTRY_QUERY_LIST::", 1)
@@ -1556,6 +1560,9 @@ class RTCWorkerClient:
 
                 elif "REGISTRY_QUERY_INFO" in message:
                     logging.info("Registry query info request received")
+                    # Mark this as a query-only connection (no training/inference)
+                    self.is_query_only_connection = True
+
                     # Extract model ID from message
                     try:
                         _, model_id = message.split("REGISTRY_QUERY_INFO::", 1)
@@ -1626,6 +1633,19 @@ class RTCWorkerClient:
             await self.clean_exit()
             return
         elif self.pc.iceConnectionState in ["failed", "disconnected", "closed"]:
+            # Check if this is a query-only connection (registry queries only)
+            if self.is_query_only_connection:
+                logging.info(f"Query-only connection closed. Cleaning up and returning to available state.")
+                # Reset the flag for next connection
+                self.is_query_only_connection = False
+                # Clean up the peer connection but don't exit - just wait for next client
+                await self.pc.close()
+                # Status should return to available
+                if self.status == "reserved":
+                    self.status = "available"
+                    logging.info("Worker status returned to 'available'")
+                return
+
             logging.info(f"ICE connection {self.pc.iceConnectionState}. Waiting for reconnect...")
 
             # Mark training as interrupted before waiting
