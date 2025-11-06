@@ -100,32 +100,37 @@ class RegistryQueryClient:
             # If worker_id specified, connect directly
             # Otherwise, discover workers and pick first one
             if not worker_id:
-                # Request worker list using list_peers message
+                # Request worker list using discover_peers message
                 await websocket.send(json.dumps({
-                    'type': 'list_peers',
-                    'peer_id': client_peer_id
+                    'type': 'discover_peers',
+                    'from_peer_id': client_peer_id,
+                    'filters': {
+                        'role': 'worker'
+                    }
                 }))
 
-                # Get worker list
-                response = await websocket.recv()
-                data = json.loads(response)
+                # Get worker list with timeout
+                try:
+                    response = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                    data = json.loads(response)
 
-                if data.get('type') == 'peer_list':
-                    # Filter for workers only
-                    all_peers = data.get('peers', [])
-                    workers = [p for p in all_peers if p.get('role') == 'worker']
+                    if data.get('type') == 'peer_list':
+                        workers = data.get('peers', [])
 
-                    if not workers:
-                        raise RuntimeError("No workers available in room")
+                        if not workers:
+                            raise RuntimeError("No workers available in room")
 
-                    # Pick first available worker
-                    worker_id = workers[0]['peer_id']
-                    logging.info(f"Selected worker: {worker_id}")
-                elif data.get('type') == 'error':
-                    error_msg = data.get('message', 'Unknown error')
-                    raise RuntimeError(f"Worker discovery failed: {error_msg}. Try specifying --worker-id directly.")
-                else:
-                    raise RuntimeError(f"Unexpected response from signaling server: {data.get('type')}")
+                        # Pick first available worker
+                        worker_id = workers[0]['peer_id']
+                        logging.info(f"Selected worker: {worker_id}")
+                    elif data.get('type') == 'error':
+                        error_msg = data.get('message', 'Unknown error')
+                        raise RuntimeError(f"Worker discovery failed: {error_msg}. Try specifying --worker-id directly.")
+                    else:
+                        raise RuntimeError(f"Unexpected response from signaling server: {data.get('type')}")
+
+                except asyncio.TimeoutError:
+                    raise RuntimeError("Worker discovery timed out. Try specifying --worker-id directly.")
 
             # Create offer and connect to worker
             await self.pc.setLocalDescription(await self.pc.createOffer())
