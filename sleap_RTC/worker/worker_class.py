@@ -1635,11 +1635,11 @@ class RTCWorkerClient:
         elif self.pc.iceConnectionState in ["failed", "disconnected", "closed"]:
             # Check if this is a query-only connection (registry queries only)
             if self.is_query_only_connection:
-                logging.info(f"Query-only connection closed. Cleaning up and returning to available state.")
+                logging.info(f"Query-only connection closed. Returning to available state.")
                 # Reset the flag for next connection
                 self.is_query_only_connection = False
-                # Clean up the peer connection but don't exit - just wait for next client
-                await self.pc.close()
+                # Don't call pc.close() - connection already closed by client
+                # Calling close() on an already-closed connection corrupts its state
                 # Status should return to available
                 if self.status == "reserved":
                     self.status = "available"
