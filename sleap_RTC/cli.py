@@ -6,7 +6,10 @@ from pathlib import Path
 from sleap_rtc.rtc_worker import run_RTCworker
 from sleap_rtc.rtc_client import run_RTCclient
 from sleap_rtc.rtc_client_track import run_RTCclient_track
+from sleap_rtc.worker.model_registry import ModelRegistry
 import sys
+import json
+from datetime import datetime
 
 @click.group()
 def cli():
@@ -358,6 +361,177 @@ def client_deprecated(ctx, **kwargs):
     """[DEPRECATED] Use 'client-train' instead."""
     logger.warning("Warning: 'sleap-rtc client' is deprecated. Use 'sleap-rtc client-train' instead.")
     ctx.invoke(client_train, **kwargs)
+
+
+@cli.command(name="list-models")
+@click.option(
+    "--registry-dir",
+    type=click.Path(exists=True, path_type=Path),
+    default=Path("models/.registry"),
+    help="Path to the model registry directory.",
+)
+@click.option(
+    "--status",
+    type=click.Choice(["training", "completed", "interrupted", "failed"], case_sensitive=False),
+    required=False,
+    help="Filter models by status.",
+)
+@click.option(
+    "--model-type",
+    type=str,
+    required=False,
+    help="Filter models by type (e.g., centroid, centered_instance).",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["table", "json"], case_sensitive=False),
+    default="table",
+    help="Output format (table or json).",
+)
+def list_models(registry_dir, status, model_type, output_format):
+    """List all trained models in the registry.
+
+    Examples:
+      sleap-rtc list-models
+      sleap-rtc list-models --status completed
+      sleap-rtc list-models --model-type centroid
+      sleap-rtc list-models --format json
+    """
+    try:
+        registry = ModelRegistry(registry_dir=registry_dir)
+    except Exception as e:
+        logger.error(f"Failed to load registry: {e}")
+        sys.exit(1)
+
+    # Apply filters
+    filters = {}
+    if status:
+        filters['status'] = status
+    if model_type:
+        filters['model_type'] = model_type
+
+    models = registry.list(filters=filters)
+
+    if not models:
+        logger.info("No models found matching criteria")
+        return
+
+    if output_format == "json":
+        # JSON output
+        print(json.dumps(models, indent=2))
+    else:
+        # Table output
+        logger.info(f"\nFound {len(models)} model(s):\n")
+
+        # Print header
+        header = f"{'Model ID':<12} {'Type':<20} {'Status':<12} {'Created':<20} {'Val Loss':<10}"
+        print(header)
+        print("=" * len(header))
+
+        # Print rows
+        for model in models:
+            model_id = model.get('id', 'N/A')[:12]
+            model_type = model.get('model_type', 'N/A')[:20]
+            status = model.get('status', 'N/A')[:12]
+            created = model.get('created_at', 'N/A')[:19]  # Trim milliseconds
+            val_loss = model.get('metrics', {}).get('final_val_loss', 'N/A')
+
+            # Format val_loss
+            if isinstance(val_loss, (int, float)):
+                val_loss_str = f"{val_loss:.4f}"
+            else:
+                val_loss_str = str(val_loss)
+
+            print(f"{model_id:<12} {model_type:<20} {status:<12} {created:<20} {val_loss_str:<10}")
+
+
+@cli.command(name="model-info")
+@click.argument("model_id", type=str)
+@click.option(
+    "--registry-dir",
+    type=click.Path(exists=True, path_type=Path),
+    default=Path("models/.registry"),
+    help="Path to the model registry directory.",
+)
+def model_info(model_id, registry_dir):
+    """Display detailed information about a specific model.
+
+    Examples:
+      sleap-rtc model-info a3f5e8c9
+    """
+    try:
+        registry = ModelRegistry(registry_dir=registry_dir)
+    except Exception as e:
+        logger.error(f"Failed to load registry: {e}")
+        sys.exit(1)
+
+    model = registry.get(model_id)
+
+    if not model:
+        logger.error(f"Model '{model_id}' not found in registry")
+        sys.exit(1)
+
+    # Display model information
+    logger.info(f"\nModel Information: {model_id}\n")
+    print("=" * 60)
+
+    # Basic info
+    print(f"ID:               {model.get('id', 'N/A')}")
+    print(f"Type:             {model.get('model_type', 'N/A')}")
+    print(f"Status:           {model.get('status', 'N/A')}")
+    print(f"Run Name:         {model.get('run_name', 'N/A')}")
+    print(f"Training Job:     {model.get('training_job_hash', 'N/A')}")
+
+    # Timestamps
+    print(f"\nTimestamps:")
+    print(f"  Created:        {model.get('created_at', 'N/A')}")
+    completed_at = model.get('completed_at')
+    if completed_at:
+        print(f"  Completed:      {completed_at}")
+    interrupted_at = model.get('interrupted_at')
+    if interrupted_at:
+        print(f"  Interrupted:    {interrupted_at}")
+
+    # Paths
+    print(f"\nPaths:")
+    print(f"  Checkpoint:     {model.get('checkpoint_path', 'N/A')}")
+    print(f"  Config:         {model.get('config_path', 'N/A')}")
+
+    # Check if checkpoint exists
+    checkpoint_path = Path(model.get('checkpoint_path', ''))
+    if checkpoint_path.exists():
+        size_mb = checkpoint_path.stat().st_size / (1024 * 1024)
+        print(f"  Checkpoint Size: {size_mb:.2f} MB")
+    else:
+        print(f"  Checkpoint Size: [FILE NOT FOUND]")
+
+    # Metrics
+    metrics = model.get('metrics', {})
+    if metrics:
+        print(f"\nMetrics:")
+        for key, value in metrics.items():
+            if isinstance(value, float):
+                print(f"  {key:<20}: {value:.4f}")
+            else:
+                print(f"  {key:<20}: {value}")
+
+    # Metadata
+    metadata = model.get('metadata', {})
+    if metadata:
+        print(f"\nMetadata:")
+        for key, value in metadata.items():
+            print(f"  {key:<20}: {value}")
+
+    # Resume info for interrupted jobs
+    if model.get('status') == 'interrupted':
+        last_epoch = model.get('last_epoch', 0)
+        print(f"\nResume Information:")
+        print(f"  Last Epoch:     {last_epoch}")
+        print(f"  To resume, run training with the same configuration")
+
+    print("=" * 60)
+
 
 if __name__ == "__main__":
     cli()
