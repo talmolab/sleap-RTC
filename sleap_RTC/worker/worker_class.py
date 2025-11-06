@@ -15,6 +15,7 @@ import zmq
 import socket
 import platform
 import time
+import hashlib
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 # from run_training import run_all_training_jobs
@@ -22,6 +23,7 @@ from pathlib import Path
 from websockets.client import ClientConnection
 
 from sleap_rtc.config import get_config
+from sleap_rtc.worker.model_registry import ModelRegistry
 
 # Setup logging.
 logging.basicConfig(level=logging.INFO)
@@ -51,6 +53,11 @@ class RTCWorkerClient:
         self.supported_models = ["base", "centroid", "topdown"]
         self.supported_job_types = ["training", "inference"]
         self.max_concurrent_jobs = 1
+
+        # Model registry for tracking trained models and checkpoints
+        self.registry = ModelRegistry()
+        self.current_model_id = None  # Track currently training model ID
+        self.training_job_hash = None  # Track hash of uploaded training package
 
     def _detect_gpu_memory(self) -> int:
         """Detect GPU memory in MB.
@@ -497,6 +504,60 @@ class RTCWorkerClient:
             for config_name in training_jobs:
                 job_name = Path(config_name).stem
 
+                # Load training configuration for registry
+                config_path = Path(self.unzipped_dir) / config_name
+                try:
+                    import yaml
+                    with open(config_path, 'r') as f:
+                        training_config = yaml.safe_load(f)
+                except Exception as e:
+                    logging.warning(f"Could not load config {config_name} for registry: {e}")
+                    training_config = {}
+
+                # Find labels file for hashing
+                labels_files = list(Path(self.unzipped_dir).glob("*.slp"))
+                labels_path = str(labels_files[0]) if labels_files else ""
+
+                # Generate unique model ID
+                from datetime import datetime
+                run_name = f"{job_name}_{datetime.now().strftime('%y%m%d_%H%M%S')}"
+
+                model_id = self.registry.generate_model_id(
+                    config=training_config,
+                    labels_path=labels_path,
+                    run_name=run_name
+                )
+
+                # Determine model type from config
+                head_configs = training_config.get('model_config', {}).get('head_configs', {})
+                model_types = [k for k, v in head_configs.items() if v is not None]
+                model_type = model_types[0] if model_types else "unknown"
+
+                # Create hash-based directory name
+                model_dir_name = f"{model_type}_{model_id}"
+
+                # Register model in registry
+                model_info = {
+                    "id": model_id,
+                    "full_hash": hashlib.sha256(f"{model_id}{run_name}".encode()).hexdigest(),
+                    "run_name": run_name,
+                    "model_type": model_type,
+                    "training_job_hash": self.training_job_hash or "",
+                    "status": "training",
+                    "checkpoint_path": f"{self.output_dir}/{model_dir_name}/best.ckpt",
+                    "config_path": f"{self.output_dir}/{model_dir_name}/training_config.yaml",
+                    "created_at": datetime.now().isoformat(),
+                    "metadata": {
+                        "dataset": os.path.basename(labels_path) if labels_path else "",
+                        "gpu_model": self.gpu_model,
+                        "original_config": config_name
+                    }
+                }
+
+                registered_id = self.registry.register(model_info)
+                self.current_model_id = registered_id
+                logging.info(f"Registered model {registered_id} in registry")
+
                 # Send RTC msg over channel to indicate job start.
                 logging.info(f"Starting training job: {job_name} with config: {config_name}")
                 channel.send(f"TRAIN_JOB_START::{job_name}")
@@ -511,6 +572,19 @@ class RTCWorkerClient:
                         "message": f"Initializing training: {job_name}"
                     })
 
+                # Check for interrupted training to resume
+                interrupted_jobs = self.registry.get_interrupted()
+                resume_checkpoint = None
+                for interrupted in interrupted_jobs:
+                    interrupted_config = interrupted.get('metadata', {}).get('original_config', '')
+                    if interrupted['model_type'] == model_type and interrupted_config == config_name:
+                        resume_checkpoint = interrupted.get('checkpoint_path')
+                        logging.info(f"Found interrupted job for {model_type}, will resume from {resume_checkpoint}")
+                        # Use the same model ID to continue training
+                        self.current_model_id = interrupted['id']
+                        model_dir_name = f"{model_type}_{interrupted['id']}"
+                        break
+
                 # Use sleap-nn train command for newer SLEAP versions
                 # Run directly in the extracted directory with config-dir from training script
                 cmd = [
@@ -518,11 +592,22 @@ class RTCWorkerClient:
                     "--config-name", config_name,
                     "--config-dir", ".",
                     "trainer_config.ckpt_dir=models",
-                    f"trainer_config.run_name={job_name}",
+                    f"trainer_config.run_name={model_dir_name}",  # Use hash-based name
                     "trainer_config.zmq.controller_port=9000",
                     "trainer_config.zmq.publish_port=9001",
                     # "trainer_config.enable_progress_bar=false"
                 ]
+
+                # Add resumption if checkpoint found
+                if resume_checkpoint:
+                    # Convert to absolute path
+                    resume_path = Path(self.unzipped_dir) / resume_checkpoint
+                    if resume_path.exists():
+                        cmd.append(f"trainer_config.resume_ckpt_path={resume_path}")
+                        logging.info(f"Resuming from checkpoint: {resume_path}")
+                    else:
+                        logging.warning(f"Resume checkpoint not found: {resume_path}, starting fresh")
+
                 logging.info(f"[RUNNING] {' '.join(cmd)} (cwd={self.unzipped_dir})")
 
                 process = await asyncio.create_subprocess_exec(
@@ -602,10 +687,22 @@ class RTCWorkerClient:
                     if channel.readyState == "open":
                         channel.send(f"TRAIN_JOB_END::{job_name}")
 
+                    # Mark model as completed in registry
+                    if self.current_model_id:
+                        # Try to extract final validation loss from training logs (simplified)
+                        # In production, would parse actual training output
+                        metrics = {
+                            "training_duration_minutes": training_duration,
+                            "epochs_completed": training_config.get('trainer_config', {}).get('max_epochs', 0),
+                            "final_val_loss": 0.0  # TODO: Parse from training logs
+                        }
+                        self.registry.mark_completed(self.current_model_id, metrics)
+                        logging.info(f"Marked model {self.current_model_id} as completed in registry")
+
                     # Send completion status via peer message
                     if job_id and client_id:
                         # Try to get model size if it exists
-                        model_path = Path(self.unzipped_dir) / self.output_dir / job_name
+                        model_path = Path(self.unzipped_dir) / self.output_dir / model_dir_name
                         model_size_mb = 0
                         if model_path.exists():
                             # Check for model files
@@ -618,7 +715,7 @@ class RTCWorkerClient:
                             "job_id": job_id,
                             "status": "running",
                             "progress": 1.0,
-                            "message": f"Training completed: {job_name}"
+                            "message": f"Training completed: {job_name} (model_id: {self.current_model_id})"
                         })
                 else:
                     logging.warning(f"[FAILED] Job {job_name} exited with code {process.returncode}.")
@@ -1326,6 +1423,11 @@ class RTCWorkerClient:
                         file.write(file_data)
                     logging.info(f"File saved as: {file_path}")
 
+                    # Generate hash of training package for registry tracking
+                    if file_path.endswith(".zip"):
+                        self.training_job_hash = hashlib.md5(file_data).hexdigest()[:8]
+                        logging.info(f"Training package hash: {self.training_job_hash}")
+
                     # Unzip results if needed.
                     if file_path.endswith(".zip"):
                         await self.unzip_results(file_path)
@@ -1423,7 +1525,56 @@ class RTCWorkerClient:
                         logging.info(f"Sent control message to Trainer: {zmq_msg}")
                     else:
                         logging.error(f"ZMQ control socket not initialized {self.ctrl_socket}. Cannot send control message.")
-                    
+
+                elif "REGISTRY_QUERY_LIST" in message:
+                    logging.info("Registry query list request received")
+                    # Parse optional filters from message
+                    try:
+                        _, filters_json = message.split("REGISTRY_QUERY_LIST::", 1)
+                        filters = json.loads(filters_json) if filters_json else {}
+                    except (ValueError, json.JSONDecodeError):
+                        filters = {}
+
+                    # Query registry with filters
+                    models = self.registry.list(filters=filters)
+                    logging.info(f"Returning {len(models)} models to client")
+
+                    # Send response
+                    response = {
+                        "type": "registry_list",
+                        "models": models,
+                        "count": len(models)
+                    }
+                    channel.send(f"REGISTRY_RESPONSE_LIST::{json.dumps(response)}")
+
+                elif "REGISTRY_QUERY_INFO" in message:
+                    logging.info("Registry query info request received")
+                    # Extract model ID from message
+                    try:
+                        _, model_id = message.split("REGISTRY_QUERY_INFO::", 1)
+                        model_id = model_id.strip()
+                    except ValueError:
+                        logging.error("Invalid REGISTRY_QUERY_INFO message format")
+                        channel.send("REGISTRY_RESPONSE_ERROR::Invalid message format")
+                        return
+
+                    # Get model info from registry
+                    model_info = self.registry.get(model_id)
+
+                    if model_info:
+                        logging.info(f"Returning info for model {model_id}")
+                        response = {
+                            "type": "registry_info",
+                            "model": model_info
+                        }
+                        channel.send(f"REGISTRY_RESPONSE_INFO::{json.dumps(response)}")
+                    else:
+                        logging.warning(f"Model {model_id} not found in registry")
+                        response = {
+                            "type": "registry_error",
+                            "error": f"Model '{model_id}' not found"
+                        }
+                        channel.send(f"REGISTRY_RESPONSE_ERROR::{json.dumps(response)}")
 
                 else:
                     logging.info(f"Client sent: {message}")
@@ -1445,20 +1596,42 @@ class RTCWorkerClient:
         Returns:
             None
         """
-        
+
         # Log the ICE connection state.
         logging.info(f"ICE connection state is now {self.pc.iceConnectionState}")
 
         # Check the ICE connection state and handle accordingly.
         if self.pc.iceConnectionState == "failed":
-            logging.ERROR('ICE connection failed')
+            logging.error('ICE connection failed')
+
+            # Mark current training as interrupted if active
+            if self.current_model_id and self.status == "busy":
+                logging.info(f"Marking model {self.current_model_id} as interrupted due to connection failure")
+                # Find best checkpoint in model directory
+                model_info = self.registry.get(self.current_model_id)
+                if model_info:
+                    checkpoint_path = model_info.get('checkpoint_path', '')
+                    # Estimate current epoch (would need actual tracking in production)
+                    epoch = 0  # TODO: Track actual epoch during training
+                    self.registry.mark_interrupted(self.current_model_id, checkpoint_path, epoch)
+                    logging.info(f"Model {self.current_model_id} marked as interrupted and can be resumed")
+
             await self.clean_exit()
             return
         elif self.pc.iceConnectionState in ["failed", "disconnected", "closed"]:
             logging.info(f"ICE connection {self.pc.iceConnectionState}. Waiting for reconnect...")
 
+            # Mark training as interrupted before waiting
+            if self.current_model_id and self.status == "busy":
+                logging.info(f"Marking model {self.current_model_id} as interrupted due to disconnection")
+                model_info = self.registry.get(self.current_model_id)
+                if model_info:
+                    checkpoint_path = model_info.get('checkpoint_path', '')
+                    epoch = 0  # TODO: Track actual epoch
+                    self.registry.mark_interrupted(self.current_model_id, checkpoint_path, epoch)
+
             # Wait up to 90 seconds.
-            for i in range(90):  
+            for i in range(90):
                 await asyncio.sleep(1)
                 if self.pc.iceConnectionState in ["connected", "completed"]:
                     logging.info("ICE reconnected!")
@@ -1466,7 +1639,7 @@ class RTCWorkerClient:
 
             logging.error("Reconnection timed out. Closing connection.")
             await self.clean_exit()
-            
+
         elif self.pc.iceConnectionState == "checking":
             logging.info("ICE connection is checking...")
             

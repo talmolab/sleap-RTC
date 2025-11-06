@@ -7,8 +7,10 @@ from sleap_rtc.rtc_worker import run_RTCworker
 from sleap_rtc.rtc_client import run_RTCclient
 from sleap_rtc.rtc_client_track import run_RTCclient_track
 from sleap_rtc.worker.model_registry import ModelRegistry
+from sleap_rtc.client.registry_query import query_registry_list, query_registry_info
 import sys
 import json
+import asyncio
 from datetime import datetime
 
 @click.group()
@@ -247,8 +249,14 @@ def client_train(**kwargs):
     "--model_paths",
     "-m",
     multiple=True,
-    required=True,
+    required=False,
     help="Paths to trained model directories (can specify multiple times).",
+)
+@click.option(
+    "--model",
+    multiple=True,
+    required=False,
+    help="Model IDs from worker registry (alternative to --model_paths).",
 )
 @click.option(
     "--output",
@@ -273,6 +281,14 @@ def client_train(**kwargs):
 def client_track(**kwargs):
     """Run remote inference on a worker with pre-trained models.
 
+    Model specification (mutually exclusive):
+
+    1. Model paths: --model_paths PATH1 --model_paths PATH2
+       Use local model directories.
+
+    2. Model IDs: --model MODEL_ID1 --model MODEL_ID2
+       Use models from worker's registry (requires querying worker).
+
     Connection modes (mutually exclusive):
 
     1. Session string (direct): --session-string SESSION
@@ -292,6 +308,26 @@ def client_track(**kwargs):
     worker_id = kwargs.pop("worker_id", None)
     auto_select = kwargs.pop("auto_select", False)
     min_gpu_memory = kwargs.pop("min_gpu_memory", None)
+
+    # Extract model options
+    model_paths = kwargs.pop("model_paths", ())
+    model_ids = kwargs.pop("model", ())
+
+    # Validation: Must provide either model_paths OR model IDs
+    has_model_paths = len(model_paths) > 0
+    has_model_ids = len(model_ids) > 0
+
+    if has_model_paths and has_model_ids:
+        logger.error("Model specification modes are mutually exclusive. Use only one of:")
+        logger.error("  --model_paths (local model directories)")
+        logger.error("  --model (model IDs from worker registry)")
+        sys.exit(1)
+
+    if not has_model_paths and not has_model_ids:
+        logger.error("Must provide models:")
+        logger.error("  --model_paths PATH1 --model_paths PATH2 (local directories)")
+        logger.error("  --model MODEL_ID1 --model MODEL_ID2 (worker registry IDs)")
+        sys.exit(1)
 
     # Validation: Must provide either session string OR room credentials
     has_session = session_string is not None
@@ -324,7 +360,51 @@ def client_track(**kwargs):
         logger.error("Cannot use both --worker-id and --auto-select")
         sys.exit(1)
 
-    logger.info(f"Running inference with models: {kwargs['model_paths']}")
+    # If using model IDs, resolve them to paths via registry query
+    if has_model_ids:
+        logger.info(f"Resolving model IDs: {list(model_ids)}")
+
+        # Build connection params for registry query
+        connection_params = {}
+        if session_string:
+            connection_params['session_string'] = session_string
+        else:
+            connection_params['room_id'] = room_id
+            connection_params['token'] = token
+            if worker_id:
+                connection_params['worker_id'] = worker_id
+
+        # Query each model ID to get checkpoint path
+        resolved_paths = []
+        for model_id in model_ids:
+            try:
+                logger.info(f"Querying worker for model {model_id}...")
+                model_info = asyncio.run(query_registry_info(model_id, **connection_params))
+
+                if not model_info:
+                    logger.error(f"Model '{model_id}' not found in worker registry")
+                    sys.exit(1)
+
+                # Extract checkpoint path
+                checkpoint_path = model_info.get('checkpoint_path')
+                if not checkpoint_path:
+                    logger.error(f"Model '{model_id}' has no checkpoint path")
+                    sys.exit(1)
+
+                # Get parent directory (model directory)
+                model_dir = str(Path(checkpoint_path).parent)
+                resolved_paths.append(model_dir)
+                logger.info(f"  Resolved to: {model_dir}")
+
+            except Exception as e:
+                logger.error(f"Failed to resolve model {model_id}: {e}")
+                sys.exit(1)
+
+        # Use resolved paths
+        model_paths = tuple(resolved_paths)
+        logger.info(f"Using models: {list(model_paths)}")
+    else:
+        logger.info(f"Running inference with models: {list(model_paths)}")
 
     # Handle room-based connection
     if room_id:
@@ -348,7 +428,7 @@ def client_track(**kwargs):
     return run_RTCclient_track(
         session_string=session_string,
         data_path=kwargs.pop("data_path"),
-        model_paths=list(kwargs.pop("model_paths")),
+        model_paths=list(model_paths),
         output=kwargs.pop("output"),
         only_suggested_frames=kwargs.pop("only_suggested_frames"),
         **kwargs
@@ -365,10 +445,36 @@ def client_deprecated(ctx, **kwargs):
 
 @cli.command(name="list-models")
 @click.option(
+    "--session-string",
+    "--session_string",
+    "-s",
+    type=str,
+    required=False,
+    help="Session string for remote worker connection.",
+)
+@click.option(
+    "--room-id",
+    type=str,
+    required=False,
+    help="Room ID for remote worker connection.",
+)
+@click.option(
+    "--token",
+    type=str,
+    required=False,
+    help="Room token (required with --room-id).",
+)
+@click.option(
+    "--worker-id",
+    type=str,
+    required=False,
+    help="Specific worker to query (optional with --room-id).",
+)
+@click.option(
     "--registry-dir",
     type=click.Path(exists=True, path_type=Path),
     default=Path("models/.registry"),
-    help="Path to the model registry directory.",
+    help="Path to LOCAL registry directory (used only without connection params).",
 )
 @click.option(
     "--status",
@@ -389,29 +495,72 @@ def client_deprecated(ctx, **kwargs):
     default="table",
     help="Output format (table or json).",
 )
-def list_models(registry_dir, status, model_type, output_format):
-    """List all trained models in the registry.
+def list_models(session_string, room_id, token, worker_id, registry_dir, status, model_type, output_format):
+    """List trained models in registry (local or remote).
 
-    Examples:
+    LOCAL (worker machine):
       sleap-rtc list-models
       sleap-rtc list-models --status completed
-      sleap-rtc list-models --model-type centroid
-      sleap-rtc list-models --format json
+
+    REMOTE (query worker from client):
+      sleap-rtc list-models --room-id ROOM --token TOKEN
+      sleap-rtc list-models --session-string SESSION
+      sleap-rtc list-models --room-id ROOM --token TOKEN --worker-id WORKER
     """
-    try:
-        registry = ModelRegistry(registry_dir=registry_dir)
-    except Exception as e:
-        logger.error(f"Failed to load registry: {e}")
-        sys.exit(1)
+    # Determine if this is a remote or local query
+    is_remote = session_string or room_id
 
-    # Apply filters
-    filters = {}
-    if status:
-        filters['status'] = status
-    if model_type:
-        filters['model_type'] = model_type
+    if is_remote:
+        # Validate connection parameters
+        if session_string and room_id:
+            logger.error("Cannot use both --session-string and --room-id")
+            sys.exit(1)
 
-    models = registry.list(filters=filters)
+        if room_id and not token:
+            logger.error("--token required with --room-id")
+            sys.exit(1)
+
+        # Build connection params
+        connection_params = {}
+        if session_string:
+            connection_params['session_string'] = session_string
+        else:
+            connection_params['room_id'] = room_id
+            connection_params['token'] = token
+            if worker_id:
+                connection_params['worker_id'] = worker_id
+
+        # Build filters
+        filters = {}
+        if status:
+            filters['status'] = status
+        if model_type:
+            filters['model_type'] = model_type
+
+        # Query remote worker
+        try:
+            logger.info("Querying remote worker registry...")
+            models = asyncio.run(query_registry_list(filters=filters, **connection_params))
+        except Exception as e:
+            logger.error(f"Failed to query remote registry: {e}")
+            sys.exit(1)
+
+    else:
+        # Local registry query
+        try:
+            registry = ModelRegistry(registry_dir=registry_dir)
+        except Exception as e:
+            logger.error(f"Failed to load local registry: {e}")
+            sys.exit(1)
+
+        # Apply filters
+        filters = {}
+        if status:
+            filters['status'] = status
+        if model_type:
+            filters['model_type'] = model_type
+
+        models = registry.list(filters=filters)
 
     if not models:
         logger.info("No models found matching criteria")
@@ -449,24 +598,87 @@ def list_models(registry_dir, status, model_type, output_format):
 @cli.command(name="model-info")
 @click.argument("model_id", type=str)
 @click.option(
+    "--session-string",
+    "--session_string",
+    "-s",
+    type=str,
+    required=False,
+    help="Session string for remote worker connection.",
+)
+@click.option(
+    "--room-id",
+    type=str,
+    required=False,
+    help="Room ID for remote worker connection.",
+)
+@click.option(
+    "--token",
+    type=str,
+    required=False,
+    help="Room token (required with --room-id).",
+)
+@click.option(
+    "--worker-id",
+    type=str,
+    required=False,
+    help="Specific worker to query (optional with --room-id).",
+)
+@click.option(
     "--registry-dir",
     type=click.Path(exists=True, path_type=Path),
     default=Path("models/.registry"),
-    help="Path to the model registry directory.",
+    help="Path to LOCAL registry directory (used only without connection params).",
 )
-def model_info(model_id, registry_dir):
-    """Display detailed information about a specific model.
+def model_info(model_id, session_string, room_id, token, worker_id, registry_dir):
+    """Display detailed model information (local or remote).
 
-    Examples:
+    LOCAL (worker machine):
       sleap-rtc model-info a3f5e8c9
-    """
-    try:
-        registry = ModelRegistry(registry_dir=registry_dir)
-    except Exception as e:
-        logger.error(f"Failed to load registry: {e}")
-        sys.exit(1)
 
-    model = registry.get(model_id)
+    REMOTE (query worker from client):
+      sleap-rtc model-info a3f5e8c9 --room-id ROOM --token TOKEN
+      sleap-rtc model-info a3f5e8c9 --session-string SESSION
+    """
+    # Determine if this is a remote or local query
+    is_remote = session_string or room_id
+
+    if is_remote:
+        # Validate connection parameters
+        if session_string and room_id:
+            logger.error("Cannot use both --session-string and --room-id")
+            sys.exit(1)
+
+        if room_id and not token:
+            logger.error("--token required with --room-id")
+            sys.exit(1)
+
+        # Build connection params
+        connection_params = {}
+        if session_string:
+            connection_params['session_string'] = session_string
+        else:
+            connection_params['room_id'] = room_id
+            connection_params['token'] = token
+            if worker_id:
+                connection_params['worker_id'] = worker_id
+
+        # Query remote worker
+        try:
+            logger.info(f"Querying remote worker for model {model_id}...")
+            model = asyncio.run(query_registry_info(model_id, **connection_params))
+        except Exception as e:
+            logger.error(f"Failed to query remote registry: {e}")
+            sys.exit(1)
+
+    else:
+        # Local registry query
+        try:
+            registry = ModelRegistry(registry_dir=registry_dir)
+        except Exception as e:
+            logger.error(f"Failed to load local registry: {e}")
+            sys.exit(1)
+
+        model = registry.get(model_id)
 
     if not model:
         logger.error(f"Model '{model_id}' not found in registry")
