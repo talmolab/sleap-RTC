@@ -383,7 +383,7 @@ class RTCWorkerClient:
         """Requests the signaling server to delete the room and associated user/worker."""
 
         config = get_config()
-        url = config.get_http_endpoint("/delete-peers-and-room")
+        url = config.get_http_endpoint("/delete-peer")
         json = {
             "peer_id": peer_id,
         }

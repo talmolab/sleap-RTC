@@ -84,7 +84,7 @@ class RTCClient:
         """Requests the signaling server to delete the room and associated user/worker."""
 
         config = get_config()
-        url = config.get_http_endpoint("/delete-peers-and-room")
+        url = config.get_http_endpoint("/delete-peer")
         json = {
             "peer_id": peer_id,
         }
@@ -885,7 +885,8 @@ class RTCClient:
                     workers = new_workers
                     continue
                 else:
-                    print("No workers found. Showing previous list.")
+                    print("No workers found. Returning empty list.")
+                    workers = []
                     continue
 
             try:
