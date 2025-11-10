@@ -51,6 +51,12 @@ class RTCWorkerClient:
         self.supported_models = ["base", "centroid", "topdown"]
         self.supported_job_types = ["training", "inference"]
         self.max_concurrent_jobs = 1
+        self.shutting_down = False
+
+        # Room credentials (set during run_worker, needed for re-registration)
+        self.room_id = None
+        self.room_token = None
+        self.id_token = None  # Cognito ID token for authentication
 
     def _detect_gpu_memory(self) -> int:
         """Detect GPU memory in MB.
@@ -111,24 +117,58 @@ class RTCWorkerClient:
         }
 
         try:
+            # Send metadata update to signaling server
             await self.websocket.send(json.dumps({
                 "type": "update_metadata",
                 "peer_id": self.cognito_username,
                 "metadata": metadata
             }))
 
-            # Wait for confirmation (optional but recommended)
-            response = await asyncio.wait_for(self.websocket.recv(), timeout=2.0)
-            response_data = json.loads(response)
+            # Response handled by websocket in handle_connection()
 
-            if response_data.get("type") == "metadata_updated":
-                logging.info(f"Status updated to: {status}")
-            else:
-                logging.warning(f"Unexpected response to status update: {response_data}")
-        except asyncio.TimeoutError:
-            logging.warning(f"Timeout waiting for status update confirmation")
         except Exception as e:
             logging.error(f"Failed to update status: {e}")
+
+    async def reregister_worker(self):
+        """Re-register worker with signaling server to become discoverable again.
+
+        Called after resetting from a client disconnect to ensure the worker
+        appears in discovery queries.
+        """
+        # Get SLEAP version
+        try:
+            import sleap
+            sleap_version = sleap.__version__
+        except (ImportError, AttributeError):
+            sleap_version = "unknown"
+
+        try:
+            # Send full registration message (not just metadata update)
+            await self.websocket.send(json.dumps({
+                'type': 'register',
+                'peer_id': self.cognito_username,
+                'room_id': self.room_id,
+                'token': self.room_token,
+                'id_token': self.id_token,  # Required for authentication
+                'role': 'worker',
+                'metadata': {
+                    'tags': ['sleap-rtc', 'training-worker', 'inference-worker'],
+                    'properties': {
+                        'gpu_memory_mb': self.gpu_memory_mb,
+                        'gpu_model': self.gpu_model,
+                        'sleap_version': sleap_version,
+                        'cuda_version': self.cuda_version,
+                        'hostname': socket.gethostname(),
+                        'status': self.status,
+                        'max_concurrent_jobs': self.max_concurrent_jobs,
+                        'supported_models': self.supported_models,
+                        'supported_job_types': self.supported_job_types
+                    }
+                }
+            }))
+            logging.info("Worker re-registered with signaling server")
+        except Exception as e:
+            logging.error(f"Failed to re-register worker: {e}")
 
     async def _send_peer_message(self, to_peer_id: str, payload: dict):
         """Send peer message via signaling server.
@@ -1007,6 +1047,9 @@ class RTCWorkerClient:
             None    
         """
 
+        # Set flag BEFORE closing connection & iceConnection state change triggers
+        self.shutting_down = True
+
         logging.info("Closing WebRTC connection...") 
         if self.pc:
             await self.pc.close()
@@ -1193,6 +1236,9 @@ class RTCWorkerClient:
 
                 elif msg_type == 'peer_message':  # NEW: Handle peer messages (job requests, etc.)
                     await self.handle_peer_message(data)
+
+                elif msg_type == "metadata_updated":
+                    logging.info(f"Status updated to: {data.get('metadata').get('properties').get('status')}")
 
                 # Error handling
                 else:
@@ -1452,15 +1498,58 @@ class RTCWorkerClient:
         """
         
         # Log the ICE connection state.
-        logging.info(f"ICE connection state is now {self.pc.iceConnectionState}")
+        iceState = self.pc.iceConnectionState
+        logging.info(f"ICE connection state is now {iceState}")
 
-        # Check the ICE connection state and handle accordingly.
-        if self.pc.iceConnectionState == "failed":
-            logging.ERROR('ICE connection failed')
-            await self.clean_exit()
+        # Let clean_exit() finish without restarting
+        if self.shutting_down:
+            logging.info("Worker is shutting down - ignoring ICE state change.")
+            return 
+
+        # Success States
+        if iceState in ["connected", "completed"]:
+            logging.info(f"ICE connection established ({iceState})")
+            # Reset any reconnection tracking if you add it later
+            # self.reconnect_attempts = 0
+            # Connection is now active and ready
             return
-        elif self.pc.iceConnectionState in ["failed", "disconnected", "closed"]:
-            logging.info(f"ICE connection {self.pc.iceConnectionState}. Waiting for reconnect...")
+        
+        # Negotiation States
+        if iceState == "checking":
+            logging.info("ICE connection is checking...")
+            return
+
+        if iceState == "new":
+            logging.info("ICE connection is new...")
+            return
+
+        # Check the ICE connection state and reset the Worker.
+        if iceState == "closed":
+            # Client explicitly closed the connection.
+            logging.error('Client closed connection - resetting for new client')
+
+            # Close old peer connection
+            await self.pc.close()
+
+            # Create new peer connection
+            self.pc = RTCPeerConnection()
+            self.pc.on("datachannel", self.on_datachannel)
+            self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
+
+            # Clear the job state
+            self.current_job = None
+            self.received_files.clear()
+
+            # Re-register with signaling server (not just update metadata)
+            # This ensures the worker appears in discovery queries again
+            self.status = "available"
+            await self.reregister_worker()
+
+            logging.info("Ready for new client connection!")
+
+        elif iceState == "disconnected":
+            # Temporary network issue - wait for recovery
+            logging.info("ICE connection disconnected -wainting for recovery...")
 
             # Wait up to 90 seconds.
             for i in range(90):  
@@ -1468,12 +1557,48 @@ class RTCWorkerClient:
                 if self.pc.iceConnectionState in ["connected", "completed"]:
                     logging.info("ICE reconnected!")
                     return
+                if self.pc.iceConnectionState in ["closed", "failed"]:
+                    break
 
             logging.error("Reconnection timed out. Closing connection.")
-            await self.clean_exit()
-            
-        elif self.pc.iceConnectionState == "checking":
-            logging.info("ICE connection is checking...")
+            await self.pc.close()
+
+            # Create new peer connection
+            self.pc = RTCPeerConnection()
+            self.pc.on("datachannel", self.on_datachannel)
+            self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
+
+            # Clear the job state
+            self.current_job = None
+            self.received_files.clear()
+
+            # Re-register with signaling server (not just update metadata)
+            self.status = "available"
+            await self.reregister_worker()
+
+            logging.info("Ready for new client connection!")
+
+        elif iceState == "failed":
+            # Connection permanently failed
+            logging.info("Connection failed - resetting")
+
+            # Close old peer connection
+            await self.pc.close()
+
+            # Create new peer connection
+            self.pc = RTCPeerConnection()
+            self.pc.on("datachannel", self.on_datachannel)
+            self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
+
+            # Clear the job state
+            self.current_job = None
+            self.received_files.clear()
+
+            # Re-register with signaling server (not just update metadata)
+            self.status = "available"
+            await self.reregister_worker()
+
+            logging.info("Ready for new client connection!")
             
 
     async def run_worker(self, pc, DNS: str, port_number, room_id=None, token=None):
@@ -1527,6 +1652,11 @@ class RTCWorkerClient:
                     return
                 logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
 
+            # Store credentials for re-registration after reset
+            self.id_token = id_token
+            self.room_id = room_json['room_id']
+            self.room_token = room_json['token']
+
             # Establish a WebSocket connection to the signaling server.
             logging.info(f"Connecting to signaling server at {DNS}...")
             async with websockets.connect(DNS) as websocket:
@@ -1570,8 +1700,16 @@ class RTCWorkerClient:
                 logging.info(f"Worker capabilities: GPU={self.gpu_model}, Memory={self.gpu_memory_mb}MB, CUDA={self.cuda_version}")
 
                 # Handle incoming messages from server (e.g. answers).
-                await self.handle_connection(self.pc, self.websocket, peer_id)
-                logging.info(f"{peer_id} connected with client!")
+                try:
+                    await self.handle_connection(self.pc, self.websocket, peer_id)
+                    logging.info(f"{peer_id} connected with client!")
+                except KeyboardInterrupt:
+                    logging.info("Worker shut down by user, shutting down...")
+                    await self.clean_exit()
+                
+        except KeyboardInterrupt:
+            logging.info("Worker interrupted by user during setup")
+            await self.clean_exit()
         except Exception as e:
             logging.error(f"Error in run_worker: {e}")
         finally:

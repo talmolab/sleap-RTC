@@ -60,6 +60,12 @@ class RTCClient:
         self.target_worker = None
         self.reconnecting = False
         self.current_job_id = None  # For tracking active job submissions
+
+        # Response queues for coordinating websocket messages
+        # (Only handle_connection() calls recv(), other functions wait on these queues)
+        self.registration_queue = asyncio.Queue()  # For registered_auth responses
+        self.peer_list_queue = asyncio.Queue()     # For peer_list responses
+        self.job_response_queues = {}              # job_id -> asyncio.Queue for job responses
     
 
     def parse_session_string(self, session_string: str):
@@ -266,11 +272,13 @@ class RTCClient:
 
 
     async def handle_connection(self):
-        """Handles receiving SDP answer from Worker and ICE candidates from Worker.
+        """Handles receiving all WebSocket messages and routes them appropriately.
+
+        This is the ONLY method that calls websocket.recv(). All other methods
+        wait on queues for their responses.
 
         Args:
-            pc: RTCPeerConnection object
-            websocket: websocket connection object 
+            None
         Returns:
             None
         Raises:
@@ -285,46 +293,73 @@ class RTCClient:
                     logging.info(f"Received int message: {message}")
 
                 data = json.loads(message)
+                msg_type = data.get('type')
 
                 # Receive answer SDP from worker and set it as this peer's remote description.
-                if data.get('type') == 'answer':
-                    logging.info(f"Received answer from worker: {data}")
-
-                    await self.pc.setRemoteDescription(RTCSessionDescription(sdp=data.get('sdp'), type=data.get('type')))
+                if msg_type == 'answer':
+                    logging.info(f"Received answer from worker")
+                    await self.pc.setRemoteDescription(
+                        RTCSessionDescription(sdp=data.get('sdp'), type='answer')
+                    )
 
                 # Handle "trickle ICE" for non-local ICE candidates.
-                elif data.get('type') == 'candidate':
+                elif msg_type == 'candidate':
                     logging.info("Received ICE candidate")
                     candidate = data.get('candidate')
                     await self.pc.addIceCandidate(candidate)
 
                 # NOT initiator, received quit request from worker.
-                elif data.get('type') == 'quit': 
+                elif msg_type == 'quit':
                     logging.info("Worker has quit. Closing connection...")
                     await self.clean_exit()
                     break
 
-                # Handle the "registered_auth" message from the signaling server.
-                elif data.get('type') == 'registered_auth':
-                    logging.info(f"Client authenticated with server.")
+                # Registration confirmation → route to queue
+                elif msg_type == 'registered_auth':
+                    logging.info("Client authenticated with server")
+                    await self.registration_queue.put(data)
 
-                # Handle peer messages (job responses, status updates, etc.)
-                elif data.get('type') == 'peer_message':
-                    # Peer messages are handled by _collect_job_responses and _monitor_job_progress
-                    # They should be processed by those methods, not here
-                    # Just log for debugging
+                # Peer discovery response → route to queue
+                elif msg_type == 'peer_list':
+                    workers = data.get("peers", [])
+                    logging.info(f"Discovered {len(workers)} workers")
+                    await self.peer_list_queue.put(workers)
+
+                # Peer messages (job responses, progress updates) → route to job-specific queue
+                elif msg_type == 'peer_message':
                     payload = data.get('payload', {})
-                    logging.debug(f"Received peer message: {payload.get('app_message_type', 'unknown')}")
+                    app_msg_type = payload.get('app_message_type')
+
+                    if app_msg_type == 'job_response':
+                        # Route to job-specific queue
+                        job_id = payload.get('job_id')
+                        if job_id and job_id in self.job_response_queues:
+                            await self.job_response_queues[job_id].put({
+                                "worker_id": data.get("from_peer_id"),
+                                "accepted": payload.get("accepted"),
+                                "reason": payload.get("reason", ""),
+                                "estimated_duration_minutes": payload.get("estimated_duration_minutes", 0),
+                                "estimated_start_time_sec": payload.get("estimated_start_time_sec", 0),
+                                "worker_info": payload.get("worker_info", {})
+                            })
+
+                    elif app_msg_type in ['job_started', 'job_progress', 'job_completed', 'job_failed']:
+                        # Route to job progress queue
+                        job_id = payload.get('job_id')
+                        if job_id and job_id in self.job_response_queues:
+                            await self.job_response_queues[job_id].put(payload)
+
+                    logging.debug(f"Received peer message: {app_msg_type}")
 
                 # Unhandled message types.
                 else:
-                    logging.debug(f"Unhandled message: {data}")
-        
+                    logging.debug(f"Unhandled message type: {msg_type}")
+
         except json.JSONDecodeError:
-            logging.DEBUG("Invalid JSON received")
+            logging.error("Invalid JSON received")
 
         except Exception as e:
-            logging.DEBUG(f"Error handling message: {e}")
+            logging.error(f"Error handling message: {e}")
 
 
     async def keep_ice_alive(self):
@@ -659,21 +694,14 @@ class RTCClient:
                 "filters": filters
             }))
 
-            # Wait for response
-            response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
-            response_data = json.loads(response)
+            # Wait for response from queue (routed by handle_connection)
+            workers = await asyncio.wait_for(
+                self.peer_list_queue.get(),
+                timeout=5.0
+            )
 
-            if response_data.get("type") == "peer_list":
-                workers = response_data.get("peers", [])
-                logging.info(f"Discovered {len(workers)} available workers in room {room_id}")
-                return workers
-            elif response_data.get("type") == "error" and response_data.get("code") == "UNKNOWN_MESSAGE_TYPE":
-                # Old signaling server, fall back to manual peer_id
-                logging.warning("Signaling server doesn't support discovery, using manual peer_id")
-                return await self._fallback_manual_peer_selection()
-            else:
-                logging.error(f"Unexpected response: {response_data}")
-                return []
+            logging.info(f"Discovered {len(workers)} available workers in room {room_id}")
+            return workers
 
         except asyncio.TimeoutError:
             logging.warning("Discovery timed out, falling back to manual peer_id")
@@ -729,6 +757,7 @@ class RTCClient:
 
         logging.info(f"Registering {self.peer_id} with room {room_id}...")
 
+        # Send registration message
         await self.websocket.send(json.dumps({
             'type': 'register',
             'peer_id': self.peer_id,
@@ -746,14 +775,16 @@ class RTCClient:
             }
         }))
 
-        # Wait for registration confirmation
+        # Wait for confirmation from queue (routed by handle_connection)
         try:
-            response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
-            response_data = json.loads(response)
-            if response_data.get("type") == "registered_auth":
+            response = await asyncio.wait_for(
+                self.registration_queue.get(),
+                timeout=5.0
+            )
+            if response.get("type") == "registered_auth":
                 logging.info(f"Client {self.peer_id} successfully registered with room {room_id}")
             else:
-                logging.warning(f"Unexpected registration response: {response_data}")
+                logging.warning(f"Unexpected registration response: {response}")
         except asyncio.TimeoutError:
             logging.error("Registration confirmation timeout")
         except Exception as e:
@@ -795,17 +826,14 @@ class RTCClient:
                 "filters": filters
             }))
 
-            # Wait for response
-            response = await asyncio.wait_for(self.websocket.recv(), timeout=5.0)
-            response_data = json.loads(response)
+            # Wait for response from queue (routed by handle_connection)
+            workers = await asyncio.wait_for(
+                self.peer_list_queue.get(),
+                timeout=5.0
+            )
 
-            if response_data.get("type") == "peer_list":
-                workers = response_data.get("peers", [])
-                logging.info(f"Discovered {len(workers)} available workers in room")
-                return workers
-            else:
-                logging.error(f"Unexpected discovery response: {response_data}")
-                return []
+            logging.info(f"Discovered {len(workers)} available workers in room")
+            return workers
 
         except asyncio.TimeoutError:
             logging.error("Worker discovery timed out")
@@ -877,12 +905,12 @@ class RTCClient:
             if choice == 'refresh':
                 logging.info("Refreshing worker list...")
                 # Re-query workers
-                new_workers = await self._discover_workers_in_room(
+                refreshed_workers = await self._discover_workers_in_room(
                     room_id=self.current_room_id,
                     min_gpu_memory=None
                 )
-                if new_workers:
-                    workers = new_workers
+                if refreshed_workers:
+                    workers = refreshed_workers
                     continue
                 else:
                     print("No workers found. Returning empty list.")
@@ -913,32 +941,31 @@ class RTCClient:
         responses = []
         deadline = time.time() + timeout
 
-        while time.time() < deadline:
-            try:
+        # Create queue for this specific job
+        self.job_response_queues[job_id] = asyncio.Queue()
+
+        try:
+            while time.time() < deadline:
                 remaining = deadline - time.time()
-                msg = await asyncio.wait_for(
-                    self.websocket.recv(),
-                    timeout=max(0.1, remaining)
-                )
 
-                data = json.loads(msg)
+                try:
+                    # Wait for response from queue (routed by handle_connection)
+                    response = await asyncio.wait_for(
+                        self.job_response_queues[job_id].get(),
+                        timeout=max(0.1, remaining)
+                    )
 
-                if data.get("type") == "peer_message":
-                    payload = data.get("payload", {})
-                    if (payload.get("app_message_type") == "job_response" and
-                        payload.get("job_id") == job_id):
+                    # Only collect job_response messages (not progress/started/etc)
+                    if isinstance(response, dict) and response.get("worker_id"):
+                        responses.append(response)
 
-                        responses.append({
-                            "worker_id": data.get("from_peer_id"),
-                            "accepted": payload.get("accepted"),
-                            "reason": payload.get("reason", ""),
-                            "estimated_duration_minutes": payload.get("estimated_duration_minutes", 0),
-                            "estimated_start_time_sec": payload.get("estimated_start_time_sec", 0),
-                            "worker_info": payload.get("worker_info", {})
-                        })
+                except asyncio.TimeoutError:
+                    break
 
-            except asyncio.TimeoutError:
-                break
+        finally:
+            # Clean up queue
+            if job_id in self.job_response_queues:
+                del self.job_response_queues[job_id]
 
         return responses
 
@@ -948,42 +975,49 @@ class RTCClient:
         Args:
             job_id: Job ID to monitor
         """
-        while True:
-            msg = await self.websocket.recv()
-            data = json.loads(msg)
+        # Reuse the same queue as _collect_job_responses if it exists,
+        # or create new one
+        if job_id not in self.job_response_queues:
+            self.job_response_queues[job_id] = asyncio.Queue()
 
-            if data.get("type") != "peer_message":
-                continue
+        try:
+            while True:
+                # Wait for messages from queue (routed by handle_connection)
+                payload = await self.job_response_queues[job_id].get()
 
-            payload = data.get("payload", {})
+                # Skip non-dict messages or job_response messages (those are for _collect_job_responses)
+                if not isinstance(payload, dict) or payload.get("worker_id"):
+                    continue
 
-            if payload.get("job_id") != job_id:
-                continue
+                app_msg_type = payload.get("app_message_type")
 
-            app_msg_type = payload.get("app_message_type")
+                if app_msg_type == "job_status":
+                    # Display progress
+                    progress = payload.get("progress", 0)
+                    message = payload.get("message", "")
+                    details = payload.get("details", {})
 
-            if app_msg_type == "job_status":
-                # Display progress
-                progress = payload.get("progress", 0)
-                message = payload.get("message", "")
-                details = payload.get("details", {})
+                    logging.info(f"Job progress: {progress*100:.1f}% - {message}")
+                    if details:
+                        logging.info(f"Details: {details}")
 
-                logging.info(f"Job progress: {progress*100:.1f}% - {message}")
-                if details:
-                    logging.info(f"Details: {details}")
+                elif app_msg_type == "job_complete":
+                    logging.info("Job completed successfully!")
+                    result = payload.get("result", {})
+                    logging.info(f"Result: {result}")
+                    break
 
-            elif app_msg_type == "job_complete":
-                logging.info("Job completed successfully!")
-                result = payload.get("result", {})
-                logging.info(f"Result: {result}")
-                break
+                elif app_msg_type == "job_failed":
+                    error = payload.get("error", {})
+                    logging.error(f"Job failed: {error.get('message', 'Unknown error')}")
+                    raise JobFailedError(
+                        f"Job failed with code {error.get('code', 'UNKNOWN')}: {error.get('message', 'Unknown error')}"
+                    )
 
-            elif app_msg_type == "job_failed":
-                error = payload.get("error", {})
-                logging.error(f"Job failed: {error.get('message', 'Unknown error')}")
-                raise JobFailedError(
-                    f"Job failed with code {error.get('code', 'UNKNOWN')}: {error.get('message', 'Unknown error')}"
-                )
+        finally:
+            # Clean up queue when done
+            if job_id in self.job_response_queues:
+                del self.job_response_queues[job_id]
 
     async def submit_training_job(self, dataset_path: str, config: dict, room_id: str = None, **job_requirements):
         """Submit training job to available workers (DEPRECATED: use room-based connection flow).
@@ -1191,101 +1225,110 @@ class RTCClient:
                 # Initate the websocket for the GUI client (so other functions can use).
                 self.websocket = websocket
 
-                # BRANCH 1: Session string (direct connection to specific worker)
-                if session_string:
-                    logging.info("Using session string for direct worker connection")
+                # START handle_connection as background task to route messages to queues
+                connection_task = asyncio.create_task(self.handle_connection())
 
-                    # Prompt for session string if not provided
-                    if not session_string:
-                        session_str_json = None
-                        while True:
-                            session_string = input("Please enter RTC session string (or type 'exit' to quit): ")
-                            if session_string.lower() == "exit":
-                                print("Exiting client.")
-                                return
-                            try:
-                                session_str_json = self.parse_session_string(session_string)
-                                break  # Exit loop if parsing succeeds
-                            except ValueError as e:
-                                print(f"Error: {e}")
-                                print("Please try again or type 'exit' to quit.")
+                try:
+                    # BRANCH 1: Session string (direct connection to specific worker)
+                    if session_string:
+                        logging.info("Using session string for direct worker connection")
+
+                        # Prompt for session string if not provided
+                        if not session_string:
+                            session_str_json = None
+                            while True:
+                                session_string = input("Please enter RTC session string (or type 'exit' to quit): ")
+                                if session_string.lower() == "exit":
+                                    print("Exiting client.")
+                                    return
+                                try:
+                                    session_str_json = self.parse_session_string(session_string)
+                                    break  # Exit loop if parsing succeeds
+                                except ValueError as e:
+                                    print(f"Error: {e}")
+                                    print("Please try again or type 'exit' to quit.")
+                        else:
+                            session_str_json = self.parse_session_string(session_string)
+
+                        # Extract worker credentials from session string.
+                        worker_room_id = session_str_json.get("room_id")
+                        worker_token = session_str_json.get("token")
+                        worker_peer_id = session_str_json.get("peer_id")
+
+                        # Register with room
+                        await self._register_with_room(
+                            room_id=worker_room_id,
+                            token=worker_token,
+                            id_token=id_token
+                        )
+
+                        # Set target worker from session string
+                        self.target_worker = worker_peer_id
+                        logging.info(f"Selected worker from session string: {self.target_worker}")
+
+                    # BRANCH 2: Room-based discovery
+                    elif room_id:
+                        logging.info(f"Using room-based worker discovery: room_id={room_id}")
+
+                        # Store room info for discovery
+                        self.current_room_id = room_id
+
+                        # Register with room
+                        await self._register_with_room(
+                            room_id=room_id,
+                            token=token,
+                            id_token=id_token
+                        )
+
+                        # Discover workers in room
+                        workers = await self._discover_workers_in_room(
+                            room_id=room_id,
+                            min_gpu_memory=min_gpu_memory
+                        )
+
+                        if not workers:
+                            logging.error("No available workers found in room")
+                            return
+
+                        # Select worker based on mode
+                        if worker_id:
+                            # Direct worker selection
+                            self.target_worker = worker_id
+                            logging.info(f"Using specified worker: {worker_id}")
+                        elif auto_select:
+                            # Auto-select best worker
+                            self.target_worker = self._auto_select_worker(workers)
+                            logging.info(f"Auto-selected worker: {self.target_worker}")
+                        else:
+                            # Interactive worker selection
+                            self.target_worker = await self._prompt_worker_selection(workers)
+                            logging.info(f"User selected worker: {self.target_worker}")
+
                     else:
-                        session_str_json = self.parse_session_string(session_string)
-
-                    # Extract worker credentials from session string.
-                    worker_room_id = session_str_json.get("room_id")
-                    worker_token = session_str_json.get("token")
-                    worker_peer_id = session_str_json.get("peer_id")
-
-                    # Register with room
-                    await self._register_with_room(
-                        room_id=worker_room_id,
-                        token=worker_token,
-                        id_token=id_token
-                    )
-
-                    # Set target worker from session string
-                    self.target_worker = worker_peer_id
-                    logging.info(f"Selected worker from session string: {self.target_worker}")
-
-                # BRANCH 2: Room-based discovery
-                elif room_id:
-                    logging.info(f"Using room-based worker discovery: room_id={room_id}")
-
-                    # Store room info for discovery
-                    self.current_room_id = room_id
-
-                    # Register with room
-                    await self._register_with_room(
-                        room_id=room_id,
-                        token=token,
-                        id_token=id_token
-                    )
-
-                    # Discover workers in room
-                    workers = await self._discover_workers_in_room(
-                        room_id=room_id,
-                        min_gpu_memory=min_gpu_memory
-                    )
-
-                    if not workers:
-                        logging.error("No available workers found in room")
+                        logging.error("No connection method provided (session_string or room_id required)")
                         return
 
-                    # Select worker based on mode
-                    if worker_id:
-                        # Direct worker selection
-                        self.target_worker = worker_id
-                        logging.info(f"Using specified worker: {worker_id}")
-                    elif auto_select:
-                        # Auto-select best worker
-                        self.target_worker = self._auto_select_worker(workers)
-                        logging.info(f"Auto-selected worker: {self.target_worker}")
-                    else:
-                        # Interactive worker selection
-                        self.target_worker = await self._prompt_worker_selection(workers)
-                        logging.info(f"User selected worker: {self.target_worker}")
+                    if not self.target_worker:
+                        logging.info("No target worker given. Cannot connect.")
+                        return
 
-                else:
-                    logging.error("No connection method provided (session_string or room_id required)")
-                    return
+                    # Create and send SDP offer to worker peer.
+                    await self.pc.setLocalDescription(await self.pc.createOffer())
+                    await websocket.send(json.dumps({
+                        'type': self.pc.localDescription.type, # type: 'offer'
+                        'sender': self.peer_id, # should be own peer_id (Zoom username)
+                        'target': self.target_worker, # should match Worker's peer_id (Zoom username)
+                        'sdp': self.pc.localDescription.sdp
+                    }))
+                    logging.info('Offer sent to worker')
 
-                if not self.target_worker:
-                    logging.info("No target worker given. Cannot connect.")
-                    return
-                
-                # Create and send SDP offer to worker peer.
-                await self.pc.setLocalDescription(await self.pc.createOffer())
-                await websocket.send(json.dumps({
-                    'type': self.pc.localDescription.type, # type: 'offer'
-                    'sender': self.peer_id, # should be own peer_id (Zoom username)
-                    'target': self.target_worker, # should match Worker's peer_id (Zoom username)
-                    'sdp': self.pc.localDescription.sdp
-                }))
-                logging.info('Offer sent to worker')
+                    # Wait for connection_task to complete (handles all incoming messages)
+                    await connection_task
 
-                # Handle incoming messages from server (e.g. answer from worker).
-                await self.handle_connection()
+                except Exception as e:
+                    logging.error(f"Error during client connection: {e}")
+                    connection_task.cancel()
+                    raise
 
             # Send POST req to server to delete this User, Worker, and associated Room.
             logging.info("Cleaning up Cognito and DynamoDB entries...")
