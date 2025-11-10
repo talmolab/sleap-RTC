@@ -152,10 +152,10 @@ async def handle_connection(pc: RTCPeerConnection, websocket: ClientConnection):
                 break
     
     except json.JSONDecodeError:
-        logging.DEBUG("Invalid JSON received")
+        logging.debug("Invalid JSON received")
 
     except Exception as e:
-        logging.DEBUG(f"Error handling message: {e}")
+        logging.debug(f"Error handling message: {e}")
 
 
 async def run_client(
