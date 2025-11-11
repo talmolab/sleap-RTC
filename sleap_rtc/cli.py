@@ -626,5 +626,265 @@ def import_model(model_path: Path, alias: Optional[str], model_type: Optional[st
     logger.info("✓ Model successfully imported!")
     logger.info("")
 
+
+@cli.command(name="tag-model")
+@click.argument("identifier", type=str)
+@click.argument("alias", type=str)
+@click.option(
+    "--force",
+    "-f",
+    is_flag=True,
+    default=False,
+    help="Overwrite existing alias without prompting.",
+)
+@click.option(
+    "--registry-path",
+    type=click.Path(path_type=Path),
+    required=False,
+    help="Path to registry file (default: ~/.sleap-rtc/models/manifest.json).",
+)
+def tag_model(identifier: str, alias: str, force: bool, registry_path: Optional[Path]):
+    """Set or update an alias for a model.
+
+    IDENTIFIER: Model ID or existing alias to tag
+    ALIAS: New alias to assign to the model
+
+    Examples:
+        # Tag model by ID
+        sleap-rtc tag-model a3b4c5d6 production-v1
+
+        # Update existing alias
+        sleap-rtc tag-model old-alias new-alias
+
+        # Force overwrite existing alias
+        sleap-rtc tag-model a3b4c5d6 existing-alias --force
+    """
+    logger.info("=" * 70)
+    logger.info("Tag Model")
+    logger.info("=" * 70)
+    logger.info("")
+
+    # Initialize registry
+    registry = ClientModelRegistry(registry_path=registry_path)
+
+    # Step 1: Resolve identifier to model ID
+    logger.info(f"Resolving identifier: {identifier}")
+    model_id = registry.resolve(identifier)
+
+    if not model_id:
+        logger.error(f"Model not found: '{identifier}'")
+        logger.error("Use 'list-models' to see available models")
+        sys.exit(1)
+
+    # Get model info
+    model = registry.get(model_id)
+    old_alias = model.get("alias")
+    model_type = model.get("model_type", "unknown")
+
+    logger.info(f"✓ Found model: {model_id} ({model_type})")
+    if old_alias:
+        logger.info(f"  Current alias: {old_alias}")
+    logger.info("")
+
+    # Step 2: Sanitize and validate new alias
+    sanitized_alias = registry._sanitize_alias(alias)
+    is_valid, error_msg = registry._validate_alias(sanitized_alias)
+
+    if not is_valid:
+        logger.error(f"Invalid alias: {error_msg}")
+        sys.exit(1)
+
+    if sanitized_alias != alias:
+        logger.info(f"Sanitized alias: '{alias}' → '{sanitized_alias}'")
+        logger.info("")
+
+    # Step 3: Check for collision
+    existing_model_id = registry.resolve(sanitized_alias)
+
+    if existing_model_id and existing_model_id != model_id:
+        # Alias is in use by a different model
+        existing_model = registry.get(existing_model_id)
+        logger.warning(f"Alias '{sanitized_alias}' is already assigned to:")
+        logger.warning(f"  Model ID: {existing_model_id}")
+        logger.warning(f"  Type: {existing_model.get('model_type', 'unknown')}")
+        logger.warning("")
+
+        if not force:
+            if not click.confirm("Reassign alias to this model?", default=False):
+                logger.info("Operation cancelled")
+                sys.exit(0)
+
+    # Step 4: Set alias
+    success = registry.set_alias(model_id, sanitized_alias, force=True)
+
+    if success:
+        logger.info("=" * 70)
+        if old_alias:
+            logger.info(f"✓ Alias updated: '{old_alias}' → '{sanitized_alias}'")
+        else:
+            logger.info(f"✓ Alias set: '{sanitized_alias}'")
+        logger.info(f"  Model ID: {model_id}")
+        logger.info(f"  Model Type: {model_type}")
+        logger.info("=" * 70)
+    else:
+        logger.error("Failed to set alias")
+        sys.exit(1)
+
+
+@cli.command(name="update-model")
+@click.argument("identifier", type=str)
+@click.option(
+    "--notes",
+    type=str,
+    help="Add or update notes for the model.",
+)
+@click.option(
+    "--add-tag",
+    type=str,
+    multiple=True,
+    help="Add a tag to the model (can specify multiple times).",
+)
+@click.option(
+    "--remove-tag",
+    type=str,
+    multiple=True,
+    help="Remove a tag from the model (can specify multiple times).",
+)
+@click.option(
+    "--clear-tags",
+    is_flag=True,
+    default=False,
+    help="Remove all tags from the model.",
+)
+@click.option(
+    "--registry-path",
+    type=click.Path(path_type=Path),
+    required=False,
+    help="Path to registry file (default: ~/.sleap-rtc/models/manifest.json).",
+)
+def update_model(
+    identifier: str,
+    notes: Optional[str],
+    add_tag: tuple,
+    remove_tag: tuple,
+    clear_tags: bool,
+    registry_path: Optional[Path]
+):
+    """Update metadata for a model.
+
+    IDENTIFIER: Model ID or alias to update
+
+    Examples:
+        # Add notes
+        sleap-rtc update-model production-v1 --notes "Best performing model"
+
+        # Add tags
+        sleap-rtc update-model a3b4c5d6 --add-tag validated --add-tag production
+
+        # Remove tag
+        sleap-rtc update-model production-v1 --remove-tag experimental
+
+        # Clear all tags
+        sleap-rtc update-model a3b4c5d6 --clear-tags
+
+        # Combine operations
+        sleap-rtc update-model prod-v1 --notes "Updated model" --add-tag v2
+    """
+    logger.info("=" * 70)
+    logger.info("Update Model Metadata")
+    logger.info("=" * 70)
+    logger.info("")
+
+    # Initialize registry
+    registry = ClientModelRegistry(registry_path=registry_path)
+
+    # Resolve identifier to model ID
+    logger.info(f"Resolving identifier: {identifier}")
+    model_id = registry.resolve(identifier)
+
+    if not model_id:
+        logger.error(f"Model not found: '{identifier}'")
+        sys.exit(1)
+
+    # Get current model info
+    model = registry.get(model_id)
+    logger.info(f"✓ Found model: {model_id}")
+    logger.info(f"  Type: {model.get('model_type', 'unknown')}")
+    if model.get("alias"):
+        logger.info(f"  Alias: {model.get('alias')}")
+    logger.info("")
+
+    # Track changes
+    updates = {}
+    changes_made = False
+
+    # Update notes
+    if notes is not None:
+        old_notes = model.get("notes", "")
+        updates["notes"] = notes
+        changes_made = True
+        logger.info("Notes:")
+        logger.info(f"  Old: {old_notes if old_notes else '(none)'}")
+        logger.info(f"  New: {notes}")
+        logger.info("")
+
+    # Update tags
+    current_tags = set(model.get("tags", []))
+
+    if clear_tags:
+        updates["tags"] = []
+        changes_made = True
+        logger.info(f"Cleared all tags (was: {', '.join(current_tags) if current_tags else '(none)'})")
+        logger.info("")
+    else:
+        modified_tags = current_tags.copy()
+
+        # Add tags
+        for tag in add_tag:
+            if tag not in modified_tags:
+                modified_tags.add(tag)
+                changes_made = True
+                logger.info(f"+ Added tag: {tag}")
+
+        # Remove tags
+        for tag in remove_tag:
+            if tag in modified_tags:
+                modified_tags.discard(tag)
+                changes_made = True
+                logger.info(f"- Removed tag: {tag}")
+            else:
+                logger.warning(f"Tag not found: {tag}")
+
+        if add_tag or remove_tag:
+            updates["tags"] = list(modified_tags)
+            logger.info("")
+
+    # Apply updates
+    if not changes_made:
+        logger.warning("No changes specified")
+        logger.info("Use --notes, --add-tag, --remove-tag, or --clear-tags")
+        sys.exit(0)
+
+    registry.update(model_id, updates)
+
+    logger.info("=" * 70)
+    logger.info("✓ Model metadata updated")
+    logger.info("=" * 70)
+    logger.info("")
+
+    # Display updated info
+    updated_model = registry.get(model_id)
+    logger.info("Current metadata:")
+    logger.info(f"  Model ID: {model_id}")
+    logger.info(f"  Type: {updated_model.get('model_type', 'unknown')}")
+    if updated_model.get("alias"):
+        logger.info(f"  Alias: {updated_model.get('alias')}")
+    if updated_model.get("notes"):
+        logger.info(f"  Notes: {updated_model.get('notes')}")
+    if updated_model.get("tags"):
+        logger.info(f"  Tags: {', '.join(updated_model.get('tags'))}")
+    logger.info("")
+
+
 if __name__ == "__main__":
     cli()

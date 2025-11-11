@@ -201,6 +201,8 @@ class ClientModelRegistry:
         model_info.setdefault("on_worker", False)
         model_info.setdefault("worker_last_seen", None)
         model_info.setdefault("worker_path", None)
+        model_info.setdefault("notes", "")
+        model_info.setdefault("tags", [])
 
         # Store in registry
         self._data["models"][model_id] = model_info
