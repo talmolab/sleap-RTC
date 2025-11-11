@@ -4,7 +4,7 @@ import hashlib
 import json
 import yaml
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from loguru import logger
 
 
@@ -234,3 +234,109 @@ def format_size(size_bytes: int) -> str:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024.0
     return f"{size_bytes:.1f} TB"
+
+
+def resolve_model_path(identifier: str, registry_path: Optional[Path] = None) -> Tuple[Optional[Path], Optional[str]]:
+    """Resolve a model identifier to a filesystem path.
+
+    This function supports three types of identifiers:
+    1. File system paths (absolute or relative) - returned directly if they exist
+    2. Model IDs (8-character hex strings) - resolved via registry
+    3. Model aliases (user-friendly names) - resolved via registry
+
+    Args:
+        identifier: Model identifier - can be a path, model ID, or alias
+        registry_path: Optional custom path to registry file
+
+    Returns:
+        Tuple of (resolved_path, source) where:
+        - resolved_path: Path object if resolved, None if not found
+        - source: String describing resolution source ('path', 'id', 'alias', or None)
+
+    Examples:
+        >>> resolve_model_path("/path/to/model")
+        (Path("/path/to/model"), "path")
+
+        >>> resolve_model_path("a3b4c5d6")  # Model ID
+        (Path("/home/user/.sleap-rtc/models/centroid_a3b4c5d6"), "id")
+
+        >>> resolve_model_path("production-v1")  # Alias
+        (Path("/home/user/.sleap-rtc/models/centroid_a3b4c5d6"), "alias")
+
+        >>> resolve_model_path("nonexistent")
+        (None, None)
+    """
+    # First, check if it's a direct file path
+    path = Path(identifier)
+    if path.exists() and path.is_dir():
+        logger.debug(f"Resolved '{identifier}' as direct filesystem path")
+        return path.resolve(), "path"
+
+    # Try to resolve through the registry
+    try:
+        from sleap_rtc.client.client_model_registry import ClientModelRegistry
+
+        registry = ClientModelRegistry(registry_path=registry_path)
+
+        # Try to resolve as ID or alias
+        model_id = registry.resolve(identifier)
+
+        if model_id:
+            # Get the model entry
+            model = registry.get(model_id)
+            if model and "local_path" in model:
+                resolved_path = Path(model["local_path"])
+
+                # Determine if it was resolved as ID or alias
+                source = "id" if model_id == identifier else "alias"
+
+                # Verify the path exists
+                if resolved_path.exists():
+                    logger.debug(f"Resolved '{identifier}' via registry {source} to: {resolved_path}")
+                    return resolved_path, source
+                else:
+                    logger.warning(f"Registry entry found for '{identifier}' but path does not exist: {resolved_path}")
+                    return None, None
+
+        logger.debug(f"Could not resolve '{identifier}' through registry")
+        return None, None
+
+    except Exception as e:
+        logger.warning(f"Error resolving model identifier '{identifier}': {e}")
+        return None, None
+
+
+def resolve_model_paths(identifiers: List[str], registry_path: Optional[Path] = None) -> Tuple[List[Path], List[Tuple[str, str]]]:
+    """Resolve multiple model identifiers to filesystem paths.
+
+    Args:
+        identifiers: List of model identifiers (paths, IDs, or aliases)
+        registry_path: Optional custom path to registry file
+
+    Returns:
+        Tuple of (resolved_paths, errors) where:
+        - resolved_paths: List of successfully resolved Path objects
+        - errors: List of (identifier, error_message) tuples for failed resolutions
+
+    Examples:
+        >>> resolve_model_paths(["/path/to/model1", "production-v1", "a3b4c5d6"])
+        ([Path("/path/to/model1"), Path("~/.sleap-rtc/models/..."), ...], [])
+
+        >>> resolve_model_paths(["nonexistent", "production-v1"])
+        ([Path("~/.sleap-rtc/models/...")], [("nonexistent", "Model not found")])
+    """
+    resolved_paths = []
+    errors = []
+
+    for identifier in identifiers:
+        resolved_path, source = resolve_model_path(identifier, registry_path)
+
+        if resolved_path:
+            resolved_paths.append(resolved_path)
+            logger.info(f"✓ Resolved model: '{identifier}' ({source})")
+        else:
+            error_msg = f"Model not found: '{identifier}' (not a path, ID, or alias)"
+            errors.append((identifier, error_msg))
+            logger.error(error_msg)
+
+    return resolved_paths, errors

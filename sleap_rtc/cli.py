@@ -15,6 +15,7 @@ from sleap_rtc.client.model_utils import (
     validate_checkpoint_files,
     generate_model_id_from_config,
     format_size,
+    resolve_model_paths,
 )
 import sys
 import shutil
@@ -256,7 +257,7 @@ def client_train(**kwargs):
     "-m",
     multiple=True,
     required=True,
-    help="Paths to trained model directories (can specify multiple times).",
+    help="Model identifiers: paths, IDs, or aliases (can specify multiple times).",
 )
 @click.option(
     "--output",
@@ -278,8 +279,20 @@ def client_train(**kwargs):
     default=None,
     help="Minimum GPU memory in MB required for inference.",
 )
+@click.option(
+    "--registry-path",
+    type=click.Path(path_type=Path),
+    required=False,
+    help="Path to model registry file (default: ~/.sleap-rtc/models/manifest.json).",
+)
 def client_track(**kwargs):
     """Run remote inference on a worker with pre-trained models.
+
+    Model specification:
+    - File paths: --model-paths /path/to/model
+    - Model IDs: --model-paths a3b4c5d6
+    - Aliases: --model-paths production-v1
+    - Mixed: --model-paths /path/to/model1 --model-paths prod-model
 
     Connection modes (mutually exclusive):
 
@@ -332,7 +345,26 @@ def client_track(**kwargs):
         logger.error("Cannot use both --worker-id and --auto-select")
         sys.exit(1)
 
-    logger.info(f"Running inference with models: {kwargs['model_paths']}")
+    # Resolve model paths (supports paths, IDs, and aliases)
+    registry_path = kwargs.pop("registry_path", None)
+    model_identifiers = list(kwargs.pop("model_paths"))
+
+    logger.info(f"Resolving {len(model_identifiers)} model(s)...")
+    resolved_paths, errors = resolve_model_paths(model_identifiers, registry_path)
+
+    # Check for resolution errors
+    if errors:
+        logger.error(f"Failed to resolve {len(errors)} model(s):")
+        for identifier, error_msg in errors:
+            logger.error(f"  - {identifier}: {error_msg}")
+        logger.error("")
+        logger.error("Available options:")
+        logger.error("  1. Use a filesystem path (e.g., /path/to/model)")
+        logger.error("  2. Import the model first: sleap-rtc import-model /path/to/model --alias my-model")
+        logger.error("  3. List available models: python -m sleap_rtc.client.registry_server")
+        sys.exit(1)
+
+    logger.info(f"Successfully resolved {len(resolved_paths)} model(s)")
 
     # Handle room-based connection
     if room_id:
@@ -356,7 +388,7 @@ def client_track(**kwargs):
     return run_RTCclient_track(
         session_string=session_string,
         data_path=kwargs.pop("data_path"),
-        model_paths=list(kwargs.pop("model_paths")),
+        model_paths=[str(p) for p in resolved_paths],  # Convert Path objects to strings
         output=kwargs.pop("output"),
         only_suggested_frames=kwargs.pop("only_suggested_frames"),
         **kwargs

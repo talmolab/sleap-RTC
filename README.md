@@ -172,21 +172,108 @@ Connect to a worker to run an inference job:
 # Option 1: Direct connection using session string
 sleap-rtc client-track \
   --session-string <session_string> \
-  --pkg-path /path/to/inference_package.zip
+  --data-path data.slp \
+  --model-paths /path/to/model
 
 # Option 2: Room-based discovery with interactive worker selection
 sleap-rtc client-track \
   --room-id <room_id> \
   --token <token> \
-  --pkg-path /path/to/inference_package.zip
+  --data-path data.slp \
+  --model-paths /path/to/model
 
 # Option 3: Auto-select best worker by GPU memory
 sleap-rtc client-track \
   --room-id <room_id> \
   --token <token> \
-  --pkg-path /path/to/inference_package.zip \
+  --data-path data.slp \
+  --model-paths /path/to/model \
   --auto-select
 ```
+
+## Model Registry
+
+SLEAP-RTC includes a client-side model registry for managing and organizing trained models. Instead of always specifying full file paths, you can import models once and reference them by ID or friendly alias.
+
+### Importing Models
+
+Import a trained model into the registry:
+
+```bash
+# Import with auto-detection and alias
+sleap-rtc import-model /path/to/model --alias production-v1
+
+# Import with explicit model type
+sleap-rtc import-model /path/to/model --model-type centroid --alias my-centroid
+
+# Import and copy files (default creates symlink)
+sleap-rtc import-model /path/to/model --alias backup-model --copy
+```
+
+The import command will:
+1. Auto-detect model type from config files (YAML or JSON)
+2. Validate checkpoint files exist and are readable
+3. Generate a unique model ID (8-character hash)
+4. Create symlink or copy to `~/.sleap-rtc/models/{type}_{id}/`
+5. Register model in the client registry
+6. Optionally set a friendly alias for easy reference
+
+### Using Models by Reference
+
+Once imported, models can be referenced by:
+- **File path** (traditional): `/path/to/model`
+- **Model ID** (8-char hex): `a3b4c5d6`
+- **Alias** (friendly name): `production-v1`
+
+```bash
+# Use model by alias
+sleap-rtc client-track \
+  --room-id <room_id> \
+  --token <token> \
+  --data-path data.slp \
+  --model-paths production-v1
+
+# Use model by ID
+sleap-rtc client-track \
+  --room-id <room_id> \
+  --token <token> \
+  --data-path data.slp \
+  --model-paths a3b4c5d6
+
+# Mix references (path, ID, alias)
+sleap-rtc client-track \
+  --room-id <room_id> \
+  --token <token> \
+  --data-path data.slp \
+  --model-paths /path/to/model1 \
+  --model-paths production-v1 \
+  --model-paths b7c8d9e0
+```
+
+### Viewing Registered Models
+
+View all imported models in a web interface:
+
+```bash
+python -m sleap_rtc.client.registry_server
+# Open http://localhost:8765 in your browser
+```
+
+The web interface displays:
+- Model ID, alias, and type
+- File paths (hover to see full path, click to copy)
+- Model size and import date
+- Source (local-import, worker-training, etc.)
+
+### Registry Management
+
+The model registry is stored at `~/.sleap-rtc/models/manifest.json` with models stored in `~/.sleap-rtc/models/{type}_{id}/`.
+
+Benefits of using the model registry:
+- **Convenience**: Reference models by memorable aliases instead of full paths
+- **Organization**: Central repository for all trained models
+- **Versioning**: Track multiple versions with aliases like `prod-v1`, `prod-v2`
+- **Sharing**: Easy to reference the same model across different inference jobs
 
 ## Connection Workflows
 
