@@ -3,10 +3,21 @@
 import click
 from loguru import logger
 from pathlib import Path
+from typing import Optional
 from sleap_rtc.rtc_worker import run_RTCworker
 from sleap_rtc.rtc_client import run_RTCclient
 from sleap_rtc.rtc_client_track import run_RTCclient_track
+from sleap_rtc.client.client_model_registry import ClientModelRegistry
+from sleap_rtc.client.model_utils import (
+    find_checkpoint_files,
+    detect_model_type,
+    calculate_model_size,
+    validate_checkpoint_files,
+    generate_model_id_from_config,
+    format_size,
+)
 import sys
+import shutil
 
 @click.group()
 def cli():
@@ -358,6 +369,230 @@ def client_deprecated(ctx, **kwargs):
     """[DEPRECATED] Use 'client-train' instead."""
     logger.warning("Warning: 'sleap-rtc client' is deprecated. Use 'sleap-rtc client-train' instead.")
     ctx.invoke(client_train, **kwargs)
+
+@cli.command(name="import-model")
+@click.argument("model_path", type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path))
+@click.option(
+    "--alias",
+    "-a",
+    type=str,
+    required=False,
+    help="Friendly name for the model (optional).",
+)
+@click.option(
+    "--model-type",
+    "-t",
+    type=click.Choice(["centroid", "topdown", "bottomup", "single_instance"], case_sensitive=False),
+    required=False,
+    help="Model type (if not auto-detected).",
+)
+@click.option(
+    "--copy",
+    is_flag=True,
+    default=False,
+    help="Copy files instead of creating symlink (default: symlink).",
+)
+@click.option(
+    "--registry-path",
+    type=click.Path(path_type=Path),
+    required=False,
+    help="Path to registry file (default: ~/.sleap-rtc/models/manifest.json).",
+)
+def import_model(model_path: Path, alias: Optional[str], model_type: Optional[str], copy: bool, registry_path: Optional[Path]):
+    """Import a pre-trained model into the client registry.
+
+    MODEL_PATH: Directory containing the trained model files (.ckpt, .h5, etc.)
+
+    This command will:
+    1. Detect model type from training_config.yaml (or prompt if not found)
+    2. Validate checkpoint files exist and are readable
+    3. Create symlink or copy files to ~/.sleap-rtc/models/{type}_{id}/
+    4. Register model in client registry
+    5. Optionally set a friendly alias for easy reference
+
+    Examples:
+        # Auto-detect model type and create symlink
+        sleap-rtc import-model /path/to/model --alias production-v1
+
+        # Specify model type and copy files
+        sleap-rtc import-model /path/to/model --model-type centroid --copy
+
+        # Import without alias
+        sleap-rtc import-model /path/to/model
+    """
+    logger.info("=" * 70)
+    logger.info("Model Import")
+    logger.info("=" * 70)
+    logger.info("")
+
+    # Initialize registry
+    registry = ClientModelRegistry(registry_path=registry_path)
+    logger.info(f"Using registry: {registry.registry_path}")
+    logger.info("")
+
+    # Step 1: Validate source directory
+    logger.info(f"Source: {model_path}")
+
+    # Find checkpoint files
+    try:
+        checkpoint_files = find_checkpoint_files(model_path)
+    except ValueError as e:
+        logger.error(f"Error: {e}")
+        sys.exit(1)
+
+    if not checkpoint_files:
+        logger.error(f"No checkpoint files found in {model_path}")
+        logger.error("Expected files with extensions: .ckpt, .h5, .pth, .pt")
+        sys.exit(1)
+
+    logger.info(f"Found {len(checkpoint_files)} checkpoint file(s):")
+    for ckpt in checkpoint_files:
+        logger.info(f"  - {ckpt.name}")
+    logger.info("")
+
+    # Step 2: Validate checkpoint files
+    logger.info("Validating checkpoint files...")
+    if not validate_checkpoint_files(model_path):
+        logger.error("Checkpoint validation failed")
+        sys.exit(1)
+    logger.info("✓ All checkpoint files are valid")
+    logger.info("")
+
+    # Step 3: Detect or prompt for model type
+    if not model_type:
+        detected_type = detect_model_type(model_path)
+        if detected_type:
+            model_type = detected_type
+            logger.info(f"Auto-detected model type: {model_type}")
+        else:
+            logger.warning("Could not auto-detect model type from config")
+            model_type = click.prompt(
+                "Enter model type",
+                type=click.Choice(["centroid", "topdown", "bottomup", "single_instance"], case_sensitive=False)
+            )
+    else:
+        logger.info(f"Model type: {model_type}")
+    logger.info("")
+
+    # Step 4: Generate model ID
+    model_id = generate_model_id_from_config(model_path)
+    logger.info(f"Generated model ID: {model_id}")
+    logger.info("")
+
+    # Step 5: Check if model already exists
+    if registry.exists(model_id):
+        logger.warning(f"Model {model_id} already exists in registry")
+        overwrite = click.confirm("Overwrite existing model entry?", default=False)
+        if not overwrite:
+            logger.info("Import cancelled")
+            sys.exit(0)
+        # Delete existing entry
+        registry.delete(model_id)
+        logger.info("Removed existing model entry")
+
+    # Step 6: Create destination directory
+    dest_dir = Path.home() / ".sleap-rtc" / "models" / f"{model_type}_{model_id}"
+    dest_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Remove destination if it already exists
+    if dest_dir.exists():
+        logger.info(f"Removing existing directory: {dest_dir}")
+        shutil.rmtree(dest_dir)
+
+    # Step 7: Copy or symlink files
+    if copy:
+        logger.info(f"Copying files to {dest_dir}...")
+        shutil.copytree(model_path, dest_dir, symlinks=True)
+        logger.info("✓ Files copied")
+    else:
+        logger.info(f"Creating symlink to {dest_dir}...")
+        dest_dir.symlink_to(model_path.resolve(), target_is_directory=True)
+        logger.info("✓ Symlink created")
+    logger.info("")
+
+    # Step 8: Calculate model size
+    model_size = calculate_model_size(model_path)
+    logger.info(f"Model size: {format_size(model_size)}")
+    logger.info("")
+
+    # Step 9: Find checkpoint path (use first checkpoint file found)
+    checkpoint_path = dest_dir / checkpoint_files[0].relative_to(model_path)
+
+    # Step 10: Register model
+    model_info = {
+        "id": model_id,
+        "model_type": model_type,
+        "source": "local-import",
+        "local_path": str(dest_dir),
+        "checkpoint_path": str(checkpoint_path),
+        "on_worker": False,
+        "size_bytes": model_size,
+        "import_mode": "copy" if copy else "symlink",
+        "original_path": str(model_path.resolve()),
+    }
+
+    registry.register(model_info)
+    logger.info("✓ Model registered in client registry")
+    logger.info("")
+
+    # Step 11: Set alias if provided
+    if alias:
+        # Sanitize and validate alias
+        sanitized_alias = registry._sanitize_alias(alias)
+        is_valid, error_msg = registry._validate_alias(sanitized_alias)
+
+        if not is_valid:
+            logger.error(f"Invalid alias: {error_msg}")
+            logger.warning("Model imported without alias")
+        else:
+            if sanitized_alias != alias:
+                logger.info(f"Sanitized alias: '{alias}' → '{sanitized_alias}'")
+
+            # Check for collision
+            success = registry.set_alias(model_id, sanitized_alias, force=False)
+            if not success:
+                logger.warning(f"Alias '{sanitized_alias}' already in use")
+                force_overwrite = click.confirm("Reassign alias to this model?", default=False)
+                if force_overwrite:
+                    registry.set_alias(model_id, sanitized_alias, force=True)
+                    logger.info(f"✓ Alias set: {sanitized_alias}")
+                else:
+                    logger.warning("Model imported without alias")
+            else:
+                logger.info(f"✓ Alias set: {sanitized_alias}")
+        logger.info("")
+    elif click.confirm("Set a friendly alias for this model?", default=False):
+        # Interactive alias prompt
+        suggestion = registry.suggest_alias(model_path.name, model_type=model_type)
+        logger.info(f"Suggestion: {suggestion}")
+        alias_input = click.prompt("Enter alias (or press Enter for suggestion)", default=suggestion, show_default=False)
+
+        try:
+            success = registry.set_alias(model_id, alias_input, force=False)
+            if success:
+                logger.info(f"✓ Alias set: {alias_input}")
+            else:
+                logger.warning(f"Alias '{alias_input}' already in use")
+        except ValueError as e:
+            logger.error(f"Invalid alias: {e}")
+        logger.info("")
+
+    # Step 12: Display summary
+    logger.info("=" * 70)
+    logger.info("Import Summary")
+    logger.info("=" * 70)
+    model = registry.get(model_id)
+    logger.info(f"Model ID:      {model_id}")
+    if model.get("alias"):
+        logger.info(f"Alias:         {model['alias']}")
+    logger.info(f"Type:          {model_type}")
+    logger.info(f"Size:          {format_size(model_size)}")
+    logger.info(f"Local path:    {dest_dir}")
+    logger.info(f"Import mode:   {'Copy' if copy else 'Symlink'}")
+    logger.info(f"Checkpoint:    {checkpoint_path}")
+    logger.info("")
+    logger.info("✓ Model successfully imported!")
+    logger.info("")
 
 if __name__ == "__main__":
     cli()
