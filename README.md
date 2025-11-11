@@ -33,7 +33,7 @@ Create a configuration file at one of these locations:
 - `sleap-rtc.toml` in your project directory
 - `~/.sleap-rtc/config.toml` in your home directory
 
-See `config.example.toml` for a complete example with all environments.
+See `config/config.example.toml` for a complete example with all environments.
 
 Example configuration:
 
