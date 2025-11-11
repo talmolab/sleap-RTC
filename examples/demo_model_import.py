@@ -25,10 +25,12 @@ from sleap_rtc.client.model_utils import (
 def create_mock_model(base_path: Path, model_name: str, model_type: str) -> Path:
     """Create a mock model directory for testing.
 
+    Creates a SLEAP-NN style config with model_config.head_configs structure.
+
     Args:
         base_path: Base directory to create mock model in
         model_name: Name for the model directory
-        model_type: Type of model (centroid, topdown, etc.)
+        model_type: Type of model (centroid, centered_instance, bottomup, single_instance)
 
     Returns:
         Path to created model directory
@@ -40,16 +42,87 @@ def create_mock_model(base_path: Path, model_name: str, model_type: str) -> Path
     checkpoint = model_dir / "best.ckpt"
     checkpoint.write_bytes(b"x" * 1024 * 100)  # 100 KB mock checkpoint
 
-    # Create a training config
-    config = {
-        "model_type": model_type,
-        "backbone": {"type": f"{model_type}_resnet"},
-        "training": {
-            "learning_rate": 0.001,
-            "batch_size": 4,
-            "epochs": 10,
-        },
+    # Create a SLEAP-NN style training config
+    # All head configs are null except the one for this model type
+    head_configs = {
+        "single_instance": None,
+        "centroid": None,
+        "centered_instance": None,
+        "bottomup": None,
+        "multi_class_bottomup": None,
+        "multi_class_topdown": None,
     }
+
+    # Set the appropriate head config based on model type
+    if model_type == "centroid":
+        head_configs["centroid"] = {
+            "confmaps": {
+                "anchor_part": None,
+                "sigma": 2.5,
+                "output_stride": 2,
+            }
+        }
+    elif model_type == "centered_instance":
+        head_configs["centered_instance"] = {
+            "confmaps": {
+                "part_names": None,
+                "anchor_part": None,
+                "sigma": 2.5,
+                "output_stride": 4,
+                "loss_weight": 1.0,
+            }
+        }
+    elif model_type == "bottomup":
+        head_configs["bottomup"] = {
+            "confmaps": {
+                "sigma": 2.5,
+                "output_stride": 4,
+            },
+            "pafs": {
+                "sigma": 10.0,
+                "output_stride": 4,
+            }
+        }
+    elif model_type == "single_instance":
+        head_configs["single_instance"] = {
+            "confmaps": {
+                "sigma": 2.5,
+                "output_stride": 2,
+            }
+        }
+
+    config = {
+        "data_config": {
+            "train_labels_path": ["labels.v929.pkg.slp"],
+            "validation_fraction": 0.1,
+        },
+        "model_config": {
+            "init_weights": "default",
+            "backbone_config": {
+                "unet": {
+                    "in_channels": 1,
+                    "kernel_size": 3,
+                    "filters": 16,
+                    "filters_rate": 2.0,
+                    "max_stride": 16,
+                }
+            },
+            "head_configs": head_configs,
+        },
+        "trainer_config": {
+            "train_data_loader": {
+                "batch_size": 4,
+                "num_workers": 2,
+            },
+            "max_epochs": 5,
+            "optimizer_name": "Adam",
+            "optimizer": {
+                "lr": 0.0001,
+            },
+        },
+        "sleap_nn_version": "0.0.2",
+    }
+
     config_path = model_dir / "training_config.yaml"
     with open(config_path, 'w') as f:
         yaml.dump(config, f)
@@ -213,7 +286,7 @@ def main():
     print()
 
     centroid_model = create_mock_model(mock_models_dir, "centroid_mouse", "centroid")
-    topdown_model = create_mock_model(mock_models_dir, "topdown_rat", "topdown")
+    centered_model = create_mock_model(mock_models_dir, "centered_rat", "centered_instance")
     bottomup_model = create_mock_model(mock_models_dir, "bottomup_multi", "bottomup")
     print()
 
@@ -227,7 +300,7 @@ def main():
     print()
 
     demo_programmatic_import(registry, centroid_model, "centroid-prod-v1")
-    demo_programmatic_import(registry, topdown_model, "topdown-baseline")
+    demo_programmatic_import(registry, centered_model, "centered-baseline")
     demo_programmatic_import(registry, bottomup_model, "bottomup-exp-v1")
 
     # List imported models
@@ -310,7 +383,7 @@ def main():
     print()
     print("CLI Usage Examples:")
     print(f"  sleap-rtc import-model {centroid_model} --alias my-model")
-    print(f"  sleap-rtc import-model {topdown_model} --model-type topdown --copy")
+    print(f"  sleap-rtc import-model {centered_model} --model-type centered_instance --copy")
     print()
 
 

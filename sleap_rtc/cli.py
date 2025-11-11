@@ -382,7 +382,7 @@ def client_deprecated(ctx, **kwargs):
 @click.option(
     "--model-type",
     "-t",
-    type=click.Choice(["centroid", "topdown", "bottomup", "single_instance"], case_sensitive=False),
+    type=click.Choice(["centroid", "centered_instance", "bottomup", "single_instance"], case_sensitive=False),
     required=False,
     help="Model type (if not auto-detected).",
 )
@@ -404,7 +404,7 @@ def import_model(model_path: Path, alias: Optional[str], model_type: Optional[st
     MODEL_PATH: Directory containing the trained model files (.ckpt, .h5, etc.)
 
     This command will:
-    1. Detect model type from training_config.yaml (or prompt if not found)
+    1. Detect model type from config file (YAML or JSON, or prompt if not found)
     2. Validate checkpoint files exist and are readable
     3. Create symlink or copy files to ~/.sleap-rtc/models/{type}_{id}/
     4. Register model in client registry
@@ -415,7 +415,7 @@ def import_model(model_path: Path, alias: Optional[str], model_type: Optional[st
         sleap-rtc import-model /path/to/model --alias production-v1
 
         # Specify model type and copy files
-        sleap-rtc import-model /path/to/model --model-type centroid --copy
+        sleap-rtc import-model /path/to/model --model-type centered_instance --copy
 
         # Import without alias
         sleap-rtc import-model /path/to/model
@@ -468,7 +468,7 @@ def import_model(model_path: Path, alias: Optional[str], model_type: Optional[st
             logger.warning("Could not auto-detect model type from config")
             model_type = click.prompt(
                 "Enter model type",
-                type=click.Choice(["centroid", "topdown", "bottomup", "single_instance"], case_sensitive=False)
+                type=click.Choice(["centroid", "centered_instance", "bottomup", "single_instance"], case_sensitive=False)
             )
     else:
         logger.info(f"Model type: {model_type}")

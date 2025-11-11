@@ -1,6 +1,7 @@
 """Utilities for model file detection and management."""
 
 import hashlib
+import json
 import yaml
 from pathlib import Path
 from typing import Optional, List
@@ -42,58 +43,83 @@ def find_checkpoint_files(path: Path) -> List[Path]:
 
 
 def detect_model_type(path: Path) -> Optional[str]:
-    """Detect model type from training_config.yaml if present.
+    """Detect model type from training config file (YAML or JSON).
+
+    Detects model type from SLEAP-NN config structure where the model type
+    is determined by which head config is not null under model_config.head_configs.
+    Also supports older SLEAP JSON config format.
 
     Args:
         path: Directory path to search for training configuration
 
     Returns:
-        Model type string (e.g., "centroid", "topdown", "bottomup") or None if not detected
+        Model type string (e.g., "centroid", "centered_instance", "bottomup", "single_instance")
+        or None if not detected
     """
-    # Look for training_config.yaml in the directory
+    # Look for training config files (YAML and JSON formats)
     config_files = [
+        # YAML files (SLEAP-NN)
         path / "training_config.yaml",
         path / "training_config.yml",
         path / "config.yaml",
         path / "config.yml",
+        path / "centroid.yaml",
+        path / "centered_instance.yaml",
+        path / "bottomup.yaml",
+        path / "single_instance.yaml",
+        # JSON files (older SLEAP)
+        path / "training_config.json",
+        path / "config.json",
+        path / "training_job.json",
+        path / "centroid.json",
+        path / "centered_instance.json",
+        path / "bottomup.json",
+        path / "single_instance.json",
     ]
 
     for config_file in config_files:
         if config_file.exists():
             try:
+                # Detect file format and parse accordingly
                 with open(config_file, 'r') as f:
-                    config = yaml.safe_load(f)
+                    if config_file.suffix in ['.yaml', '.yml']:
+                        config = yaml.safe_load(f)
+                    elif config_file.suffix == '.json':
+                        config = json.load(f)
+                    else:
+                        continue
 
-                # Try different possible keys for model type
-                # SLEAP training configs typically have a 'model' or 'model_type' field
-                if isinstance(config, dict):
-                    # Check common model type keys
-                    if 'model_type' in config:
-                        model_type = config['model_type']
+                if not isinstance(config, dict):
+                    continue
+
+                # SLEAP-NN config structure: model_config.head_configs
+                # The model type is the head that is not null
+                if 'model_config' in config and isinstance(config['model_config'], dict):
+                    model_config = config['model_config']
+                    if 'head_configs' in model_config and isinstance(model_config['head_configs'], dict):
+                        head_configs = model_config['head_configs']
+
+                        # Check each head type
+                        for head_type in ['single_instance', 'centroid', 'centered_instance',
+                                         'bottomup', 'multi_class_bottomup', 'multi_class_topdown']:
+                            if head_type in head_configs and head_configs[head_type] is not None:
+                                logger.info(f"Detected model type from head_configs: {head_type}")
+                                return head_type
+
+                # Fallback: Check common model type keys
+                if 'model_type' in config:
+                    model_type = config['model_type']
+                    logger.info(f"Detected model type from config: {model_type}")
+                    return model_type
+
+                # Check for model configuration structure
+                if 'model' in config and isinstance(config['model'], dict):
+                    if 'type' in config['model']:
+                        model_type = config['model']['type']
                         logger.info(f"Detected model type from config: {model_type}")
                         return model_type
 
-                    # Check for model configuration structure
-                    if 'model' in config and isinstance(config['model'], dict):
-                        if 'type' in config['model']:
-                            model_type = config['model']['type']
-                            logger.info(f"Detected model type from config: {model_type}")
-                            return model_type
-
-                    # Check for backbone type (common in SLEAP models)
-                    if 'backbone' in config:
-                        backbone = config['backbone']
-                        if isinstance(backbone, dict) and 'type' in backbone:
-                            # Infer from backbone type
-                            backbone_type = backbone['type'].lower()
-                            if 'centroid' in backbone_type:
-                                return 'centroid'
-                            elif 'topdown' in backbone_type or 'top_down' in backbone_type:
-                                return 'topdown'
-                            elif 'bottomup' in backbone_type or 'bottom_up' in backbone_type:
-                                return 'bottomup'
-
-                    logger.debug(f"Config found but could not determine model type from: {config_file}")
+                logger.debug(f"Config found but could not determine model type from: {config_file}")
 
             except Exception as e:
                 logger.warning(f"Error reading config file {config_file}: {e}")
@@ -158,18 +184,23 @@ def validate_checkpoint_files(path: Path) -> bool:
 def generate_model_id_from_config(path: Path) -> str:
     """Generate a model ID from the training config file hash.
 
+    Supports both YAML and JSON config formats.
+
     Args:
         path: Directory path containing training configuration
 
     Returns:
         8-character hex string model ID
     """
-    # Look for training_config.yaml
+    # Look for training config files (YAML and JSON)
     config_files = [
         path / "training_config.yaml",
         path / "training_config.yml",
         path / "config.yaml",
         path / "config.yml",
+        path / "training_config.json",
+        path / "config.json",
+        path / "training_job.json",
     ]
 
     for config_file in config_files:

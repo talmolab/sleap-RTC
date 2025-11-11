@@ -1,5 +1,6 @@
 """Tests for model utility functions."""
 
+import json
 import pytest
 from pathlib import Path
 import yaml
@@ -81,8 +82,99 @@ class TestFindCheckpointFiles:
 class TestDetectModelType:
     """Test model type detection."""
 
-    def test_detect_from_model_type_field(self, tmp_path):
-        """Test detection from model_type field."""
+    def test_detect_from_head_configs_centroid(self, tmp_path):
+        """Test detection from SLEAP-NN head_configs for centroid."""
+        config = {
+            "model_config": {
+                "head_configs": {
+                    "single_instance": None,
+                    "centroid": {
+                        "confmaps": {
+                            "sigma": 2.5,
+                            "output_stride": 2,
+                        }
+                    },
+                    "centered_instance": None,
+                    "bottomup": None,
+                }
+            }
+        }
+        config_path = tmp_path / "training_config.yaml"
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f)
+
+        model_type = detect_model_type(tmp_path)
+        assert model_type == "centroid"
+
+    def test_detect_from_head_configs_centered_instance(self, tmp_path):
+        """Test detection from SLEAP-NN head_configs for centered_instance."""
+        config = {
+            "model_config": {
+                "head_configs": {
+                    "single_instance": None,
+                    "centroid": None,
+                    "centered_instance": {
+                        "confmaps": {
+                            "sigma": 2.5,
+                            "output_stride": 4,
+                        }
+                    },
+                    "bottomup": None,
+                }
+            }
+        }
+        config_path = tmp_path / "training_config.yaml"
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f)
+
+        model_type = detect_model_type(tmp_path)
+        assert model_type == "centered_instance"
+
+    def test_detect_from_head_configs_bottomup(self, tmp_path):
+        """Test detection from SLEAP-NN head_configs for bottomup."""
+        config = {
+            "model_config": {
+                "head_configs": {
+                    "single_instance": None,
+                    "centroid": None,
+                    "centered_instance": None,
+                    "bottomup": {
+                        "confmaps": {"sigma": 2.5},
+                        "pafs": {"sigma": 10.0},
+                    },
+                }
+            }
+        }
+        config_path = tmp_path / "training_config.yaml"
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f)
+
+        model_type = detect_model_type(tmp_path)
+        assert model_type == "bottomup"
+
+    def test_detect_from_head_configs_single_instance(self, tmp_path):
+        """Test detection from SLEAP-NN head_configs for single_instance."""
+        config = {
+            "model_config": {
+                "head_configs": {
+                    "single_instance": {
+                        "confmaps": {"sigma": 2.5}
+                    },
+                    "centroid": None,
+                    "centered_instance": None,
+                    "bottomup": None,
+                }
+            }
+        }
+        config_path = tmp_path / "training_config.yaml"
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f)
+
+        model_type = detect_model_type(tmp_path)
+        assert model_type == "single_instance"
+
+    def test_detect_from_model_type_field_fallback(self, tmp_path):
+        """Test detection from model_type field (fallback)."""
         config = {"model_type": "centroid"}
         config_path = tmp_path / "training_config.yaml"
         with open(config_path, 'w') as f:
@@ -91,25 +183,15 @@ class TestDetectModelType:
         model_type = detect_model_type(tmp_path)
         assert model_type == "centroid"
 
-    def test_detect_from_model_dict(self, tmp_path):
-        """Test detection from model.type field."""
-        config = {"model": {"type": "topdown"}}
+    def test_detect_from_model_dict_fallback(self, tmp_path):
+        """Test detection from model.type field (fallback)."""
+        config = {"model": {"type": "centered_instance"}}
         config_path = tmp_path / "training_config.yaml"
         with open(config_path, 'w') as f:
             yaml.dump(config, f)
 
         model_type = detect_model_type(tmp_path)
-        assert model_type == "topdown"
-
-    def test_detect_from_backbone(self, tmp_path):
-        """Test detection from backbone type."""
-        config = {"backbone": {"type": "centroid_resnet"}}
-        config_path = tmp_path / "training_config.yaml"
-        with open(config_path, 'w') as f:
-            yaml.dump(config, f)
-
-        model_type = detect_model_type(tmp_path)
-        assert model_type == "centroid"
+        assert model_type == "centered_instance"
 
     def test_no_config_file(self, tmp_path):
         """Test when no config file exists."""
@@ -118,7 +200,14 @@ class TestDetectModelType:
 
     def test_alternative_config_names(self, tmp_path):
         """Test detection with alternative config filenames."""
-        config = {"model_type": "bottomup"}
+        config = {
+            "model_config": {
+                "head_configs": {
+                    "bottomup": {"confmaps": {"sigma": 2.5}},
+                    "centroid": None,
+                }
+            }
+        }
 
         # Test config.yaml
         config_path = tmp_path / "config.yaml"
@@ -128,11 +217,97 @@ class TestDetectModelType:
         model_type = detect_model_type(tmp_path)
         assert model_type == "bottomup"
 
+    def test_named_config_file(self, tmp_path):
+        """Test detection from model-type-named config file."""
+        config = {
+            "model_config": {
+                "head_configs": {
+                    "centroid": {"confmaps": {"sigma": 2.5}},
+                    "bottomup": None,
+                }
+            }
+        }
+
+        # Test centroid.yaml
+        config_path = tmp_path / "centroid.yaml"
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f)
+
+        model_type = detect_model_type(tmp_path)
+        assert model_type == "centroid"
+
     def test_invalid_config(self, tmp_path):
         """Test with invalid YAML."""
         config_path = tmp_path / "training_config.yaml"
         with open(config_path, 'w') as f:
             f.write("invalid: yaml: content: {{")
+
+        model_type = detect_model_type(tmp_path)
+        assert model_type is None
+
+    def test_detect_from_json_head_configs_centroid(self, tmp_path):
+        """Test detection from JSON config with head_configs for centroid."""
+        config = {
+            "model_config": {
+                "head_configs": {
+                    "single_instance": None,
+                    "centroid": {
+                        "confmaps": {
+                            "sigma": 2.5,
+                            "output_stride": 2,
+                        }
+                    },
+                    "centered_instance": None,
+                    "bottomup": None,
+                }
+            }
+        }
+        config_path = tmp_path / "training_config.json"
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+
+        model_type = detect_model_type(tmp_path)
+        assert model_type == "centroid"
+
+    def test_detect_from_json_head_configs_centered_instance(self, tmp_path):
+        """Test detection from JSON config with head_configs for centered_instance."""
+        config = {
+            "model_config": {
+                "head_configs": {
+                    "single_instance": None,
+                    "centroid": None,
+                    "centered_instance": {
+                        "confmaps": {
+                            "sigma": 2.5,
+                            "output_stride": 4,
+                        }
+                    },
+                    "bottomup": None,
+                }
+            }
+        }
+        config_path = tmp_path / "config.json"
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+
+        model_type = detect_model_type(tmp_path)
+        assert model_type == "centered_instance"
+
+    def test_detect_from_json_model_type_fallback(self, tmp_path):
+        """Test detection from JSON with model_type field (older SLEAP format)."""
+        config = {"model_type": "bottomup"}
+        config_path = tmp_path / "training_config.json"
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+
+        model_type = detect_model_type(tmp_path)
+        assert model_type == "bottomup"
+
+    def test_invalid_json_config(self, tmp_path):
+        """Test with invalid JSON."""
+        config_path = tmp_path / "training_config.json"
+        with open(config_path, 'w') as f:
+            f.write("{invalid json content")
 
         model_type = detect_model_type(tmp_path)
         assert model_type is None
@@ -204,6 +379,28 @@ class TestGenerateModelId:
         config_path = tmp_path / "training_config.yaml"
         with open(config_path, 'w') as f:
             yaml.dump(config, f)
+
+        id1 = generate_model_id_from_config(tmp_path)
+        id2 = generate_model_id_from_config(tmp_path)
+        assert id1 == id2
+
+    def test_generate_from_json_config(self, tmp_path):
+        """Test ID generation from JSON config hash."""
+        config = {"model_type": "centroid", "learning_rate": 0.001}
+        config_path = tmp_path / "training_config.json"
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+
+        model_id = generate_model_id_from_config(tmp_path)
+        assert len(model_id) == 8
+        assert all(c in "0123456789abcdef" for c in model_id)
+
+    def test_json_deterministic_id(self, tmp_path):
+        """Test that same JSON config produces same ID."""
+        config = {"model_type": "bottomup"}
+        config_path = tmp_path / "config.json"
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
 
         id1 = generate_model_id_from_config(tmp_path)
         id2 = generate_model_id_from_config(tmp_path)

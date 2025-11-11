@@ -401,6 +401,57 @@ select:hover, select:focus {
     font-size: 0.85rem;
 }
 
+.path-field {
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+    padding: 4px 8px;
+    border-radius: 4px;
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.path-field:hover {
+    background: #f0f0f0;
+    color: #667eea;
+}
+
+.copy-icon {
+    opacity: 0;
+    transition: opacity 0.2s;
+    font-size: 0.9rem;
+}
+
+.path-field:hover .copy-icon {
+    opacity: 1;
+}
+
+.copied-feedback {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: #10b981;
+    color: white;
+    padding: 12px 24px;
+    border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+    font-weight: 500;
+    animation: slideIn 0.3s ease-out;
+    z-index: 1000;
+}
+
+@keyframes slideIn {
+    from {
+        transform: translateX(400px);
+        opacity: 0;
+    }
+    to {
+        transform: translateX(0);
+        opacity: 1;
+    }
+}
+
 .tags {
     display: flex;
     flex-wrap: wrap;
@@ -594,7 +645,37 @@ function displayModels(models) {
                     ${model.local_path ? `
                     <div class="model-field">
                         <span class="field-label">Local Path:</span>
-                        <span class="field-value code">${truncatePath(model.local_path)}</span>
+                        <span class="field-value code path-field"
+                              title="${model.local_path}"
+                              onclick="copyToClipboard('${model.local_path.replace(/'/g, "\\'")}', event)"
+                              data-full-path="${model.local_path}">
+                            ${truncatePath(model.local_path)}
+                            <span class="copy-icon">📋</span>
+                        </span>
+                    </div>
+                    ` : ''}
+                    ${model.checkpoint_path ? `
+                    <div class="model-field">
+                        <span class="field-label">Checkpoint:</span>
+                        <span class="field-value code path-field"
+                              title="${model.checkpoint_path}"
+                              onclick="copyToClipboard('${model.checkpoint_path.replace(/'/g, "\\'")}', event)"
+                              data-full-path="${model.checkpoint_path}">
+                            ${truncatePath(model.checkpoint_path)}
+                            <span class="copy-icon">📋</span>
+                        </span>
+                    </div>
+                    ` : ''}
+                    ${model.original_path ? `
+                    <div class="model-field">
+                        <span class="field-label">Original Path:</span>
+                        <span class="field-value code path-field"
+                              title="${model.original_path}"
+                              onclick="copyToClipboard('${model.original_path.replace(/'/g, "\\'")}', event)"
+                              data-full-path="${model.original_path}">
+                            ${truncatePath(model.original_path)}
+                            <span class="copy-icon">📋</span>
+                        </span>
                     </div>
                     ` : ''}
                     ${model.notes ? `
@@ -638,6 +719,62 @@ function truncatePath(path) {
         return '...' + path.slice(-37);
     }
     return path;
+}
+
+function copyToClipboard(text, event) {
+    event.stopPropagation();
+
+    // Create temporary textarea for copying
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+
+    // Select and copy
+    textarea.select();
+    textarea.setSelectionRange(0, 99999); // For mobile devices
+
+    try {
+        document.execCommand('copy');
+        showCopiedFeedback(text);
+    } catch (err) {
+        console.error('Failed to copy:', err);
+        // Fallback to navigator.clipboard API
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => {
+                showCopiedFeedback(text);
+            }).catch(err => {
+                console.error('Clipboard API failed:', err);
+                alert('Failed to copy to clipboard');
+            });
+        }
+    }
+
+    document.body.removeChild(textarea);
+}
+
+function showCopiedFeedback(path) {
+    // Remove existing feedback if any
+    const existing = document.querySelector('.copied-feedback');
+    if (existing) {
+        existing.remove();
+    }
+
+    // Create feedback element
+    const feedback = document.createElement('div');
+    feedback.className = 'copied-feedback';
+    feedback.textContent = '✓ Path copied to clipboard!';
+    document.body.appendChild(feedback);
+
+    // Also log the full path to console for reference
+    console.log('Copied path:', path);
+
+    // Remove after 3 seconds
+    setTimeout(() => {
+        feedback.style.opacity = '0';
+        setTimeout(() => feedback.remove(), 300);
+    }, 3000);
 }
 
 // Event listeners
