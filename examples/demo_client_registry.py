@@ -22,7 +22,7 @@ def main():
 
     # Create a temporary registry for demo purposes
     # In production, this would default to ~/.sleap-rtc/models/manifest.json
-    demo_path = Path("/tmp/sleap-rtc-demo")
+    demo_path = Path("/tmp/sleap-rtc-alias-demo")
     demo_path.mkdir(exist_ok=True)
     registry_path = demo_path / "manifest.json"
 

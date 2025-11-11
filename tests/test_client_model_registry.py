@@ -376,3 +376,319 @@ class TestMetadata:
         assert retrieved["training_hyperparameters"]["lr"] == 0.001
         assert "production" in retrieved["tags"]
         assert retrieved["notes"] == "Best model"
+
+
+class TestAliasValidation:
+    """Test alias validation logic."""
+
+    def test_valid_aliases(self, temp_registry):
+        """Test that valid aliases are accepted."""
+        valid_aliases = [
+            "good-model",
+            "my_model",
+            "Model123",
+            "prod-v1",
+            "a",  # min length
+            "x" * 64,  # max length
+        ]
+
+        for alias in valid_aliases:
+            is_valid, error = temp_registry._validate_alias(alias)
+            assert is_valid, f"'{alias}' should be valid but got error: {error}"
+
+    def test_invalid_aliases(self, temp_registry):
+        """Test that invalid aliases are rejected."""
+        invalid_cases = [
+            ("", "empty"),
+            ("   ", "whitespace"),
+            ("my model", "spaces"),
+            ("model@prod", "special char @"),
+            ("my/model", "special char /"),
+            ("-leading", "leading dash"),
+            ("trailing-", "trailing dash"),
+            ("_leading", "leading underscore"),
+            ("trailing_", "trailing underscore"),
+            ("x" * 65, "too long"),
+            ("all", "reserved: all"),
+            ("latest", "reserved: latest"),
+            ("none", "reserved: none"),
+            ("null", "reserved: null"),
+            ("a3f5e8c9", "looks like model ID"),
+        ]
+
+        for alias, reason in invalid_cases:
+            is_valid, error = temp_registry._validate_alias(alias)
+            assert not is_valid, f"'{alias}' should be invalid ({reason})"
+            assert error is not None
+
+    def test_case_sensitivity(self, temp_registry):
+        """Test that aliases are case-sensitive."""
+        is_valid1, _ = temp_registry._validate_alias("Good-Model")
+        is_valid2, _ = temp_registry._validate_alias("good-model")
+        is_valid3, _ = temp_registry._validate_alias("GOOD-MODEL")
+
+        assert is_valid1 and is_valid2 and is_valid3
+        # These are all valid and should be treated as different
+
+    def test_sanitize_alias(self, temp_registry):
+        """Test alias sanitization."""
+        test_cases = [
+            ("my model", "my-model"),
+            ("Good Model 2024", "Good-Model-2024"),
+            ("model@prod!", "modelprod"),
+            ("  -trim-  ", "trim"),
+            ("x" * 70, "x" * 64),  # truncation
+        ]
+
+        for input_text, expected in test_cases:
+            result = temp_registry._sanitize_alias(input_text)
+            assert result == expected, f"Sanitize '{input_text}' expected '{expected}', got '{result}'"
+
+
+class TestAliasAssignment:
+    """Test setting and updating aliases."""
+
+    def test_set_alias_basic(self, temp_registry):
+        """Test basic alias assignment."""
+        temp_registry.register({"id": "model1", "model_type": "centroid"})
+
+        success = temp_registry.set_alias("model1", "my-alias")
+        assert success
+
+        # Check alias mapping exists
+        assert "my-alias" in temp_registry._data["aliases"]
+        assert temp_registry._data["aliases"]["my-alias"] == "model1"
+
+        # Check model has alias field
+        model = temp_registry.get("model1")
+        assert model["alias"] == "my-alias"
+
+    def test_set_alias_nonexistent_model(self, temp_registry):
+        """Test setting alias for non-existent model raises error."""
+        with pytest.raises(KeyError, match="not found in registry"):
+            temp_registry.set_alias("nonexistent", "alias")
+
+    def test_set_alias_invalid(self, temp_registry):
+        """Test setting invalid alias raises error."""
+        temp_registry.register({"id": "model1", "model_type": "centroid"})
+
+        with pytest.raises(ValueError, match="Alias"):
+            temp_registry.set_alias("model1", "invalid alias")  # has space
+
+    def test_set_alias_collision_without_force(self, temp_registry):
+        """Test alias collision without force flag."""
+        temp_registry.register({"id": "model1", "model_type": "centroid"})
+        temp_registry.register({"id": "model2", "model_type": "centroid"})
+
+        # Set alias on first model
+        temp_registry.set_alias("model1", "shared-alias")
+
+        # Try to set same alias on second model (should fail)
+        success = temp_registry.set_alias("model2", "shared-alias")
+        assert not success
+
+        # First model should still have the alias
+        assert temp_registry._data["aliases"]["shared-alias"] == "model1"
+
+    def test_set_alias_collision_with_force(self, temp_registry):
+        """Test alias collision with force flag."""
+        temp_registry.register({"id": "model1", "model_type": "centroid"})
+        temp_registry.register({"id": "model2", "model_type": "centroid"})
+
+        # Set alias on first model
+        temp_registry.set_alias("model1", "shared-alias")
+
+        # Force set same alias on second model
+        success = temp_registry.set_alias("model2", "shared-alias", force=True)
+        assert success
+
+        # Second model should now have the alias
+        assert temp_registry._data["aliases"]["shared-alias"] == "model2"
+
+        # First model should not have alias anymore
+        model1 = temp_registry.get("model1")
+        assert model1["alias"] is None
+
+    def test_rename_alias(self, temp_registry):
+        """Test renaming a model's alias."""
+        temp_registry.register({"id": "model1", "model_type": "centroid"})
+
+        # Set initial alias
+        temp_registry.set_alias("model1", "old-name")
+
+        # Set new alias (should remove old one)
+        temp_registry.set_alias("model1", "new-name")
+
+        # Old alias should be gone
+        assert "old-name" not in temp_registry._data["aliases"]
+
+        # New alias should exist
+        assert "new-name" in temp_registry._data["aliases"]
+        assert temp_registry._data["aliases"]["new-name"] == "model1"
+
+        # Model should have new alias
+        model = temp_registry.get("model1")
+        assert model["alias"] == "new-name"
+
+
+class TestAliasRetrieval:
+    """Test retrieving models by alias."""
+
+    def test_get_by_alias(self, temp_registry):
+        """Test retrieving model by alias."""
+        temp_registry.register({"id": "model1", "model_type": "centroid", "alias": "test-alias"})
+
+        model = temp_registry.get_by_alias("test-alias")
+        assert model is not None
+        assert model["id"] == "model1"
+
+    def test_get_by_alias_not_found(self, temp_registry):
+        """Test retrieving non-existent alias."""
+        model = temp_registry.get_by_alias("nonexistent")
+        assert model is None
+
+    def test_resolve_model_id(self, temp_registry):
+        """Test resolving a model ID."""
+        temp_registry.register({"id": "model1", "model_type": "centroid"})
+
+        resolved = temp_registry.resolve("model1")
+        assert resolved == "model1"
+
+    def test_resolve_alias(self, temp_registry):
+        """Test resolving an alias to model ID."""
+        temp_registry.register({"id": "model1", "model_type": "centroid", "alias": "my-alias"})
+
+        resolved = temp_registry.resolve("my-alias")
+        assert resolved == "model1"
+
+    def test_resolve_priority(self, temp_registry):
+        """Test that model ID takes priority over alias in resolution."""
+        temp_registry.register({"id": "model1", "model_type": "centroid"})
+        temp_registry.register({"id": "model2", "model_type": "centroid", "alias": "model1"})
+
+        # "model1" is both a model ID and an alias
+        # Should resolve to the model ID first
+        resolved = temp_registry.resolve("model1")
+        assert resolved == "model1"
+
+    def test_resolve_not_found(self, temp_registry):
+        """Test resolving non-existent identifier."""
+        resolved = temp_registry.resolve("nonexistent")
+        assert resolved is None
+
+
+class TestAliasManagement:
+    """Test alias management operations."""
+
+    def test_remove_alias(self, temp_registry):
+        """Test removing an alias."""
+        temp_registry.register({"id": "model1", "model_type": "centroid", "alias": "test-alias"})
+
+        success = temp_registry.remove_alias("test-alias")
+        assert success
+
+        # Alias should be gone
+        assert "test-alias" not in temp_registry._data["aliases"]
+
+        # Model should not have alias
+        model = temp_registry.get("model1")
+        assert model["alias"] is None
+
+        # Model itself should still exist
+        assert temp_registry.exists("model1")
+
+    def test_remove_nonexistent_alias(self, temp_registry):
+        """Test removing non-existent alias."""
+        success = temp_registry.remove_alias("nonexistent")
+        assert not success
+
+    def test_list_aliases(self, temp_registry):
+        """Test listing all aliases."""
+        temp_registry.register({"id": "model1", "model_type": "centroid", "alias": "alias-c"})
+        temp_registry.register({"id": "model2", "model_type": "centroid", "alias": "alias-a"})
+        temp_registry.register({"id": "model3", "model_type": "centroid", "alias": "alias-b"})
+
+        aliases = temp_registry.list_aliases(sort=True)
+
+        # Should be sorted alphabetically
+        alias_list = list(aliases.keys())
+        assert alias_list == ["alias-a", "alias-b", "alias-c"]
+
+        # Check mappings are correct
+        assert aliases["alias-a"] == "model2"
+        assert aliases["alias-b"] == "model3"
+        assert aliases["alias-c"] == "model1"
+
+    def test_list_aliases_unsorted(self, temp_registry):
+        """Test listing aliases without sorting."""
+        temp_registry.register({"id": "model1", "model_type": "centroid", "alias": "alias-z"})
+        temp_registry.register({"id": "model2", "model_type": "centroid", "alias": "alias-a"})
+
+        aliases = temp_registry.list_aliases(sort=False)
+
+        # Should be a dict (order may vary)
+        assert isinstance(aliases, dict)
+        assert len(aliases) == 2
+
+    def test_suggest_alias_basic(self, temp_registry):
+        """Test basic alias suggestion."""
+        suggestion = temp_registry.suggest_alias("my model")
+        assert suggestion == "my-model"
+
+        # Should be valid
+        is_valid, _ = temp_registry._validate_alias(suggestion)
+        assert is_valid
+
+    def test_suggest_alias_with_model_type(self, temp_registry):
+        """Test alias suggestion with model type."""
+        suggestion = temp_registry.suggest_alias("mouse", model_type="centroid")
+        assert suggestion == "centroid-mouse"
+
+    def test_suggest_alias_uniqueness(self, temp_registry):
+        """Test that suggestions are unique."""
+        temp_registry.register({"id": "model1", "model_type": "centroid", "alias": "my-model"})
+
+        # Should suggest versioned name
+        suggestion = temp_registry.suggest_alias("my model")
+        assert suggestion == "my-model-v1"
+
+        # Add that too
+        temp_registry.register({"id": "model2", "model_type": "centroid", "alias": "my-model-v1"})
+
+        # Should suggest v2
+        suggestion = temp_registry.suggest_alias("my model")
+        assert suggestion == "my-model-v2"
+
+    def test_suggest_alias_invalid_input(self, temp_registry):
+        """Test alias suggestion with invalid input."""
+        # Empty input should default to "model"
+        suggestion = temp_registry.suggest_alias("")
+        assert suggestion == "model"
+
+        # Special characters should be sanitized
+        suggestion = temp_registry.suggest_alias("@#$%")
+        assert suggestion == "model"
+
+
+class TestAliasPersistence:
+    """Test alias persistence across registry instances."""
+
+    def test_alias_persists(self, tmp_path):
+        """Test that aliases persist when registry is reloaded."""
+        registry_path = tmp_path / "manifest.json"
+
+        # Create registry and set alias
+        registry1 = ClientModelRegistry(registry_path=registry_path)
+        registry1.register({"id": "model1", "model_type": "centroid"})
+        registry1.set_alias("model1", "persistent-alias")
+
+        # Create new instance (reload from disk)
+        registry2 = ClientModelRegistry(registry_path=registry_path)
+
+        # Alias should still exist
+        assert "persistent-alias" in registry2.list_aliases()
+        assert registry2.resolve("persistent-alias") == "model1"
+
+        model = registry2.get_by_alias("persistent-alias")
+        assert model is not None
+        assert model["id"] == "model1"

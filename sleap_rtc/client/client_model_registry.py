@@ -369,3 +369,251 @@ class ClientModelRegistry:
             Dictionary mapping alias names to model IDs
         """
         return dict(self._data["aliases"])
+
+    # Alias Management Methods
+
+    @staticmethod
+    def _validate_alias(alias: str) -> tuple[bool, Optional[str]]:
+        """Validate an alias string.
+
+        Args:
+            alias: The alias to validate
+
+        Returns:
+            Tuple of (is_valid, error_message)
+            If valid, error_message is None
+            If invalid, error_message describes the problem
+        """
+        import re
+
+        # Check empty or whitespace
+        if not alias or not alias.strip():
+            return False, "Alias cannot be empty or whitespace only"
+
+        # Check length
+        if len(alias) < 1:
+            return False, "Alias must be at least 1 character"
+        if len(alias) > 64:
+            return False, "Alias must be at most 64 characters"
+
+        # Check reserved names
+        reserved = ["all", "latest", "none", "null"]
+        if alias.lower() in reserved:
+            return False, f"'{alias}' is a reserved name"
+
+        # Check if it looks like a model ID (8 hex chars)
+        if re.match(r"^[0-9a-f]{8}$", alias.lower()):
+            return False, "Alias cannot look like a model ID (8 hexadecimal characters)"
+
+        # Check character restrictions
+        if not re.match(r"^[a-zA-Z0-9_-]+$", alias):
+            return False, "Alias must contain only letters, numbers, dashes, and underscores"
+
+        # Check leading/trailing dashes or underscores
+        if alias[0] in "-_" or alias[-1] in "-_":
+            return False, "Alias cannot start or end with dash or underscore"
+
+        return True, None
+
+    @staticmethod
+    def _sanitize_alias(text: str) -> str:
+        """Sanitize a string to create a valid alias.
+
+        Args:
+            text: Text to sanitize
+
+        Returns:
+            Sanitized alias (may still need validation)
+        """
+        import re
+
+        # Replace spaces with dashes
+        text = text.replace(" ", "-")
+
+        # Remove invalid characters
+        text = re.sub(r"[^a-zA-Z0-9_-]", "", text)
+
+        # Remove leading/trailing dashes and underscores
+        text = text.strip("-_")
+
+        # Truncate to max length
+        if len(text) > 64:
+            text = text[:64].rstrip("-_")
+
+        return text
+
+    def set_alias(self, model_id: str, alias: str, force: bool = False) -> bool:
+        """Set or update an alias for a model.
+
+        Args:
+            model_id: Model ID to assign alias to
+            alias: Alias name to assign
+            force: If True, overwrite existing alias without prompting
+
+        Returns:
+            True if alias was set successfully, False otherwise
+
+        Raises:
+            KeyError: If model_id not found in registry
+            ValueError: If alias is invalid
+        """
+        # Check model exists
+        if model_id not in self._data["models"]:
+            raise KeyError(f"Model {model_id} not found in registry")
+
+        # Validate alias
+        is_valid, error_msg = self._validate_alias(alias)
+        if not is_valid:
+            raise ValueError(error_msg)
+
+        # Check for collision
+        if alias in self._data["aliases"]:
+            existing_id = self._data["aliases"][alias]
+            if existing_id != model_id:
+                if not force:
+                    # Collision detected, would need user confirmation in CLI
+                    # For now, log and return False
+                    logger.warning(
+                        f"Alias '{alias}' already used by model {existing_id}. "
+                        f"Use force=True to overwrite."
+                    )
+                    return False
+                else:
+                    # Force overwrite - remove old alias from previous model
+                    if existing_id in self._data["models"]:
+                        old_alias = self._data["models"][existing_id].get("alias")
+                        if old_alias == alias:
+                            self._data["models"][existing_id]["alias"] = None
+                    logger.info(
+                        f"Alias '{alias}' reassigned from {existing_id} to {model_id}"
+                    )
+
+        # If model already has a different alias, remove the old mapping
+        model = self._data["models"][model_id]
+        old_alias = model.get("alias")
+        if old_alias and old_alias != alias:
+            self._data["aliases"].pop(old_alias, None)
+
+        # Set the new alias
+        self._data["aliases"][alias] = model_id
+        self._data["models"][model_id]["alias"] = alias
+
+        self._save_registry()
+        logger.info(f"Set alias '{alias}' for model {model_id}")
+        return True
+
+    def get_by_alias(self, alias: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a model by its alias.
+
+        Args:
+            alias: Alias to look up
+
+        Returns:
+            Model metadata dict if found, None otherwise
+        """
+        model_id = self._data["aliases"].get(alias)
+        if model_id:
+            return self._data["models"].get(model_id)
+        return None
+
+    def resolve(self, identifier: str) -> Optional[str]:
+        """Resolve an identifier to a model ID.
+
+        Tries to match against model IDs first, then aliases.
+
+        Args:
+            identifier: Either a model ID or alias
+
+        Returns:
+            Model ID if found, None otherwise
+        """
+        # First check if it's a direct model ID match
+        if identifier in self._data["models"]:
+            return identifier
+
+        # Then check if it's an alias
+        if identifier in self._data["aliases"]:
+            return self._data["aliases"][identifier]
+
+        return None
+
+    def remove_alias(self, alias: str) -> bool:
+        """Remove an alias from the registry.
+
+        The model itself is preserved, only the alias is removed.
+
+        Args:
+            alias: Alias to remove
+
+        Returns:
+            True if alias was removed, False if alias didn't exist
+        """
+        if alias not in self._data["aliases"]:
+            logger.warning(f"Alias '{alias}' not found")
+            return False
+
+        # Get the model ID
+        model_id = self._data["aliases"][alias]
+
+        # Remove alias mapping
+        del self._data["aliases"][alias]
+
+        # Clear alias from model entry
+        if model_id in self._data["models"]:
+            self._data["models"][model_id]["alias"] = None
+
+        self._save_registry()
+        logger.info(f"Removed alias '{alias}' from model {model_id}")
+        return True
+
+    def list_aliases(self, sort: bool = True) -> Dict[str, str]:
+        """List all aliases with optional sorting.
+
+        Args:
+            sort: If True, return aliases sorted alphabetically
+
+        Returns:
+            Dictionary mapping alias names to model IDs
+        """
+        aliases = dict(self._data["aliases"])
+
+        if sort:
+            # Return as OrderedDict sorted by alias name
+            from collections import OrderedDict
+            return OrderedDict(sorted(aliases.items()))
+
+        return aliases
+
+    def suggest_alias(self, base_text: str, model_type: Optional[str] = None) -> str:
+        """Suggest a valid, available alias based on input text.
+
+        Args:
+            base_text: Base text to create alias from (e.g., directory name)
+            model_type: Optional model type to include in suggestion
+
+        Returns:
+            Suggested alias (guaranteed to be valid and available)
+        """
+        # Sanitize the base text
+        sanitized = self._sanitize_alias(base_text)
+
+        # If model type provided, prepend it
+        if model_type and sanitized and not sanitized.startswith(model_type):
+            sanitized = f"{model_type}-{sanitized}"
+
+        # Ensure it's valid
+        if not sanitized:
+            sanitized = "model"
+
+        is_valid, _ = self._validate_alias(sanitized)
+        if not is_valid:
+            sanitized = "model"
+
+        # Make it unique if it already exists
+        suggestion = sanitized
+        counter = 1
+        while suggestion in self._data["aliases"]:
+            suggestion = f"{sanitized}-v{counter}"
+            counter += 1
+
+        return suggestion

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Populate the registry with demo data for testing the web viewer."""
 
+from pathlib import Path
 from sleap_rtc.client.client_model_registry import ClientModelRegistry
 
 
@@ -8,7 +9,12 @@ def populate_demo_data():
     """Add various demo models to showcase the web viewer."""
     print("Populating registry with demo data...")
 
-    registry = ClientModelRegistry()
+    # Use consistent demo path
+    demo_path = Path("/tmp/sleap-rtc-alias-demo")
+    demo_path.mkdir(exist_ok=True)
+    registry_path = demo_path / "manifest.json"
+
+    registry = ClientModelRegistry(registry_path=registry_path)
 
     # Clear existing data
     for model_id in list(registry.get_all_models().keys()):

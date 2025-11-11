@@ -17,7 +17,7 @@ def test_loading_existing_registry():
     print("Test 1: Loading Existing Registry")
     print("=" * 70)
 
-    demo_path = Path("/tmp/sleap-rtc-test")
+    demo_path = Path("/tmp/sleap-rtc-alias-demo")
     demo_path.mkdir(exist_ok=True)
     registry_path = demo_path / "manifest.json"
 
@@ -55,7 +55,7 @@ def test_multiple_instances_read():
     print("Test 2: Multiple Instances Reading Same Registry")
     print("=" * 70)
 
-    demo_path = Path("/tmp/sleap-rtc-test")
+    demo_path = Path("/tmp/sleap-rtc-alias-demo")
     registry_path = demo_path / "manifest.json"
 
     print("Create 3 instances and verify they all see the same data:")
@@ -83,7 +83,7 @@ def test_concurrent_write_scenario():
     print("Test 3: Concurrent Write Scenario (Potential Issue)")
     print("=" * 70)
 
-    demo_path = Path("/tmp/sleap-rtc-test")
+    demo_path = Path("/tmp/sleap-rtc-alias-demo")
     registry_path = demo_path / "manifest.json"
 
     print("Scenario: Two instances modify data independently")
@@ -140,7 +140,7 @@ def test_reload_pattern():
     print("Test 4: Safe Pattern - Reload Before Modifying")
     print("=" * 70)
 
-    demo_path = Path("/tmp/sleap-rtc-test")
+    demo_path = Path("/tmp/sleap-rtc-alias-demo")
     registry_path = demo_path / "manifest.json"
 
     # Clean slate
@@ -182,7 +182,7 @@ def test_typical_cli_usage():
     print("Test 5: Typical CLI Usage Pattern (Safe)")
     print("=" * 70)
 
-    demo_path = Path("/tmp/sleap-rtc-test")
+    demo_path = Path("/tmp/sleap-rtc-alias-demo")
     registry_path = demo_path / "manifest.json"
 
     print("CLI commands typically create a fresh registry instance per command.")
