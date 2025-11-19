@@ -17,20 +17,42 @@ import platform
 import time
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
+
 # from run_training import run_all_training_jobs
 from pathlib import Path
 from websockets.client import ClientConnection
 
-from sleap_rtc.config import get_config
+from sleap_rtc.config import get_config, SharedStorageConfig, SharedStorageConfigError
+from sleap_rtc.filesystem import (
+    safe_mkdir,
+    to_relative_path,
+    to_absolute_path,
+    get_file_info,
+    validate_path_in_root,
+    PathValidationError,
+    SharedStorageError,
+)
+from sleap_rtc.protocol import (
+    MSG_JOB_ID,
+    MSG_SHARED_INPUT_PATH,
+    MSG_SHARED_OUTPUT_PATH,
+    MSG_SHARED_STORAGE_JOB,
+    MSG_PATH_VALIDATED,
+    MSG_PATH_ERROR,
+    MSG_JOB_COMPLETE,
+    format_message,
+    parse_message,
+)
 
 # Setup logging.
 logging.basicConfig(level=logging.INFO)
 
 # Set chunk separator
-SEP = re.compile(rb'[\r\n]')
+SEP = re.compile(rb"[\r\n]")
+
 
 class RTCWorkerClient:
-    def __init__(self, chunk_size=32 * 1024, gpu_id=0):
+    def __init__(self, chunk_size=32 * 1024, gpu_id=0, shared_storage_root=None):
         # Use /app/shared_data in production, current dir + shared_data in dev
         self.save_dir = "."
         self.chunk_size = chunk_size
@@ -40,6 +62,34 @@ class RTCWorkerClient:
         self.pc = None  # RTCPeerConnection will be set later
         self.websocket = None  # WebSocket connection will be set later
         self.package_type = "train"  # Default to training, can be "track" for inference
+
+        # Initialize shared storage configuration
+        try:
+            self.shared_storage_root = SharedStorageConfig.get_shared_storage_root(
+                cli_override=shared_storage_root
+            )
+            if self.shared_storage_root:
+                # Create jobs directory for shared storage transfers
+                self.shared_jobs_dir = self.shared_storage_root / "jobs"
+                safe_mkdir(self.shared_jobs_dir)
+                logging.info(
+                    f"Worker shared storage enabled: {self.shared_storage_root}"
+                )
+            else:
+                self.shared_jobs_dir = None
+                logging.info(
+                    "Worker shared storage not configured, will use RTC transfer"
+                )
+        except SharedStorageConfigError as e:
+            logging.error(f"Worker shared storage configuration error: {e}")
+            logging.info("Falling back to RTC transfer")
+            self.shared_storage_root = None
+            self.shared_jobs_dir = None
+
+        # Shared storage job tracking
+        self.current_job_id = None
+        self.current_input_path = None
+        self.current_output_path = None
 
         # Worker state and capabilities (for v2.0 features)
         self.gpu_id = gpu_id
@@ -66,8 +116,11 @@ class RTCWorkerClient:
         """
         try:
             import torch
+
             if torch.cuda.is_available() and torch.cuda.device_count() > self.gpu_id:
-                return torch.cuda.get_device_properties(self.gpu_id).total_memory // (1024 * 1024)
+                return torch.cuda.get_device_properties(self.gpu_id).total_memory // (
+                    1024 * 1024
+                )
         except (ImportError, RuntimeError) as e:
             logging.warning(f"Failed to detect GPU memory: {e}")
         return 0
@@ -80,6 +133,7 @@ class RTCWorkerClient:
         """
         try:
             import torch
+
             if torch.cuda.is_available() and torch.cuda.device_count() > self.gpu_id:
                 return torch.cuda.get_device_properties(self.gpu_id).name
         except (ImportError, RuntimeError) as e:
@@ -94,6 +148,7 @@ class RTCWorkerClient:
         """
         try:
             import torch
+
             if torch.cuda.is_available():
                 return torch.version.cuda if torch.version.cuda else "N/A"
         except (ImportError, RuntimeError) as e:
@@ -109,20 +164,19 @@ class RTCWorkerClient:
         """
         self.status = status
 
-        metadata = {
-            "properties": {
-                "status": status,
-                **extra_properties
-            }
-        }
+        metadata = {"properties": {"status": status, **extra_properties}}
 
         try:
             # Send metadata update to signaling server
-            await self.websocket.send(json.dumps({
-                "type": "update_metadata",
-                "peer_id": self.cognito_username,
-                "metadata": metadata
-            }))
+            await self.websocket.send(
+                json.dumps(
+                    {
+                        "type": "update_metadata",
+                        "peer_id": self.cognito_username,
+                        "metadata": metadata,
+                    }
+                )
+            )
 
             # Response handled by websocket in handle_connection()
 
@@ -138,34 +192,43 @@ class RTCWorkerClient:
         # Get SLEAP version
         try:
             import sleap
+
             sleap_version = sleap.__version__
         except (ImportError, AttributeError):
             sleap_version = "unknown"
 
         try:
             # Send full registration message (not just metadata update)
-            await self.websocket.send(json.dumps({
-                'type': 'register',
-                'peer_id': self.cognito_username,
-                'room_id': self.room_id,
-                'token': self.room_token,
-                'id_token': self.id_token,  # Required for authentication
-                'role': 'worker',
-                'metadata': {
-                    'tags': ['sleap-rtc', 'training-worker', 'inference-worker'],
-                    'properties': {
-                        'gpu_memory_mb': self.gpu_memory_mb,
-                        'gpu_model': self.gpu_model,
-                        'sleap_version': sleap_version,
-                        'cuda_version': self.cuda_version,
-                        'hostname': socket.gethostname(),
-                        'status': self.status,
-                        'max_concurrent_jobs': self.max_concurrent_jobs,
-                        'supported_models': self.supported_models,
-                        'supported_job_types': self.supported_job_types
+            await self.websocket.send(
+                json.dumps(
+                    {
+                        "type": "register",
+                        "peer_id": self.cognito_username,
+                        "room_id": self.room_id,
+                        "token": self.room_token,
+                        "id_token": self.id_token,  # Required for authentication
+                        "role": "worker",
+                        "metadata": {
+                            "tags": [
+                                "sleap-rtc",
+                                "training-worker",
+                                "inference-worker",
+                            ],
+                            "properties": {
+                                "gpu_memory_mb": self.gpu_memory_mb,
+                                "gpu_model": self.gpu_model,
+                                "sleap_version": sleap_version,
+                                "cuda_version": self.cuda_version,
+                                "hostname": socket.gethostname(),
+                                "status": self.status,
+                                "max_concurrent_jobs": self.max_concurrent_jobs,
+                                "supported_models": self.supported_models,
+                                "supported_job_types": self.supported_job_types,
+                            },
+                        },
                     }
-                }
-            }))
+                )
+            )
             logging.info("Worker re-registered with signaling server")
         except Exception as e:
             logging.error(f"Failed to re-register worker: {e}")
@@ -178,13 +241,19 @@ class RTCWorkerClient:
             payload: Application-specific message payload
         """
         try:
-            await self.websocket.send(json.dumps({
-                "type": "peer_message",
-                "from_peer_id": self.cognito_username,
-                "to_peer_id": to_peer_id,
-                "payload": payload
-            }))
-            logging.info(f"Sent peer message to {to_peer_id}: {payload.get('app_message_type', 'unknown')}")
+            await self.websocket.send(
+                json.dumps(
+                    {
+                        "type": "peer_message",
+                        "from_peer_id": self.cognito_username,
+                        "to_peer_id": to_peer_id,
+                        "payload": payload,
+                    }
+                )
+            )
+            logging.info(
+                f"Sent peer message to {to_peer_id}: {payload.get('app_message_type', 'unknown')}"
+            )
         except Exception as e:
             logging.error(f"Failed to send peer message: {e}")
 
@@ -203,19 +272,25 @@ class RTCWorkerClient:
         # Check GPU memory
         min_gpu_mb = requirements.get("min_gpu_memory_mb", 0)
         if self.gpu_memory_mb < min_gpu_mb:
-            logging.info(f"Job requires {min_gpu_mb}MB GPU memory, worker has {self.gpu_memory_mb}MB")
+            logging.info(
+                f"Job requires {min_gpu_mb}MB GPU memory, worker has {self.gpu_memory_mb}MB"
+            )
             return False
 
         # Check model support
         model_type = job_spec.get("model_type")
         if model_type and model_type not in self.supported_models:
-            logging.info(f"Job requires model type '{model_type}', worker supports {self.supported_models}")
+            logging.info(
+                f"Job requires model type '{model_type}', worker supports {self.supported_models}"
+            )
             return False
 
         # Check job type
         job_type = request.get("job_type")
         if job_type and job_type not in self.supported_job_types:
-            logging.info(f"Job type '{job_type}' not supported, worker supports {self.supported_job_types}")
+            logging.info(
+                f"Job type '{job_type}' not supported, worker supports {self.supported_job_types}"
+            )
             return False
 
         return True
@@ -252,6 +327,7 @@ class RTCWorkerClient:
         """
         try:
             import torch
+
             if torch.cuda.is_available() and torch.cuda.device_count() > self.gpu_id:
                 # Simple check: return 0.0 if available, 1.0 if busy
                 return 0.0 if self.status == "available" else 0.9
@@ -267,6 +343,7 @@ class RTCWorkerClient:
         """
         try:
             import torch
+
             if torch.cuda.is_available() and torch.cuda.device_count() > self.gpu_id:
                 free_memory = torch.cuda.mem_get_info(self.gpu_id)[0]
                 return int(free_memory / (1024 * 1024))
@@ -308,12 +385,13 @@ class RTCWorkerClient:
         job_id = request.get("job_id")
         job_type = request.get("job_type")
 
-        logging.info(f"Handling job request {job_id} of type {job_type} from {client_id}")
+        logging.info(
+            f"Handling job request {job_id} of type {job_type} from {client_id}"
+        )
 
         # Check if we can accept this job
-        can_accept = (
-            self.status == "available" and
-            self._check_job_compatibility(request)
+        can_accept = self.status == "available" and self._check_job_compatibility(
+            request
         )
 
         if not can_accept:
@@ -321,31 +399,39 @@ class RTCWorkerClient:
             reason = "busy" if self.status != "available" else "incompatible"
             logging.info(f"Rejecting job {job_id}: {reason}")
 
-            await self._send_peer_message(client_id, {
-                "app_message_type": "job_response",
-                "job_id": job_id,
-                "accepted": False,
-                "reason": reason
-            })
+            await self._send_peer_message(
+                client_id,
+                {
+                    "app_message_type": "job_response",
+                    "job_id": job_id,
+                    "accepted": False,
+                    "reason": reason,
+                },
+            )
             return
 
         # Estimate job duration
         estimated_duration = self._estimate_job_duration(request)
 
         # Send acceptance
-        logging.info(f"Accepting job {job_id}, estimated duration: {estimated_duration} minutes")
+        logging.info(
+            f"Accepting job {job_id}, estimated duration: {estimated_duration} minutes"
+        )
 
-        await self._send_peer_message(client_id, {
-            "app_message_type": "job_response",
-            "job_id": job_id,
-            "accepted": True,
-            "estimated_start_time_sec": 0,
-            "estimated_duration_minutes": estimated_duration,
-            "worker_info": {
-                "gpu_utilization": self._get_gpu_utilization(),
-                "available_memory_mb": self._get_available_memory()
-            }
-        })
+        await self._send_peer_message(
+            client_id,
+            {
+                "app_message_type": "job_response",
+                "job_id": job_id,
+                "accepted": True,
+                "estimated_start_time_sec": 0,
+                "estimated_duration_minutes": estimated_duration,
+                "worker_info": {
+                    "gpu_utilization": self._get_gpu_utilization(),
+                    "available_memory_mb": self._get_available_memory(),
+                },
+            },
+        )
 
         # Update status to "reserved" (prevent other clients from requesting)
         await self.update_status("reserved", pending_job_id=job_id)
@@ -368,7 +454,7 @@ class RTCWorkerClient:
         self.current_job = {
             "job_id": job_id,
             "client_id": client_id,
-            "assigned_at": time.time()
+            "assigned_at": time.time(),
         }
 
         logging.info(f"Job {job_id} assigned and ready for WebRTC connection")
@@ -392,12 +478,15 @@ class RTCWorkerClient:
             client_id = self.current_job.get("client_id")
 
             # Send cancellation acknowledgment
-            await self._send_peer_message(client_id, {
-                "app_message_type": "job_cancelled",
-                "job_id": job_id,
-                "status": "cancelled",
-                "cleanup_complete": True
-            })
+            await self._send_peer_message(
+                client_id,
+                {
+                    "app_message_type": "job_cancelled",
+                    "job_id": job_id,
+                    "status": "cancelled",
+                    "cleanup_complete": True,
+                },
+            )
 
             # Reset job state
             self.current_job = None
@@ -409,19 +498,13 @@ class RTCWorkerClient:
 
     def generate_session_string(self, room_id: str, token: str, peer_id: str):
         """Generates an encoded session string for the room."""
-        session_data = {
-            "r": room_id, 
-            "t": token, 
-            "p": peer_id 
-        }
+        session_data = {"r": room_id, "t": token, "p": peer_id}
         encoded = base64.urlsafe_b64encode(json.dumps(session_data).encode()).decode()
 
         return f"sleap-session:{encoded}"
 
-
     def request_peer_room_deletion(self, peer_id: str):
         """Requests the signaling server to delete the room and associated user/worker."""
-
         config = get_config()
         url = config.get_http_endpoint("/delete-peer")
         json = {
@@ -432,47 +515,47 @@ class RTCWorkerClient:
         response = requests.post(url, json=json)
 
         if response.status_code == 200:
-            return # Success
+            return  # Success
         else:
             logging.error(f"Failed to delete room and peer: {response.text}")
             return None
-
 
     def request_create_room(self, id_token):
         """Requests the signaling server to create a room and returns the room ID and token.
 
         Args:
             id_token (str): Cognito ID token for authentication.
+
         Returns:
             dict: Contains room_id and token if successful, otherwise raises an exception.
         """
-
         config = get_config()
         url = config.get_http_endpoint("/create-room")
-        headers = {"Authorization": f"Bearer {id_token}"} # Use the ID token string for authentication
+        headers = {
+            "Authorization": f"Bearer {id_token}"
+        }  # Use the ID token string for authentication
 
         response = requests.post(url, headers=headers)
-        
+
         if response.status_code == 200:
             return response.json()
         else:
-            logging.error(f"Failed to create room: {response.status_code} - {response.text}")
+            logging.error(
+                f"Failed to create room: {response.status_code} - {response.text}"
+            )
             raise Exception("Failed to create room")
-
 
     def request_anonymous_signin(self) -> str:
         """Request an anonymous token from Signaling Server."""
-
         config = get_config()
         url = config.get_http_endpoint("/anonymous-signin")
         response = requests.post(url)
 
         if response.status_code == 200:
-            return response.json() # should be string type
+            return response.json()  # should be string type
         else:
             logging.error(f"Failed to get anonymous token: {response.text}")
             return None
-
 
     def parse_training_script(self, train_script_path: str):
         jobs = []
@@ -488,7 +571,6 @@ class RTCWorkerClient:
                     # For sleap-nn, we don't need separate labels file - it's configured in the YAML
                     jobs.append(config_name)
         return jobs
-
 
     def parse_track_script(self, track_script_path: str):
         """Parses track-script.sh and extracts sleap-nn track commands.
@@ -519,8 +601,9 @@ class RTCWorkerClient:
 
         return commands
 
-
-    async def run_all_training_jobs(self, channel: RTCDataChannel, train_script_path: str):
+    async def run_all_training_jobs(
+        self, channel: RTCDataChannel, train_script_path: str
+    ):
         """Execute training jobs with progress updates.
 
         Args:
@@ -538,32 +621,40 @@ class RTCWorkerClient:
                 job_name = Path(config_name).stem
 
                 # Send RTC msg over channel to indicate job start.
-                logging.info(f"Starting training job: {job_name} with config: {config_name}")
+                logging.info(
+                    f"Starting training job: {job_name} with config: {config_name}"
+                )
                 channel.send(f"TRAIN_JOB_START::{job_name}")
 
                 # Send starting status via peer message
                 if job_id and client_id:
-                    await self._send_peer_message(client_id, {
-                        "app_message_type": "job_status",
-                        "job_id": job_id,
-                        "status": "starting",
-                        "progress": 0.0,
-                        "message": f"Initializing training: {job_name}"
-                    })
+                    await self._send_peer_message(
+                        client_id,
+                        {
+                            "app_message_type": "job_status",
+                            "job_id": job_id,
+                            "status": "starting",
+                            "progress": 0.0,
+                            "message": f"Initializing training: {job_name}",
+                        },
+                    )
 
                 # Use sleap-nn train command for newer SLEAP versions
                 # Run directly in the extracted directory with config-dir from training script
                 cmd = [
-                    "sleap-nn", "train",
-                    "--config-name", config_name,
-                    "--config-dir", ".",
+                    "sleap-nn",
+                    "train",
+                    "--config-name",
+                    config_name,
+                    "--config-dir",
+                    ".",
                     "trainer_config.ckpt_dir=models",
                     f"trainer_config.run_name={job_name}",
                     "trainer_config.zmq.controller_port=9000",
                     "trainer_config.zmq.publish_port=9001",
                     # macOS compatibility: disable multiprocessing to avoid h5py pickling errors
-                    # "trainer_config.train_data_loader.num_workers=0",
-                    # "trainer_config.val_data_loader.num_workers=0",
+                    "trainer_config.train_data_loader.num_workers=0",
+                    "trainer_config.val_data_loader.num_workers=0",
                     # Force CPU training to avoid MPS/GPU issues on macOS
                     # "trainer_config.trainer_accelerator=cpu",
                     # "trainer_config.enable_progress_bar=false"
@@ -574,14 +665,16 @@ class RTCWorkerClient:
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
-                    cwd=self.unzipped_dir, # run this command in the extracted directory
-                    env={**os.environ, "PYTHONUNBUFFERED": "1"}
+                    cwd=self.unzipped_dir,  # run this command in the extracted directory
+                    env={**os.environ, "PYTHONUNBUFFERED": "1"},
                 )
 
                 assert process.stdout is not None
                 logging.info(f"Process started with PID: {process.pid}")
 
-                async def stream_logs(emit_on_cr=True, read_size=512, max_flush=64*1024):
+                async def stream_logs(
+                    emit_on_cr=True, read_size=512, max_flush=64 * 1024
+                ):
                     buf = b""
                     try:
                         while True:
@@ -606,15 +699,15 @@ class RTCWorkerClient:
                                         buf = b""
                                     break
 
-                                sep = buf[m.start():m.end()]     # b'\n' or b'\r'
-                                payload = buf[:m.start()]
-                                buf = buf[m.end():]
+                                sep = buf[m.start() : m.end()]  # b'\n' or b'\r'
+                                payload = buf[: m.start()]
+                                buf = buf[m.end() :]
 
                                 text = payload.decode(errors="replace")
                                 if not text:
                                     continue
 
-                                if sep == b'\n':
+                                if sep == b"\n":
                                     # NORMAL LOG LINE: preserve newline so your client appends it
                                     channel.send(text + "\n")
                                 else:  # sep == b'\r'
@@ -637,10 +730,14 @@ class RTCWorkerClient:
                 await stream_logs()
                 logging.info("Waiting for process to complete...")
                 await process.wait()
-                logging.info(f"Process completed with return code: {process.returncode}")
+                logging.info(
+                    f"Process completed with return code: {process.returncode}"
+                )
 
                 # Calculate training duration
-                training_duration = (time.time() - start_time) / 60  # Convert to minutes
+                training_duration = (
+                    time.time() - start_time
+                ) / 60  # Convert to minutes
 
                 if process.returncode == 0:
                     logging.info(f"[DONE] Job {job_name} completed successfully.")
@@ -650,70 +747,92 @@ class RTCWorkerClient:
                     # Send completion status via peer message
                     if job_id and client_id:
                         # Try to get model size if it exists
-                        model_path = Path(self.unzipped_dir) / self.output_dir / job_name
+                        model_path = (
+                            Path(self.unzipped_dir) / self.output_dir / job_name
+                        )
                         model_size_mb = 0
                         if model_path.exists():
                             # Check for model files
-                            model_files = list(model_path.glob("*.ckpt")) + list(model_path.glob("*.h5"))
+                            model_files = list(model_path.glob("*.ckpt")) + list(
+                                model_path.glob("*.h5")
+                            )
                             if model_files:
-                                model_size_mb = sum(f.stat().st_size for f in model_files) / (1024 * 1024)
+                                model_size_mb = sum(
+                                    f.stat().st_size for f in model_files
+                                ) / (1024 * 1024)
 
-                        await self._send_peer_message(client_id, {
-                            "app_message_type": "job_status",
-                            "job_id": job_id,
-                            "status": "running",
-                            "progress": 1.0,
-                            "message": f"Training completed: {job_name}"
-                        })
+                        await self._send_peer_message(
+                            client_id,
+                            {
+                                "app_message_type": "job_status",
+                                "job_id": job_id,
+                                "status": "running",
+                                "progress": 1.0,
+                                "message": f"Training completed: {job_name}",
+                            },
+                        )
                 else:
-                    logging.warning(f"[FAILED] Job {job_name} exited with code {process.returncode}.")
+                    logging.warning(
+                        f"[FAILED] Job {job_name} exited with code {process.returncode}."
+                    )
                     if channel.readyState == "open":
-                        channel.send(f"TRAIN_JOB_ERROR::{job_name}::{process.returncode}")
+                        channel.send(
+                            f"TRAIN_JOB_ERROR::{job_name}::{process.returncode}"
+                        )
 
                     # Send failure status via peer message
                     if job_id and client_id:
-                        await self._send_peer_message(client_id, {
-                            "app_message_type": "job_failed",
-                            "job_id": job_id,
-                            "status": "failed",
-                            "error": {
-                                "code": "TRAINING_FAILED",
-                                "message": f"Training job {job_name} failed with exit code {process.returncode}",
-                                "recoverable": False
-                            }
-                        })
+                        await self._send_peer_message(
+                            client_id,
+                            {
+                                "app_message_type": "job_failed",
+                                "job_id": job_id,
+                                "status": "failed",
+                                "error": {
+                                    "code": "TRAINING_FAILED",
+                                    "message": f"Training job {job_name} failed with exit code {process.returncode}",
+                                    "recoverable": False,
+                                },
+                            },
+                        )
 
             # All jobs completed - send final completion message
             channel.send("TRAINING_JOBS_DONE")
 
             # Send job completion message via peer message
             if job_id and client_id:
-                await self._send_peer_message(client_id, {
-                    "app_message_type": "job_complete",
-                    "job_id": job_id,
-                    "status": "completed",
-                    "result": {
-                        "training_duration_minutes": training_duration,
-                        "total_jobs": len(training_jobs)
+                await self._send_peer_message(
+                    client_id,
+                    {
+                        "app_message_type": "job_complete",
+                        "job_id": job_id,
+                        "status": "completed",
+                        "result": {
+                            "training_duration_minutes": training_duration,
+                            "total_jobs": len(training_jobs),
+                        },
+                        "transfer_method": "webrtc_datachannel",
+                        "ready_for_download": True,
                     },
-                    "transfer_method": "webrtc_datachannel",
-                    "ready_for_download": True
-                })
+                )
 
         except Exception as e:
             # Handle any unexpected errors during training
             logging.error(f"Error during training execution: {e}")
             if job_id and client_id:
-                await self._send_peer_message(client_id, {
-                    "app_message_type": "job_failed",
-                    "job_id": job_id,
-                    "status": "failed",
-                    "error": {
-                        "code": "EXECUTION_ERROR",
-                        "message": str(e),
-                        "recoverable": False
-                    }
-                })
+                await self._send_peer_message(
+                    client_id,
+                    {
+                        "app_message_type": "job_failed",
+                        "job_id": job_id,
+                        "status": "failed",
+                        "error": {
+                            "code": "EXECUTION_ERROR",
+                            "message": str(e),
+                            "recoverable": False,
+                        },
+                    },
+                )
             raise
 
         finally:
@@ -721,7 +840,6 @@ class RTCWorkerClient:
             if self.current_job:
                 await self.update_status("available")
                 self.current_job = None
-
 
     async def run_track_workflow(self, channel: RTCDataChannel, track_script_path: str):
         """Executes inference workflow on received track package.
@@ -741,16 +859,19 @@ class RTCWorkerClient:
 
                 # Send error via peer message
                 if job_id and client_id:
-                    await self._send_peer_message(client_id, {
-                        "app_message_type": "job_failed",
-                        "job_id": job_id,
-                        "status": "failed",
-                        "error": {
-                            "code": "TRACK_SCRIPT_NOT_FOUND",
-                            "message": "No track script found in package",
-                            "recoverable": False
-                        }
-                    })
+                    await self._send_peer_message(
+                        client_id,
+                        {
+                            "app_message_type": "job_failed",
+                            "job_id": job_id,
+                            "status": "failed",
+                            "error": {
+                                "code": "TRACK_SCRIPT_NOT_FOUND",
+                                "message": "No track script found in package",
+                                "recoverable": False,
+                            },
+                        },
+                    )
                 return
 
             logging.info("Starting inference workflow...")
@@ -758,16 +879,21 @@ class RTCWorkerClient:
 
             # Send starting status via peer message
             if job_id and client_id:
-                await self._send_peer_message(client_id, {
-                    "app_message_type": "job_status",
-                    "job_id": job_id,
-                    "status": "starting",
-                    "progress": 0.0,
-                    "message": "Initializing inference"
-                })
+                await self._send_peer_message(
+                    client_id,
+                    {
+                        "app_message_type": "job_status",
+                        "job_id": job_id,
+                        "status": "starting",
+                        "progress": 0.0,
+                        "message": "Initializing inference",
+                    },
+                )
 
             # Make script executable
-            os.chmod(track_script_path, os.stat(track_script_path).st_mode | stat.S_IEXEC)
+            os.chmod(
+                track_script_path, os.stat(track_script_path).st_mode | stat.S_IEXEC
+            )
 
             # Parse and run track commands
             track_commands = self.parse_track_script(track_script_path)
@@ -783,7 +909,7 @@ class RTCWorkerClient:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     cwd=self.unzipped_dir,
-                    env={**os.environ, "PYTHONUNBUFFERED": "1"}
+                    env={**os.environ, "PYTHONUNBUFFERED": "1"},
                 )
 
                 # Stream logs
@@ -802,20 +928,25 @@ class RTCWorkerClient:
                     channel.send(f"INFERENCE_JOB_END::{job_name}")
                 else:
                     logging.error(f"Inference failed with code {process.returncode}")
-                    channel.send(f"INFERENCE_JOB_ERROR::{job_name}::{process.returncode}")
+                    channel.send(
+                        f"INFERENCE_JOB_ERROR::{job_name}::{process.returncode}"
+                    )
 
                     # Send failure via peer message
                     if job_id and client_id:
-                        await self._send_peer_message(client_id, {
-                            "app_message_type": "job_failed",
-                            "job_id": job_id,
-                            "status": "failed",
-                            "error": {
-                                "code": "INFERENCE_FAILED",
-                                "message": f"Inference failed with exit code {process.returncode}",
-                                "recoverable": False
-                            }
-                        })
+                        await self._send_peer_message(
+                            client_id,
+                            {
+                                "app_message_type": "job_failed",
+                                "job_id": job_id,
+                                "status": "failed",
+                                "error": {
+                                    "code": "INFERENCE_FAILED",
+                                    "message": f"Inference failed with exit code {process.returncode}",
+                                    "recoverable": False,
+                                },
+                            },
+                        )
                     return
 
             # Calculate inference duration
@@ -833,35 +964,47 @@ class RTCWorkerClient:
 
                 # Send completion via peer message
                 if job_id and client_id:
-                    predictions_size_mb = predictions_path.stat().st_size / (1024 * 1024)
-                    await self._send_peer_message(client_id, {
-                        "app_message_type": "job_complete",
-                        "job_id": job_id,
-                        "status": "completed",
-                        "result": {
-                            "predictions_size_mb": predictions_size_mb,
-                            "inference_duration_seconds": int((time.time() - start_time)),
-                            "predictions_file": predictions_path.name
+                    predictions_size_mb = predictions_path.stat().st_size / (
+                        1024 * 1024
+                    )
+                    await self._send_peer_message(
+                        client_id,
+                        {
+                            "app_message_type": "job_complete",
+                            "job_id": job_id,
+                            "status": "completed",
+                            "result": {
+                                "predictions_size_mb": predictions_size_mb,
+                                "inference_duration_seconds": int(
+                                    (time.time() - start_time)
+                                ),
+                                "predictions_file": predictions_path.name,
+                            },
+                            "transfer_method": "webrtc_datachannel",
+                            "ready_for_download": True,
                         },
-                        "transfer_method": "webrtc_datachannel",
-                        "ready_for_download": True
-                    })
+                    )
             else:
                 logging.warning("No predictions file found")
 
                 # Send warning via peer message
                 if job_id and client_id:
-                    await self._send_peer_message(client_id, {
-                        "app_message_type": "job_complete",
-                        "job_id": job_id,
-                        "status": "completed",
-                        "result": {
-                            "inference_duration_seconds": int((time.time() - start_time)),
-                            "warning": "No predictions file generated"
+                    await self._send_peer_message(
+                        client_id,
+                        {
+                            "app_message_type": "job_complete",
+                            "job_id": job_id,
+                            "status": "completed",
+                            "result": {
+                                "inference_duration_seconds": int(
+                                    (time.time() - start_time)
+                                ),
+                                "warning": "No predictions file generated",
+                            },
+                            "transfer_method": "webrtc_datachannel",
+                            "ready_for_download": False,
                         },
-                        "transfer_method": "webrtc_datachannel",
-                        "ready_for_download": False
-                    })
+                    )
 
             channel.send("INFERENCE_JOBS_DONE")
 
@@ -869,16 +1012,19 @@ class RTCWorkerClient:
             # Handle any unexpected errors during inference
             logging.error(f"Error during inference execution: {e}")
             if job_id and client_id:
-                await self._send_peer_message(client_id, {
-                    "app_message_type": "job_failed",
-                    "job_id": job_id,
-                    "status": "failed",
-                    "error": {
-                        "code": "EXECUTION_ERROR",
-                        "message": str(e),
-                        "recoverable": False
-                    }
-                })
+                await self._send_peer_message(
+                    client_id,
+                    {
+                        "app_message_type": "job_failed",
+                        "job_id": job_id,
+                        "status": "failed",
+                        "error": {
+                            "code": "EXECUTION_ERROR",
+                            "message": str(e),
+                            "recoverable": False,
+                        },
+                    },
+                )
             raise
 
         finally:
@@ -886,7 +1032,6 @@ class RTCWorkerClient:
             if self.current_job:
                 await self.update_status("available")
                 self.current_job = None
-
 
     async def send_file(self, channel: RTCDataChannel, file_path: str):
         """Sends a file to the client via data channel.
@@ -911,7 +1056,10 @@ class RTCWorkerClient:
             bytes_sent = 0
             while chunk := file.read(self.chunk_size):
                 # Flow control
-                while channel.bufferedAmount is not None and channel.bufferedAmount > 16 * 1024 * 1024:
+                while (
+                    channel.bufferedAmount is not None
+                    and channel.bufferedAmount > 16 * 1024 * 1024
+                ):
                     await asyncio.sleep(0.1)
 
                 channel.send(chunk)
@@ -921,12 +1069,12 @@ class RTCWorkerClient:
         channel.send("END_OF_FILE")
         logging.info("File sent successfully")
 
-
     def start_zmq_control(self, zmq_address: str = "tcp://127.0.0.1:9000"):
         """Starts a ZMQ control PUB socket to send ZMQ commands to the Trainer.
-    
+
         Args:
             zmq_address: Address of the ZMQ socket to connect to.
+
         Returns:
             None
         """
@@ -942,37 +1090,40 @@ class RTCWorkerClient:
         self.ctrl_socket = socket
         logging.info("ZMQ control socket initialized.")
 
-    async def start_progress_listener(self, channel: RTCDataChannel, zmq_address: str = "tcp://127.0.0.1:9001"):
+    async def start_progress_listener(
+        self, channel: RTCDataChannel, zmq_address: str = "tcp://127.0.0.1:9001"
+    ):
         """Starts a listener for ZMQ messages and sends progress updates to the client over the data channel.
-    
+
         Args:
             channel: DataChannel object to send progress updates.
             zmq_address: Address of the ZMQ socket to connect to.
+
         Returns:
             None
         """
-
         # Initialize socket and event loop.
         logging.info("Starting ZMQ progress listener...")
         context = zmq.Context()
         socket = context.socket(zmq.SUB)
 
         logging.info(f"Connecting to ZMQ address: {zmq_address}")
-        socket.bind(zmq_address) 
+        socket.bind(zmq_address)
         socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
         loop = asyncio.get_event_loop()
 
         def recv_msg():
             """Receives a message from the ZMQ socket in a non-blocking way.
-            
+
             Returns:
                 The received message as a JSON object, or None if no message is available.
             """
-            
             try:
                 # logging.info("Receiving message from ZMQ...")
-                return socket.recv_string(flags=zmq.NOBLOCK)  # or jsonpickle.decode(msg_str) if needed
+                return socket.recv_string(
+                    flags=zmq.NOBLOCK
+                )  # or jsonpickle.decode(msg_str) if needed
             except zmq.Again:
                 return None
 
@@ -987,7 +1138,7 @@ class RTCWorkerClient:
                     # logging.info("Progress report sent to client.")
                 except Exception as e:
                     logging.error(f"Failed to send ZMQ progress: {e}")
-                    
+
             # Polling interval.
             await asyncio.sleep(0.05)
 
@@ -997,14 +1148,14 @@ class RTCWorkerClient:
         Args:
             file_name: Name of the zip file to be created.
             dir_path: Path to the directory to be zipped.
+
         Returns:
             None
         """
-
         logging.info("Zipping results...")
         if Path(dir_path):
             try:
-                shutil.make_archive(file_name, 'zip', dir_path)
+                shutil.make_archive(file_name, "zip", dir_path)
                 self.zipped_file = f"{file_name}.zip"
                 logging.info(f"Results zipped to {self.zipped_file}")
             except Exception as e:
@@ -1019,10 +1170,10 @@ class RTCWorkerClient:
 
         Args:
             file_path: Path to the zip file to be unzipped.
+
         Returns:
             None
         """
-
         logging.info("Unzipping results...")
         if Path(file_path):
             try:
@@ -1036,7 +1187,127 @@ class RTCWorkerClient:
         else:
             logging.info(f"{file_path} does not exist!")
             return
-        
+
+    async def process_shared_storage_job(self, channel):
+        """Process a job using shared storage (no RTC file transfer).
+
+        This method reads the training package directly from shared storage,
+        processes it, and writes results back to shared storage.
+
+        Args:
+            channel: RTC data channel for sending progress/status updates
+
+        Returns:
+            None
+        """
+        try:
+            logging.info(f"Processing job {self.current_job_id} from shared storage")
+            logging.info(f"Input:  {self.current_input_path}")
+            logging.info(f"Output: {self.current_output_path}")
+
+            # Get file info
+            file_info = get_file_info(self.current_input_path)
+            if not file_info.get("exists"):
+                raise FileNotFoundError(
+                    f"Input file not found: {self.current_input_path}"
+                )
+
+            logging.info(
+                f"Reading input file: {self.current_input_path.name} "
+                f"({file_info['size'] / 1e6:.1f} MB)"
+            )
+
+            # Store original file name for later use
+            self.original_file_name = self.current_input_path.name
+
+            # If it's a zip file, unzip it
+            if self.current_input_path.suffix == ".zip":
+                logging.info(f"Unzipping {self.current_input_path}...")
+                # Unzip to the job directory in shared storage (not local dir)
+                job_dir = self.current_input_path.parent
+                shutil.unpack_archive(self.current_input_path, job_dir)
+                self.unzipped_dir = str(job_dir / self.original_file_name[:-4])
+                logging.info(f"Unzipped to: {self.unzipped_dir}")
+            else:
+                # Not a zip, use the file directly
+                self.unzipped_dir = str(self.current_input_path.parent)
+
+            # Determine package type and run appropriate workflow
+            # Default to training
+            train_script_path = os.path.join(self.unzipped_dir, "train-script.sh")
+            track_script_path = os.path.join(self.unzipped_dir, "track-script.sh")
+
+            if Path(track_script_path).exists():
+                # Inference workflow
+                logging.info("Detected inference workflow (track-script.sh found)")
+                self.package_type = "track"
+                await self.run_track_workflow(channel, track_script_path)
+
+            elif Path(train_script_path).exists():
+                # Training workflow
+                logging.info("Detected training workflow (train-script.sh found)")
+                self.package_type = "train"
+
+                # Start progress listener if GUI mode
+                progress_listener_task = None
+                if self.gui:
+                    progress_listener_task = asyncio.create_task(
+                        self.start_progress_listener(channel)
+                    )
+                    logging.info(f"{channel.label} progress listener started")
+                    self.start_zmq_control()
+                    logging.info(f"{channel.label} ZMQ control socket started")
+                    await asyncio.sleep(1)  # Give SUB socket time to connect
+
+                logging.info(f"Running training script: {train_script_path}")
+
+                # Make script executable
+                os.chmod(
+                    train_script_path,
+                    os.stat(train_script_path).st_mode | stat.S_IEXEC,
+                )
+
+                # Run training (output already goes to shared storage path)
+                await self.run_all_training_jobs(
+                    channel, train_script_path=train_script_path
+                )
+
+                logging.info("Training completed successfully.")
+                if progress_listener_task:
+                    progress_listener_task.cancel()
+
+                # Zip the results
+                logging.info("Zipping results...")
+                zipped_file_name = f"trained_{self.original_file_name[:-4]}"
+                await self.zip_results(
+                    zipped_file_name, f"{self.unzipped_dir}/{self.output_dir}"
+                )
+
+                # Send the zipped results back (they're already in shared storage!)
+                # Just notify client of completion
+                logging.info(
+                    f"✓ Results written to shared storage: {self.current_output_path}"
+                )
+
+            else:
+                raise FileNotFoundError(
+                    f"No train-script.sh or track-script.sh found in {self.unzipped_dir}"
+                )
+
+            # Notify client of job completion
+            relative_output = to_relative_path(
+                self.current_output_path, self.shared_storage_root
+            )
+            channel.send(
+                format_message(MSG_JOB_COMPLETE, self.current_job_id, relative_output)
+            )
+            logging.info(f"Job {self.current_job_id} completed successfully!")
+
+        except Exception as e:
+            logging.error(f"Error processing shared storage job: {e}")
+            channel.send(f"JOB_FAILED::{self.current_job_id}::{str(e)}")
+            raise
+
     async def clean_exit(self):
         """Handles cleanup and shutdown of the worker.
 
@@ -1044,13 +1315,12 @@ class RTCWorkerClient:
             pc: RTCPeerConnection object
             websocket: WebSocket connection object
         Returns:
-            None    
+            None
         """
-
         # Set flag BEFORE closing connection & iceConnection state change triggers
         self.shutting_down = True
 
-        logging.info("Closing WebRTC connection...") 
+        logging.info("Closing WebRTC connection...")
         if self.pc:
             await self.pc.close()
 
@@ -1065,7 +1335,9 @@ class RTCWorkerClient:
 
         logging.info("Client shutdown complete. Exiting...")
 
-    async def send_worker_messages(self, pc: RTCPeerConnection, channel: RTCDataChannel):
+    async def send_worker_messages(
+        self, pc: RTCPeerConnection, channel: RTCDataChannel
+    ):
         """Handles typed messages from worker to be sent to client peer.
 
         Args:
@@ -1073,10 +1345,11 @@ class RTCWorkerClient:
         Returns:
             None
         """
-
-        message = input("Enter message to send (type 'file' to prompt file or type 'quit' to exit): ")
+        message = input(
+            "Enter message to send (type 'file' to prompt file or type 'quit' to exit): "
+        )
         data = None
-        
+
         if message.lower() == "quit":
             logging.info("Quitting...")
             await pc.close()
@@ -1100,23 +1373,25 @@ class RTCWorkerClient:
                 logging.info("File does not exist.")
                 return
             else:
-                logging.info(f"Sending {self.zipped_file} to client...") # trained_labels.v001.slp.training_job.zip
+                logging.info(
+                    f"Sending {self.zipped_file} to client..."
+                )  # trained_labels.v001.slp.training_job.zip
                 file_name = os.path.basename(self.zipped_file)
                 file_size = os.path.getsize(self.zipped_file)
-                file_save_dir = self.output_dir 
-                
+                file_save_dir = self.output_dir
+
                 # Send metadata first
                 channel.send(f"FILE_META::{file_name}:{file_size}:{file_save_dir}")
-                
+
                 # Send file in chunks (32 KB)
                 with open(file_path, "rb") as file:
                     logging.info(f"File opened: {file_path}")
                     while chunk := file.read(self.CHUNK_SIZE):
                         channel.send(chunk)
-                
+
                 channel.send("END_OF_FILE")
                 logging.info(f"File sent to client.")
-                        
+
                 # Flag data to True to prevent reg msg from being sent
                 data = True
 
@@ -1124,82 +1399,96 @@ class RTCWorkerClient:
             channel.send(message)
             logging.info(f"Message sent to client.")
 
-    async def handle_connection(self, pc: RTCPeerConnection, websocket: ClientConnection, peer_id: str):
-        """ Handles incoming messages from the signaling server and processes them accordingly.
+    async def handle_connection(
+        self, pc: RTCPeerConnection, websocket: ClientConnection, peer_id: str
+    ):
+        """Handles incoming messages from the signaling server and processes them accordingly.
 
         Args:
             pc: RTCPeerConnection object
             websocket: WebSocket connection object
             peer_id: The ID of the peer
         Returns:
-            None    
+            None
         """
-
         if websocket is None:
             logging.info("Given websocket is None. Using self.websocket instead.")
 
         if pc is None:
             logging.info("Given PeerConnection object is None. Using self.pc instead.")
- 
 
         try:
             async for message in self.websocket:
                 data = json.loads(message)
-                msg_type = data.get('type')
+                msg_type = data.get("type")
 
                 # Receive offer SDP from client (forwarded by signaling server).
                 if msg_type == "offer":
-                    logging.info('Received offer SDP')
+                    logging.info("Received offer SDP")
 
                     # Obtain the sender's peer ID (this is the new target)
-                    target_pid = data.get('sender')
+                    target_pid = data.get("sender")
 
                     # SAFEGUARD: Check worker status before accepting connection
                     if self.status in ["busy", "reserved"]:
-                        logging.warning(f"Rejecting connection from {target_pid} - worker is {self.status}")
+                        logging.warning(
+                            f"Rejecting connection from {target_pid} - worker is {self.status}"
+                        )
 
                         # Send error response to client via signaling server
-                        await self.websocket.send(json.dumps({
-                            'type': 'error',
-                            'target': target_pid,
-                            'reason': 'worker_busy',
-                            'message': f"Worker is currently {self.status}. Please use --room-id and --token to discover available workers.",
-                            'current_status': self.status
-                        }))
+                        await self.websocket.send(
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "target": target_pid,
+                                    "reason": "worker_busy",
+                                    "message": f"Worker is currently {self.status}. Please use --room-id and --token to discover available workers.",
+                                    "current_status": self.status,
+                                }
+                            )
+                        )
 
                         logging.info(f"Sent busy rejection to client {target_pid}")
                         continue  # Skip this offer, continue listening
 
                     # Status is "available" - proceed with connection
-                    logging.info(f"Accepting connection from {target_pid} (status: {self.status})")
+                    logging.info(
+                        f"Accepting connection from {target_pid} (status: {self.status})"
+                    )
 
                     # Update status to "reserved" to prevent race conditions
                     await self.update_status("reserved")
                     logging.info("Worker status updated to 'reserved'")
 
                     # Set worker peer's remote description to the client's offer based on sdp data
-                    await self.pc.setRemoteDescription(RTCSessionDescription(sdp=data.get('sdp'), type='offer'))
+                    await self.pc.setRemoteDescription(
+                        RTCSessionDescription(sdp=data.get("sdp"), type="offer")
+                    )
 
                     # Generate worker's answer SDP and set it as the local description
                     await self.pc.setLocalDescription(await self.pc.createAnswer())
 
                     # Send worker's answer SDP to client so they can set it as their remote description
-                    await self.websocket.send(json.dumps({
-                        'type': self.pc.localDescription.type, # 'answer'
-                        'sender': peer_id, # worker's peer ID
-                        'target': target_pid, # client's peer ID
-                        'sdp': self.pc.localDescription.sdp # worker's answer SDP
-                    }))
+                    await self.websocket.send(
+                        json.dumps(
+                            {
+                                "type": self.pc.localDescription.type,  # 'answer'
+                                "sender": peer_id,  # worker's peer ID
+                                "target": target_pid,  # client's peer ID
+                                "sdp": self.pc.localDescription.sdp,  # worker's answer SDP
+                            }
+                        )
+                    )
 
                     logging.info(f"Connection accepted - answer sent to {target_pid}")
 
                     # Reset received_files dictionary
                     self.received_files.clear()
 
-                elif msg_type == 'registered_auth':
-                    room_id = data.get('room_id')
-                    token = data.get('token')
-                    peer_id = data.get('peer_id')
+                elif msg_type == "registered_auth":
+                    room_id = data.get("room_id")
+                    token = data.get("token")
+                    peer_id = data.get("peer_id")
 
                     # Print session string for direct worker connection (backward compatibility)
                     logging.info("=" * 80)
@@ -1207,44 +1496,57 @@ class RTCWorkerClient:
                     logging.info("=" * 80)
                     logging.info("")
                     logging.info("Session string for DIRECT connection to this worker:")
-                    session_string = self.generate_session_string(room_id, token, peer_id)
+                    session_string = self.generate_session_string(
+                        room_id, token, peer_id
+                    )
                     logging.info(f"  {session_string}")
                     logging.info("")
-                    logging.info("Room credentials for OTHER workers/clients to join this room:")
+                    logging.info(
+                        "Room credentials for OTHER workers/clients to join this room:"
+                    )
                     logging.info(f"  Room ID: {room_id}")
                     logging.info(f"  Token:   {token}")
                     logging.info("")
-                    logging.info("Use session string with --session-string for direct connection")
-                    logging.info("Use room credentials with --room-id and --token for worker discovery")
+                    logging.info(
+                        "Use session string with --session-string for direct connection"
+                    )
+                    logging.info(
+                        "Use room credentials with --room-id and --token for worker discovery"
+                    )
                     logging.info("=" * 80)
 
                 # Handle "trickle ICE" for non-local ICE candidates (might be unnecessary)
-                elif msg_type == 'candidate':
+                elif msg_type == "candidate":
                     print("Received ICE candidate")
-                    candidate = data.get('candidate')
+                    candidate = data.get("candidate")
                     await pc.addIceCandidate(candidate)
 
-                elif msg_type == 'error':
+                elif msg_type == "error":
                     logging.error(f"Error received from server: {data.get('reason')}")
                     await self.clean_exit()
                     return
 
-                elif msg_type == 'quit': # NOT initiator, received quit request from worker
+                elif (
+                    msg_type == "quit"
+                ):  # NOT initiator, received quit request from worker
                     print("Received quit request from Client. Closing connection...")
                     await self.clean_exit()
                     return
 
-                elif msg_type == 'peer_message':  # NEW: Handle peer messages (job requests, etc.)
+                elif (
+                    msg_type == "peer_message"
+                ):  # NEW: Handle peer messages (job requests, etc.)
                     await self.handle_peer_message(data)
 
                 elif msg_type == "metadata_updated":
-                    logging.info(f"Status updated to: {data.get('metadata').get('properties').get('status')}")
+                    logging.info(
+                        f"Status updated to: {data.get('metadata').get('properties').get('status')}"
+                    )
 
                 # Error handling
                 else:
                     logging.warning(f"Unhandled message type: {msg_type}")
-                    
-        
+
         except json.JSONDecodeError:
             logging.ERROR("Invalid JSON received")
 
@@ -1253,44 +1555,46 @@ class RTCWorkerClient:
 
     async def keep_ice_alive(self, channel: RTCDataChannel):
         """Sends periodic keep-alive messages to the client to maintain the connection.
-        
+
         Args:
             channel: DataChannel object
         Returns:
             None
         """
-
         while True:
             await asyncio.sleep(15)
             if channel.readyState == "open":
                 channel.send(b"KEEP_ALIVE")
 
     # Websockets are only necessary here for setting up exchange of SDP & ICE candidates to each other.
-    # Listen for incoming data channel messages on channel established by the client.         
+    # Listen for incoming data channel messages on channel established by the client.
     def on_datachannel(self, channel: RTCDataChannel):
         """Handles incoming data channel messages from the client.
 
         Args:
             channel: DataChannel object
-        Returns: 
+        Returns:
             None
         """
-
         # Listen for incoming messages on the channel.
-        logging.info("channel(%s) %s" % (channel.label, "created by remote party & received."))
-    
+        logging.info(
+            "channel(%s) %s" % (channel.label, "created by remote party & received.")
+        )
+
         async def send_worker_file(file_path: str):
             """Handles direct, one-way file transfer from client to be sent to client peer.
-        
+
             Args:
                 file_path: Path to the file to be sent.
+
             Returns:
                 None
             """
-            
             if channel.readyState != "open":
-                logging.info(f"Data channel not open. Ready state is: {channel.readyState}")
-                return 
+                logging.info(
+                    f"Data channel not open. Ready state is: {channel.readyState}"
+                )
+                return
 
             logging.info(f"Given file path {file_path}")
             if not file_path:
@@ -1299,14 +1603,14 @@ class RTCWorkerClient:
             if not Path(file_path):
                 logging.info("File does not exist.")
                 return
-            else: 
+            else:
                 logging.info(f"Sending {self.zipped_file} to client...")
 
                 # Obtain metadata.
-                file_name = os.path.basename(self.zipped_file) 
+                file_name = os.path.basename(self.zipped_file)
                 file_size = os.path.getsize(self.zipped_file)
                 file_save_dir = self.output_dir
-                
+
                 # Send metadata first.
                 channel.send(f"FILE_META::{file_name}:{file_size}:{file_save_dir}")
 
@@ -1314,16 +1618,19 @@ class RTCWorkerClient:
                 with open(self.zipped_file, "rb") as file:
                     logging.info(f"File opened: {self.zipped_file}")
                     while chunk := file.read(self.chunk_size):
-                        while channel.bufferedAmount is not None and channel.bufferedAmount > 16 * 1024 * 1024: # Wait if buffer >16MB 
+                        while (
+                            channel.bufferedAmount is not None
+                            and channel.bufferedAmount > 16 * 1024 * 1024
+                        ):  # Wait if buffer >16MB
                             await asyncio.sleep(0.1)
 
                         channel.send(chunk)
 
                 channel.send("END_OF_FILE")
                 logging.info(f"File sent to client.")
-                
+
             return
-            
+
         @channel.on("open")
         def on_channel_open():
             """Logs the channel open event.
@@ -1333,24 +1640,151 @@ class RTCWorkerClient:
             Returns:
                 None
             """
-
             asyncio.create_task(self.keep_ice_alive(channel))
-            logging.info(f'{channel.label} channel is open')
-        
+            logging.info(f"{channel.label} channel is open")
+
         @channel.on("message")
         async def on_message(message):
             """Handles incoming messages from the client.
 
             Args:
                 message: The message received from the client (can be string or bytes)
+
             Returns:
                 None
             """
-
             # Log Client's message.
             logging.info(f"Worker received: {message}")
-            
+
             if isinstance(message, str):
+                # Parse message type and arguments
+                msg_type, msg_args = parse_message(message)
+
+                # Handle shared storage job messages
+                if msg_type == MSG_JOB_ID:
+                    self.current_job_id = msg_args[0] if msg_args else None
+                    logging.info(
+                        f"Received shared storage job ID: {self.current_job_id}"
+                    )
+                    return
+
+                elif msg_type == MSG_SHARED_INPUT_PATH:
+                    # Receive relative path from client
+                    relative_path_str = msg_args[0] if msg_args else ""
+                    logging.info(f"Received shared input path: {relative_path_str}")
+
+                    # Validate shared storage is configured
+                    if not self.shared_storage_root:
+                        error_msg = "Shared storage not configured on worker"
+                        logging.error(error_msg)
+                        channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                        return
+
+                    try:
+                        # Convert relative path to absolute
+                        relative_path = Path(relative_path_str)
+                        absolute_path = to_absolute_path(
+                            relative_path, self.shared_storage_root
+                        )
+
+                        # Validate path exists
+                        if not absolute_path.exists():
+                            error_msg = f"Input path does not exist: {absolute_path}"
+                            logging.error(error_msg)
+                            channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                            return
+
+                        # Security: Validate path is within shared root
+                        validated_path = validate_path_in_root(
+                            absolute_path, self.shared_storage_root
+                        )
+
+                        # Store for job processing
+                        self.current_input_path = validated_path
+                        logging.info(f"✓ Input path validated: {validated_path}")
+
+                        # Send validation confirmation
+                        channel.send(format_message(MSG_PATH_VALIDATED, "input"))
+
+                    except PathValidationError as e:
+                        error_msg = f"Path validation failed: {e}"
+                        logging.error(error_msg)
+                        channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                        return
+                    except Exception as e:
+                        error_msg = f"Error processing input path: {e}"
+                        logging.error(error_msg)
+                        channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                        return
+
+                elif msg_type == MSG_SHARED_OUTPUT_PATH:
+                    # Receive relative output path from client
+                    relative_path_str = msg_args[0] if msg_args else ""
+                    logging.info(f"Received shared output path: {relative_path_str}")
+
+                    if not self.shared_storage_root:
+                        error_msg = "Shared storage not configured on worker"
+                        logging.error(error_msg)
+                        channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                        return
+
+                    try:
+                        # Convert relative path to absolute
+                        relative_path = Path(relative_path_str)
+                        absolute_path = to_absolute_path(
+                            relative_path, self.shared_storage_root
+                        )
+
+                        # Security: Validate path is within shared root
+                        validated_path = validate_path_in_root(
+                            absolute_path, self.shared_storage_root
+                        )
+
+                        # Create output directory
+                        safe_mkdir(validated_path)
+
+                        # Store for job processing
+                        self.current_output_path = validated_path
+                        self.output_dir = str(validated_path)
+                        logging.info(
+                            f"✓ Output path validated and created: {validated_path}"
+                        )
+
+                        # Send validation confirmation
+                        channel.send(format_message(MSG_PATH_VALIDATED, "output"))
+
+                    except PathValidationError as e:
+                        error_msg = f"Path validation failed: {e}"
+                        logging.error(error_msg)
+                        channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                        return
+                    except Exception as e:
+                        error_msg = f"Error processing output path: {e}"
+                        logging.error(error_msg)
+                        channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                        return
+
+                elif (
+                    msg_type == MSG_SHARED_STORAGE_JOB
+                    and msg_args
+                    and msg_args[0] == "start"
+                ):
+                    logging.info("Starting shared storage job processing")
+                    # Process the job using shared storage paths
+                    if self.current_input_path and self.current_output_path:
+                        try:
+                            await self.process_shared_storage_job(channel)
+                        except Exception as e:
+                            logging.error(f"Error processing shared storage job: {e}")
+                            channel.send(f"JOB_FAILED::{self.current_job_id}::{str(e)}")
+                    else:
+                        error_msg = (
+                            "Missing input or output path for shared storage job"
+                        )
+                        logging.error(error_msg)
+                        channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                    return
+
                 if message == b"KEEP_ALIVE":
                     logging.info("Keep alive message received.")
                     return
@@ -1388,16 +1822,22 @@ class RTCWorkerClient:
                     # Route to appropriate workflow based on package type
                     if self.package_type == "track":
                         # Inference workflow
-                        track_script_path = os.path.join(self.unzipped_dir, "track-script.sh")
+                        track_script_path = os.path.join(
+                            self.unzipped_dir, "track-script.sh"
+                        )
 
                         if Path(track_script_path).exists():
                             await self.run_track_workflow(channel, track_script_path)
                         else:
-                            logging.error(f"No track script found in {self.unzipped_dir}. Skipping inference.")
+                            logging.error(
+                                f"No track script found in {self.unzipped_dir}. Skipping inference."
+                            )
 
                     else:
                         # Training workflow (default)
-                        train_script_path = os.path.join(self.unzipped_dir, "train-script.sh")
+                        train_script_path = os.path.join(
+                            self.unzipped_dir, "train-script.sh"
+                        )
 
                         if Path(train_script_path):
                             try:
@@ -1408,23 +1848,36 @@ class RTCWorkerClient:
                                 # Don't need to send ZMQ progress reports if User just using CLI sleap-rtc.
                                 # (Will print sleap-nn train logs directly to terminal instead.)
                                 if self.gui:
-                                    progress_listener_task = asyncio.create_task(self.start_progress_listener(channel))
-                                    logging.info(f'{channel.label} progress listener started')
+                                    progress_listener_task = asyncio.create_task(
+                                        self.start_progress_listener(channel)
+                                    )
+                                    logging.info(
+                                        f"{channel.label} progress listener started"
+                                    )
 
                                     # Start ZMQ control socket.
                                     self.start_zmq_control()
-                                    logging.info(f'{channel.label} ZMQ control socket started')
+                                    logging.info(
+                                        f"{channel.label} ZMQ control socket started"
+                                    )
 
                                     # Give SUB socket time to connect.
                                     await asyncio.sleep(1)
 
-                                logging.info(f"Running training script: {train_script_path}")
+                                logging.info(
+                                    f"Running training script: {train_script_path}"
+                                )
 
                                 # Make the script executable
-                                os.chmod(train_script_path, os.stat(train_script_path).st_mode | stat.S_IEXEC)
+                                os.chmod(
+                                    train_script_path,
+                                    os.stat(train_script_path).st_mode | stat.S_IEXEC,
+                                )
 
                                 # Run the training script in the save directory
-                                await self.run_all_training_jobs(channel, train_script_path=train_script_path)
+                                await self.run_all_training_jobs(
+                                    channel, train_script_path=train_script_path
+                                )
 
                                 # Finish training.
                                 logging.info("Training completed successfully.")
@@ -1433,23 +1886,36 @@ class RTCWorkerClient:
 
                                 # Zip the results.
                                 logging.info("Zipping results...")
-                                zipped_file_name = f"trained_{self.original_file_name[:-4]}"
-                                await self.zip_results(zipped_file_name, f"{self.unzipped_dir}/{self.output_dir}") # normally, "./labels_dir/models"
+                                zipped_file_name = (
+                                    f"trained_{self.original_file_name[:-4]}"
+                                )
+                                await self.zip_results(
+                                    zipped_file_name,
+                                    f"{self.unzipped_dir}/{self.output_dir}",
+                                )  # normally, "./labels_dir/models"
                                 # Zipped file saved to current directory.
 
                                 # Send the zipped file to the client.
-                                logging.info(f"Sending zipped file to client: {zipped_file_name}")
+                                logging.info(
+                                    f"Sending zipped file to client: {zipped_file_name}"
+                                )
                                 await send_worker_file(zipped_file_name)
 
                             except subprocess.CalledProcessError as e:
-                                logging.error(f"Training failed with error:\n{e.stderr}")
+                                logging.error(
+                                    f"Training failed with error:\n{e.stderr}"
+                                )
                                 await self.clean_exit()
                         else:
-                            logging.info(f"No training script found in {self.save_dir}. Skipping training.")
+                            logging.info(
+                                f"No training script found in {self.save_dir}. Skipping training."
+                            )
 
                 elif "OUTPUT_DIR::" in message:
                     logging.info(f"Output directory received: {message}")
-                    _, self.output_dir = message.split("OUTPUT_DIR::", 1) # normally, "models"
+                    _, self.output_dir = message.split(
+                        "OUTPUT_DIR::", 1
+                    )  # normally, "models"
 
                 elif "FILE_META::" in message:
                     logging.info(f"File metadata received: {message}")
@@ -1459,9 +1925,11 @@ class RTCWorkerClient:
                     logging.info("self.gui set to: " + gui)
 
                     # Convert string to boolean
-                    self.gui = gui.lower() == 'true'
+                    self.gui = gui.lower() == "true"
                     self.received_files[file_name] = bytearray()
-                    logging.info(f"File name received: {file_name}, of size {file_size}")
+                    logging.info(
+                        f"File name received: {file_name}, of size {file_size}"
+                    )
                     logging.info(f"self.gui converted to boolean: {self.gui}")
                 elif "ZMQ_CTRL::" in message:
                     logging.info(f"ZMQ LossViewer control message received: {message}")
@@ -1473,18 +1941,18 @@ class RTCWorkerClient:
                         self.ctrl_socket.send_string(zmq_msg)
                         logging.info(f"Sent control message to Trainer: {zmq_msg}")
                     else:
-                        logging.error(f"ZMQ control socket not initialized {self.ctrl_socket}. Cannot send control message.")
-                    
-
+                        logging.error(
+                            f"ZMQ control socket not initialized {self.ctrl_socket}. Cannot send control message."
+                        )
                 else:
                     logging.info(f"Client sent: {message}")
-                    await self.send_worker_messages(channel, self.pc, self.websocket)
+                    # await self.send_worker_messages(self.pc, channel)
 
             elif isinstance(message, bytes):
                 if message == b"KEEP_ALIVE":
                     logging.info("Keep alive message received.")
                     return
-                
+
                 file_name = list(self.received_files.keys())[0]
                 self.received_files.get(file_name).extend(message)
 
@@ -1496,7 +1964,6 @@ class RTCWorkerClient:
         Returns:
             None
         """
-        
         # Log the ICE connection state.
         iceState = self.pc.iceConnectionState
         logging.info(f"ICE connection state is now {iceState}")
@@ -1504,7 +1971,7 @@ class RTCWorkerClient:
         # Let clean_exit() finish without restarting
         if self.shutting_down:
             logging.info("Worker is shutting down - ignoring ICE state change.")
-            return 
+            return
 
         # Success States
         if iceState in ["connected", "completed"]:
@@ -1513,7 +1980,7 @@ class RTCWorkerClient:
             # self.reconnect_attempts = 0
             # Connection is now active and ready
             return
-        
+
         # Negotiation States
         if iceState == "checking":
             logging.info("ICE connection is checking...")
@@ -1526,7 +1993,7 @@ class RTCWorkerClient:
         # Check the ICE connection state and reset the Worker.
         if iceState == "closed":
             # Client explicitly closed the connection.
-            logging.error('Client closed connection - resetting for new client')
+            logging.error("Client closed connection - resetting for new client")
 
             # Close old peer connection
             await self.pc.close()
@@ -1552,7 +2019,7 @@ class RTCWorkerClient:
             logging.info("ICE connection disconnected -wainting for recovery...")
 
             # Wait up to 90 seconds.
-            for i in range(90):  
+            for i in range(90):
                 await asyncio.sleep(1)
                 if self.pc.iceConnectionState in ["connected", "completed"]:
                     logging.info("ICE reconnected!")
@@ -1599,7 +2066,6 @@ class RTCWorkerClient:
             await self.reregister_worker()
 
             logging.info("Ready for new client connection!")
-            
 
     async def run_worker(self, pc, DNS: str, port_number, room_id=None, token=None):
         """Main function to run the worker. Contains several event handlers for the WebRTC connection and data channel.
@@ -1610,6 +2076,7 @@ class RTCWorkerClient:
             port_number: Port number of the signaling server
             room_id: Optional room ID to join. If not provided, a new room will be created.
             token: Optional room token for authentication. Required if room_id is provided.
+
         Returns:
             None
         """
@@ -1625,37 +2092,44 @@ class RTCWorkerClient:
 
             # Sign-in anonymously with AWS Cognito to get an ID token (str).
             sign_in_json = self.request_anonymous_signin()
-            id_token = sign_in_json['id_token']
-            peer_id = sign_in_json['username']
+            id_token = sign_in_json["id_token"]
+            peer_id = sign_in_json["username"]
             self.cognito_username = peer_id
-            
+
             if not id_token:
-                logging.error("Failed to sign in anonymously. No ID token given. Exiting...")
+                logging.error(
+                    "Failed to sign in anonymously. No ID token given. Exiting..."
+                )
                 return
-            
+
             logging.info(f"Anonymous sign-in successful. ID token: {id_token}")
 
             # Create the room or use existing room credentials
             if room_id and token:
                 # Join existing room
                 logging.info(f"Joining existing room with ID: {room_id}")
-                room_json = {
-                    'room_id': room_id,
-                    'token': token
-                }
+                room_json = {"room_id": room_id, "token": token}
             else:
                 # Create the room and get the room ID, token, and cognito username.
                 room_json = self.request_create_room(id_token)
 
-                if not room_json or 'room_id' not in room_json or 'token' not in room_json:
-                    logging.error("Failed to create room or get room ID/token. Exiting...")
+                if (
+                    not room_json
+                    or "room_id" not in room_json
+                    or "token" not in room_json
+                ):
+                    logging.error(
+                        "Failed to create room or get room ID/token. Exiting..."
+                    )
                     return
-                logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
+                logging.info(
+                    f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}"
+                )
 
             # Store credentials for re-registration after reset
             self.id_token = id_token
-            self.room_id = room_json['room_id']
-            self.room_token = room_json['token']
+            self.room_id = room_json["room_id"]
+            self.room_token = room_json["token"]
 
             # Establish a WebSocket connection to the signaling server.
             logging.info(f"Connecting to signaling server at {DNS}...")
@@ -1670,34 +2144,51 @@ class RTCWorkerClient:
                 # Try to get SLEAP version
                 try:
                     import sleap
+
                     sleap_version = sleap.__version__
                 except (ImportError, AttributeError):
                     sleap_version = "unknown"
 
-                await self.websocket.send(json.dumps({
-                    'type': 'register',
-                    'peer_id': peer_id, # identify a peer uniquely in the room (Zoom username)
-                    'room_id': room_json['room_id'], # from backend API call for room identification (Zoom meeting ID)
-                    'token': room_json['token'], # from backend API call for room joining (Zoom meeting password)
-                    'id_token': id_token, # from anon. Cognito sign-in (Prevent peer spoofing, even anonymously)
-                    'role': 'worker',  # NEW: worker role for discovery
-                    'metadata': {  # NEW: worker capabilities and status
-                        'tags': ['sleap-rtc', 'training-worker', 'inference-worker'],
-                        'properties': {
-                            'gpu_memory_mb': self.gpu_memory_mb,
-                            'gpu_model': self.gpu_model,
-                            'sleap_version': sleap_version,
-                            'cuda_version': self.cuda_version,
-                            'hostname': socket.gethostname(),
-                            'status': self.status,
-                            'max_concurrent_jobs': self.max_concurrent_jobs,
-                            'supported_models': self.supported_models,
-                            'supported_job_types': self.supported_job_types
+                await self.websocket.send(
+                    json.dumps(
+                        {
+                            "type": "register",
+                            "peer_id": peer_id,  # identify a peer uniquely in the room (Zoom username)
+                            "room_id": room_json[
+                                "room_id"
+                            ],  # from backend API call for room identification (Zoom meeting ID)
+                            "token": room_json[
+                                "token"
+                            ],  # from backend API call for room joining (Zoom meeting password)
+                            "id_token": id_token,  # from anon. Cognito sign-in (Prevent peer spoofing, even anonymously)
+                            "role": "worker",  # NEW: worker role for discovery
+                            "metadata": {  # NEW: worker capabilities and status
+                                "tags": [
+                                    "sleap-rtc",
+                                    "training-worker",
+                                    "inference-worker",
+                                ],
+                                "properties": {
+                                    "gpu_memory_mb": self.gpu_memory_mb,
+                                    "gpu_model": self.gpu_model,
+                                    "sleap_version": sleap_version,
+                                    "cuda_version": self.cuda_version,
+                                    "hostname": socket.gethostname(),
+                                    "status": self.status,
+                                    "max_concurrent_jobs": self.max_concurrent_jobs,
+                                    "supported_models": self.supported_models,
+                                    "supported_job_types": self.supported_job_types,
+                                },
+                            },
                         }
-                    }
-                }))
-                logging.info(f"{peer_id} sent to signaling server for registration with metadata!")
-                logging.info(f"Worker capabilities: GPU={self.gpu_model}, Memory={self.gpu_memory_mb}MB, CUDA={self.cuda_version}")
+                    )
+                )
+                logging.info(
+                    f"{peer_id} sent to signaling server for registration with metadata!"
+                )
+                logging.info(
+                    f"Worker capabilities: GPU={self.gpu_model}, Memory={self.gpu_memory_mb}MB, CUDA={self.cuda_version}"
+                )
 
                 # Handle incoming messages from server (e.g. answers).
                 try:
@@ -1706,7 +2197,7 @@ class RTCWorkerClient:
                 except KeyboardInterrupt:
                     logging.info("Worker shut down by user, shutting down...")
                     await self.clean_exit()
-                
+
         except KeyboardInterrupt:
             logging.info("Worker interrupted by user during setup")
             await self.clean_exit()
@@ -1726,7 +2217,7 @@ if __name__ == "__main__":
     # Generate a unique peer ID for the worker.
     # peer_id = f"worker-{uuid.uuid4()}"
 
-    # Run the worker 
+    # Run the worker
     try:
         config = get_config()
         asyncio.run(
@@ -1734,11 +2225,10 @@ if __name__ == "__main__":
                 pc=pc,
                 # peer_id=peer_id,
                 DNS=config.signaling_websocket,
-                port_number=8080
+                port_number=8080,
             )
         )
     except KeyboardInterrupt:
         logging.info("Worker interrupted by user. Shutting down...")
     finally:
         logging.info("Worker exiting...")
-

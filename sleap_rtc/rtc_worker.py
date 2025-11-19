@@ -1,4 +1,5 @@
 """Entry point for sleap_rtc worker CLI."""
+
 import asyncio
 import uuid
 import logging
@@ -7,6 +8,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 from pathlib import Path
 from sleap_rtc.worker.worker_class import RTCWorkerClient
 from sleap_rtc.config import get_config
+
 
 def run_RTCworker(room_id=None, token=None):
     """Create RTCWorkerClient and start it.
@@ -32,7 +34,7 @@ def run_RTCworker(room_id=None, token=None):
                 DNS=config.signaling_websocket,
                 port_number=8080,
                 room_id=room_id,
-                token=token
+                token=token,
             )
         )
     except KeyboardInterrupt:
