@@ -35,14 +35,13 @@ win = None
 
 async def clean_exit(pc: RTCPeerConnection, websocket: ClientConnection):
     """Cleans up the client connection and closes the peer connection and websocket.
-    
+
     Args:
         pc: RTCPeerConnection object
         websocket: ClientConnection object
     Returns:
         None
     """
-
     logging.info("Closing WebRTC connection...")
     await pc.close()
 
@@ -61,13 +60,14 @@ async def reconnect(pc: RTCPeerConnection, websocket: ClientConnection):
     Returns:
         bool: True if reconnection was successful, False otherwise
     """
-
     # Attempt to reconnect.
     global reconnect_attempts
     while reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
         try:
             reconnect_attempts += 1
-            logging.info(f"Reconnection attempt {reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS}...")
+            logging.info(
+                f"Reconnection attempt {reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS}..."
+            )
 
             # Create new offer with ICE restart flag.
             logging.info("Creating new offer with manual ICE restart...")
@@ -75,11 +75,15 @@ async def reconnect(pc: RTCPeerConnection, websocket: ClientConnection):
 
             # Send new offer to the worker via signaling.
             logging.info(f"Sending new offer to worker: {target_worker}")
-            await websocket.send(json.dumps({
-                'type': pc.localDescription.type,
-                'target': target_worker,
-                'sdp': pc.localDescription.sdp
-            }))
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": pc.localDescription.type,
+                        "target": target_worker,
+                        "sdp": pc.localDescription.sdp,
+                    }
+                )
+            )
 
             # Wait for connection to complete.
             for _ in range(30):
@@ -89,17 +93,17 @@ async def reconnect(pc: RTCPeerConnection, websocket: ClientConnection):
 
                     # Clear received files on reconnection.
                     logging.info("Clearing received files on reconnection...")
-                    received_files.clear()  
+                    received_files.clear()
 
                     return True
 
             logging.warning("Reconnection timed out. Retrying...")
-    
+
         except Exception as e:
             logging.error(f"Reconnection failed with error: {e}")
 
         await asyncio.sleep(RETRY_DELAY)
-    
+
     # Maximum reconnection attempts reached.
     logging.error("Maximum reconnection attempts reached. Exiting...")
     await clean_exit(pc, websocket)
@@ -111,14 +115,13 @@ async def handle_connection(pc: RTCPeerConnection, websocket: ClientConnection):
 
     Args:
         pc: RTCPeerConnection object
-        websocket: websocket connection object 
+        websocket: websocket connection object
     Returns:
-		None
+                None
     Raises:
-		JSONDecodeError: Invalid JSON received
-		Exception: An error occurred while handling the message
+                JSONDecodeError: Invalid JSON received
+                Exception: An error occurred while handling the message
     """
-
     # Handle incoming websocket messages.
     try:
         async for message in websocket:
@@ -128,19 +131,21 @@ async def handle_connection(pc: RTCPeerConnection, websocket: ClientConnection):
             data = json.loads(message)
 
             # Receive answer SDP from worker and set it as this peer's remote description.
-            if data.get('type') == 'answer':
+            if data.get("type") == "answer":
                 logging.info(f"Received answer from worker: {data}")
 
-                await pc.setRemoteDescription(RTCSessionDescription(sdp=data.get('sdp'), type=data.get('type')))
+                await pc.setRemoteDescription(
+                    RTCSessionDescription(sdp=data.get("sdp"), type=data.get("type"))
+                )
 
             # Handle "trickle ICE" for non-local ICE candidates.
-            elif data.get('type') == 'candidate':
+            elif data.get("type") == "candidate":
                 logging.info("Received ICE candidate")
-                candidate = data.get('candidate')
+                candidate = data.get("candidate")
                 await pc.addIceCandidate(candidate)
 
             # NOT initiator, received quit request from worker.
-            elif data.get('type') == 'quit': 
+            elif data.get("type") == "quit":
                 logging.info("Worker has quit. Closing connection...")
                 await clean_exit(pc, websocket)
                 break
@@ -150,7 +155,7 @@ async def handle_connection(pc: RTCPeerConnection, websocket: ClientConnection):
                 logging.debug(f"Unhandled message: {data}")
                 logging.debug("exiting...")
                 break
-    
+
     except json.JSONDecodeError:
         logging.debug("Invalid JSON received")
 
@@ -159,29 +164,28 @@ async def handle_connection(pc: RTCPeerConnection, websocket: ClientConnection):
 
 
 async def run_client(
-        peer_id: str, 
-        DNS: str, 
-        port_number: str, 
-        file_path: str = None, 
-        CLI: bool = True,
-        output_dir: str = "",
-        config_filename: TrainingJobConfig = None, 
-        cfg_head_name: str = None,
-        loss_viewer: LossViewer = None # MUST INITIALIZE LOSS VIEWER FOR WINDOW
-    ):
+    peer_id: str,
+    DNS: str,
+    port_number: str,
+    file_path: str = None,
+    CLI: bool = True,
+    output_dir: str = "",
+    config_filename: TrainingJobConfig = None,
+    cfg_head_name: str = None,
+    loss_viewer: LossViewer = None,  # MUST INITIALIZE LOSS VIEWER FOR WINDOW
+):
     """Sends initial SDP offer to worker peer and establishes both connection & datachannel to be used by both parties.
-	
+
     Args:
-		peer_id: Unique str identifier for client
+                peer_id: Unique str identifier for client
         DNS: DNS address of the signaling server
         port_number: Port number of the signaling server
         file_path: Path to a file to be sent to worker peer (usually zip file)
         CLI: Boolean indicating if the client is running in CLI mode
         output_dir: Directory to save files received from worker peer
     Returns:
-		None
+                None
     """
-
     # Initialize global variables
     global reconnect_attempts
     global win
@@ -206,33 +210,33 @@ async def run_client(
         Returns:
             None
         """
-
         while True:
             await asyncio.sleep(15)
             if channel.readyState == "open":
                 channel.send(b"KEEP_ALIVE")
 
-
     async def send_client_messages():
         """Takes input/file from client and sends it to worker peer via datachannel.
+
         Args:
             None
         Returns:
             None
         """
-
-        message = input("Enter message to send (type 'file' to prompt file or type 'quit' to exit): ")
+        message = input(
+            "Enter message to send (type 'file' to prompt file or type 'quit' to exit): "
+        )
         data = None
 
         if message.lower() == "quit":
             logging.info("Quitting...")
             await pc.close()
-            return 
-        
+            return
+
         if channel.readyState != "open":
             logging.info(f"Data channel not open. Ready state is: {channel.readyState}")
-            return 
-        
+            return
+
         if message.lower() == "file":
             logging.info("Prompting file...")
             file_path = input("Enter file path: (or type 'quit' to exit): ")
@@ -246,50 +250,51 @@ async def run_client(
             if not os.path.exists(file_path):
                 logging.info("File does not exist.")
                 return
-            else: 
+            else:
                 logging.info(f"Sending {file_path} to worker...")
                 file_name = os.path.basename(file_path)
                 file_size = os.path.getsize(file_path)
-                
+
                 # Send metadata first
-                channel.send(f"FILE_META::{file_name}:{file_size}")  
+                channel.send(f"FILE_META::{file_name}:{file_size}")
 
                 # Send file in chunks (32 KB)
                 with open(file_path, "rb") as file:
                     logging.info(f"File opened: {file_path}")
                     while chunk := file.read(CHUNK_SIZE):
-                        while channel.bufferedAmount is not None and channel.bufferedAmount > 16 * 1024 * 1024: # Wait if buffer >16MB 
+                        while (
+                            channel.bufferedAmount is not None
+                            and channel.bufferedAmount > 16 * 1024 * 1024
+                        ):  # Wait if buffer >16MB
                             await asyncio.sleep(0.1)
 
                         channel.send(chunk)
 
                 channel.send("END_OF_FILE")
                 logging.info(f"File sent to worker.")
-                    
+
                 # Flag data to True to prevent reg msg from being sent
                 data = True
 
-        if not data: 
-          channel.send(message)
-          logging.info(f"Message sent to worker.")
-        
+        if not data:
+            channel.send(message)
+            logging.info(f"Message sent to worker.")
+
         else:
             return
-
 
     async def send_client_file():
         """Handles direct, one-way file transfer from client to be sent to worker peer.
 
         Args:
-			None
-		Returns:
-			None
+                        None
+                Returns:
+                        None
         """
-        
         # Check channel state before sending file.
         if channel.readyState != "open":
             logging.info(f"Data channel not open. Ready state is: {channel.readyState}")
-            return 
+            return
 
         # Send file to worker.
         logging.info(f"Given file path {file_path}")
@@ -299,7 +304,7 @@ async def run_client(
         if not os.path.exists(file_path):
             logging.info("File does not exist.")
             return
-        else: 
+        else:
             logging.info(f"Sending {file_path} to worker...")
 
             # Send output directory.
@@ -308,22 +313,25 @@ async def run_client(
             # Obtain metadata.
             file_name = os.path.basename(file_path)
             file_size = os.path.getsize(file_path)
-            
+
             # Send metadata next.
-            channel.send(f"FILE_META::{file_name}:{file_size}")  
+            channel.send(f"FILE_META::{file_name}:{file_size}")
 
             # Send file in chunks (32 KB).
             with open(file_path, "rb") as file:
                 logging.info(f"File opened: {file_path}")
                 while chunk := file.read(CHUNK_SIZE):
-                    while channel.bufferedAmount is not None and channel.bufferedAmount > 16 * 1024 * 1024: # Wait if buffer >16MB 
+                    while (
+                        channel.bufferedAmount is not None
+                        and channel.bufferedAmount > 16 * 1024 * 1024
+                    ):  # Wait if buffer >16MB
                         await asyncio.sleep(0.1)
 
                     channel.send(chunk)
 
             channel.send("END_OF_FILE")
             logging.info(f"File sent to worker.")
-            
+
         return
 
     @channel.on("open")
@@ -331,11 +339,10 @@ async def run_client(
         """Event handler function for when the datachannel is open.
 
         Args:
-			None
+                        None
         Returns:
-			None
+                        None
         """
-
         # Initiate keep-alive task.
         asyncio.create_task(keep_ice_alive(channel))
         logging.info(f"{channel.label} is open")
@@ -350,7 +357,6 @@ async def run_client(
             await send_client_messages()
         else:
             await send_client_file()
-    
 
     @channel.on("message")
     async def on_message(message):
@@ -358,38 +364,38 @@ async def run_client(
 
         Args:
             message: The received message, either as a string or bytes.
+
         Returns:
             None
         """
-
         # Log the received message.
         logging.info(f"Client received: {message}")
         global received_files
         global output_dir
         global win
-        
+
         # Handle string and bytes messages differently.
         if isinstance(message, str):
             if message == b"KEEP_ALIVE":
                 logging.info("Keep alive message received.")
                 return
-            
+
             if message == "END_OF_FILE":
                 # File transfer complete, save to disk.
                 file_name, file_data = list(received_files.items())[0]
 
-                try: 
+                try:
                     os.makedirs(output_dir, exist_ok=True)
                     file_path = os.path.join(output_dir, file_name)
 
                     with open(file_path, "wb") as file:
                         file.write(file_data)
-                    logging.info(f"File saved as: {file_path}") 
+                    logging.info(f"File saved as: {file_path}")
                 except PermissionError:
                     logging.error(f"Permission denied when writing to: {output_dir}")
                 except Exception as e:
                     logging.error(f"Failed to save file: {e}")
-                
+
                 received_files.clear()
 
                 # Update monitor window with file transfer and training completion.
@@ -406,13 +412,15 @@ async def run_client(
                 # Progress report received from worker.
                 logging.info(message)
                 _, progress = message.split("PROGRESS_REPORT::", 1)
-                
+
                 # Update LossViewer window with received progress report.
                 if win:
-                    QtCore.QTimer.singleShot(0, partial(win._check_messages, rtc_msg=progress))
+                    QtCore.QTimer.singleShot(
+                        0, partial(win._check_messages, rtc_msg=progress)
+                    )
                     # win._check_messages(
                     #     # Progress should be result from jsonpickle.decode(msg_str)
-                    #     rtc_msg=progress 
+                    #     rtc_msg=progress
                     # )
                 else:
                     logging.info(f"No monitor window available! win is {win}")
@@ -434,49 +442,50 @@ async def run_client(
                 #     viz_window.move(win.x() + win.width() + 20, win.y())
                 #     win.on_epoch.connect(viz_window.poll)
 
-            elif "FILE_META::" in message: 
+            elif "FILE_META::" in message:
                 # Metadata received (file name & size)
                 _, meta = message.split("FILE_META::", 1)
                 file_name, file_size, output_dir = meta.split(":")
 
                 if file_name not in received_files:
                     received_files[file_name] = bytearray()  # Initialize as bytearray
-                logging.info(f"File name received: {file_name}, of size {file_size}, saving to {output_dir}")
+                logging.info(
+                    f"File name received: {file_name}, of size {file_size}, saving to {output_dir}"
+                )
 
             elif "ZMQ_CTRL::" in message:
                 # ZMQ control message received.
                 _, zmq_ctrl = message.split("ZMQ_CTRL::", 1)
-                
+
                 if zmq_ctrl == "STOP":
                     win.reset()
 
             else:
                 logging.info(f"Worker sent: {message}")
-                
+
         elif isinstance(message, bytes):
             if message == b"KEEP_ALIVE":
                 logging.info("Keep alive message received.")
                 return
-            
+
             elif b"PROGRESS_REPORT::" in message:
                 # Progress report received from worker.
                 logging.info(message.decode())
                 _, progress = message.decode().split("PROGRESS_REPORT::", 1)
-                
+
                 # Update LossViewer window with received progress report.
                 if win:
                     win._check_messages(
                         # Progress should be result from jsonpickle.decode(msg_str)
-                        rtc_msg=progress 
+                        rtc_msg=progress
                     )
                 else:
                     logging.info(f"No monitor window available! win is {win}")
 
             file_name = list(received_files.keys())[0]
             if file_name not in received_files:
-              received_files[file_name] = bytearray()
-            received_files[file_name].extend(message)    
-
+                received_files[file_name] = bytearray()
+            received_files[file_name].extend(message)
 
     # @pc.on("iceconnectionstatechange")
     async def on_iceconnectionstatechange():
@@ -487,7 +496,6 @@ async def run_client(
         Returns:
             None
         """
-
         # Log the current ICE connection state.
         global reconnecting
         logging.info(f"ICE connection state is now {pc.iceConnectionState}")
@@ -498,36 +506,41 @@ async def run_client(
             logging.info("ICE connection established.")
             logging.info(f"reconnect attempts reset to {reconnect_attempts}")
 
-        elif pc.iceConnectionState in ["failed", "disconnected", "closed"] and not reconnecting:
-            logging.warning(f"ICE connection {pc.iceConnectionState}. Attempting reconnect...")
+        elif (
+            pc.iceConnectionState in ["failed", "disconnected", "closed"]
+            and not reconnecting
+        ):
+            logging.warning(
+                f"ICE connection {pc.iceConnectionState}. Attempting reconnect..."
+            )
             reconnecting = True
 
             if target_worker is None:
-                logging.info(f"No target worker available for reconnection. target_worker is {target_worker}.")
+                logging.info(
+                    f"No target worker available for reconnection. target_worker is {target_worker}."
+                )
                 await clean_exit(pc, websocket)
                 return
-            
+
             reconnection_success = await reconnect(pc, websocket)
             reconnecting = False
             if not reconnection_success:
                 logging.info("Reconnection failed. Closing connection...")
                 await clean_exit(pc, websocket)
                 return
-            
-        
+
     # Register the event handler explicitly
     pc.on("iceconnectionstatechange", on_iceconnectionstatechange)
-    
 
     # Initate the WebSocket connection to the signaling server.
     async with websockets.connect(DNS) as websocket:
 
         # Register the client with the signaling server.
-        await websocket.send(json.dumps({'type': 'register', 'peer_id': peer_id}))
+        await websocket.send(json.dumps({"type": "register", "peer_id": peer_id}))
         logging.info(f"{peer_id} sent to signaling server for registration!")
 
         # Query for available workers.
-        await websocket.send(json.dumps({'type': 'query'}))
+        await websocket.send(json.dumps({"type": "query"}))
         response = await websocket.recv()
         available_workers = json.loads(response)["peers"]
         logging.info(f"Available workers: {available_workers}")
@@ -539,11 +552,19 @@ async def run_client(
         if not target_worker:
             logging.info("No workers available")
             return
-        
+
         # Create and send SDP offer to worker peer.
         await pc.setLocalDescription(await pc.createOffer())
-        await websocket.send(json.dumps({'type': pc.localDescription.type, 'target': target_worker, 'sdp': pc.localDescription.sdp}))
-        logging.info('Offer sent to worker')
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": pc.localDescription.type,
+                    "target": target_worker,
+                    "sdp": pc.localDescription.sdp,
+                }
+            )
+        )
+        logging.info("Offer sent to worker")
 
         # Handle incoming messages from server (e.g. answer from worker).
         await handle_connection(pc, websocket)
@@ -552,21 +573,38 @@ async def run_client(
     await pc.close()
     await websocket.close()
 
+
 def entrypoint():
     """Main CLI function to run the client.
-      Args:
-        None
-      Returns:
-        None
+
+    Args:
+      None
+    Returns:
+      None
     """
     parser = argparse.ArgumentParser(description="SLEAP webRTC Client")
 
     # Get config for default value
     config = get_config()
 
-    parser.add_argument("--server", type=str, default=config.signaling_websocket, help="WebSocket server DNS/address, ex. 'ws://ec2-54-158-36-90.compute-1.amazonaws.com'")
-    parser.add_argument("--port", type=int, default=8080, help="WebSocket server port number, ex. '8080'")
-    parser.add_argument("--peer_id", type=str, default="client1", help="Unique identifier for the client")
+    parser.add_argument(
+        "--server",
+        type=str,
+        default=config.signaling_websocket,
+        help="WebSocket server DNS/address, ex. 'ws://ec2-54-158-36-90.compute-1.amazonaws.com'",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="WebSocket server port number, ex. '8080'",
+    )
+    parser.add_argument(
+        "--peer_id",
+        type=str,
+        default="client1",
+        help="Unique identifier for the client",
+    )
 
     args = parser.parse_args()
 
@@ -574,7 +612,7 @@ def entrypoint():
     port_number = args.port
     peer_id = args.peer_id
 
-    try: 
+    try:
         asyncio.run(run_client(peer_id, DNS, port_number, file_path=None, CLI=True))
     except KeyboardInterrupt:
         logging.info("KeyboardInterrupt: Exiting...")
@@ -584,5 +622,3 @@ def entrypoint():
 
 if __name__ == "__main__":
     entrypoint()
-
-    

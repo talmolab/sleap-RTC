@@ -60,13 +60,12 @@ class RTCTrackClient:
         self.reconnecting = False
         self.reconnect_attempts = 0
 
-
     def create_track_package(
         self,
         data_path: str,
         model_paths: List[str],
         output: str,
-        only_suggested_frames: bool
+        only_suggested_frames: bool,
     ) -> str:
         """Creates a track package with data + models + track-script.sh
 
@@ -110,7 +109,7 @@ class RTCTrackClient:
             data_filename=data_file.name,
             model_names=[Path(p).name for p in model_paths],
             output=output,
-            only_suggested_frames=only_suggested_frames
+            only_suggested_frames=only_suggested_frames,
         )
 
         track_script_path = pkg_dir / "track-script.sh"
@@ -120,22 +119,17 @@ class RTCTrackClient:
 
         # 4. Zip the package
         zip_path = Path(temp_dir) / "track_package.zip"
-        shutil.make_archive(
-            str(zip_path.with_suffix('')),
-            'zip',
-            pkg_dir
-        )
+        shutil.make_archive(str(zip_path.with_suffix("")), "zip", pkg_dir)
         logging.info(f"Created track package: {zip_path}")
 
         return str(zip_path)
-
 
     def _generate_track_script(
         self,
         data_filename: str,
         model_names: List[str],
         output: str,
-        only_suggested_frames: bool
+        only_suggested_frames: bool,
     ) -> str:
         """Generates track-script.sh for the worker to execute.
 
@@ -148,12 +142,13 @@ class RTCTrackClient:
         Returns:
             Shell script content
         """
-        model_paths_args = " \\\n  ".join([
-            f"--model_paths models/{name}"
-            for name in model_names
-        ])
+        model_paths_args = " \\\n  ".join(
+            [f"--model_paths models/{name}" for name in model_names]
+        )
 
-        suggested_flag = "--only_suggested_frames \\\n  " if only_suggested_frames else ""
+        suggested_flag = (
+            "--only_suggested_frames \\\n  " if only_suggested_frames else ""
+        )
 
         script = f"""#!/bin/bash
 # Auto-generated inference script for sleap-nn track
@@ -165,8 +160,9 @@ sleap-nn track \\
 """
         return script
 
-
-    async def send_track_package(self, channel: RTCDataChannel, package_path: str, output_dir: str):
+    async def send_track_package(
+        self, channel: RTCDataChannel, package_path: str, output_dir: str
+    ):
         """Sends the track package to the worker.
 
         Args:
@@ -190,7 +186,9 @@ sleap-nn track \\
         file_name = os.path.basename(package_path)
         file_size = os.path.getsize(package_path)
 
-        channel.send(f"FILE_META::{file_name}:{file_size}:false")  # gui=false for inference
+        channel.send(
+            f"FILE_META::{file_name}:{file_size}:false"
+        )  # gui=false for inference
         logging.info(f"Sending track package: {file_name} ({file_size} bytes)")
 
         # Send file in chunks
@@ -198,7 +196,10 @@ sleap-nn track \\
             bytes_sent = 0
             while chunk := file.read(self.chunk_size):
                 # Flow control: wait if buffer is too full
-                while channel.bufferedAmount is not None and channel.bufferedAmount > 16 * 1024 * 1024:
+                while (
+                    channel.bufferedAmount is not None
+                    and channel.bufferedAmount > 16 * 1024 * 1024
+                ):
                     await asyncio.sleep(0.1)
 
                 channel.send(chunk)
@@ -212,14 +213,13 @@ sleap-nn track \\
         channel.send("END_OF_FILE")
         logging.info("Track package sent successfully")
 
-
     def parse_session_string(self, session_string: str):
         """Parse session string to extract worker credentials."""
         prefix = "sleap-session:"
         if not session_string.startswith(prefix):
             raise ValueError(f"Session string must start with '{prefix}'")
 
-        encoded = session_string[len(prefix):]
+        encoded = session_string[len(prefix) :]
         try:
             json_str = base64.urlsafe_b64decode(encoded).decode()
             data = json.loads(json_str)
@@ -230,7 +230,6 @@ sleap-nn track \\
             }
         except Exception as e:
             raise ValueError(f"Failed to decode session string: {e}")
-
 
     def request_anonymous_signin(self) -> str:
         """Request an anonymous token from Signaling Server."""
@@ -243,7 +242,6 @@ sleap-nn track \\
         else:
             logging.error(f"Failed to get anonymous token: {response.text}")
             return None
-
 
     def request_peer_room_deletion(self, peer_id: str):
         """Requests the signaling server to delete the room and associated user/worker."""
@@ -260,7 +258,6 @@ sleap-nn track \\
         else:
             logging.error(f"Failed to delete room and peer: {response.text}")
             return None
-
 
     async def clean_exit(self):
         """Cleans up the client connection and closes the peer connection and websocket."""
@@ -279,14 +276,12 @@ sleap-nn track \\
 
         logging.info("Client shutdown complete. Exiting...")
 
-
     async def keep_ice_alive(self):
         """Sends periodic keep-alive messages to the worker peer to maintain the connection."""
         while True:
             await asyncio.sleep(15)
             if self.data_channel and self.data_channel.readyState == "open":
                 self.data_channel.send(b"KEEP_ALIVE")
-
 
     async def on_channel_open(self):
         """Event handler function for when the datachannel is open."""
@@ -296,11 +291,8 @@ sleap-nn track \\
 
         # Send track package to worker
         await self.send_track_package(
-            self.data_channel,
-            self.file_path,
-            self.output_dir
+            self.data_channel, self.file_path, self.output_dir
         )
-
 
     async def on_message(self, message):
         """Handles incoming messages from worker during inference.
@@ -344,7 +336,6 @@ sleap-nn track \\
             if message != b"KEEP_ALIVE":
                 self.predictions_data.extend(message)
 
-
     async def on_iceconnectionstatechange(self):
         """Event handler function for when the ICE connection state changes."""
         logging.info(f"ICE connection state is now {self.pc.iceConnectionState}")
@@ -353,10 +344,12 @@ sleap-nn track \\
             self.reconnect_attempts = 0
             logging.info("ICE connection established.")
 
-        elif self.pc.iceConnectionState in ["failed", "disconnected", "closed"] and not self.reconnecting:
+        elif (
+            self.pc.iceConnectionState in ["failed", "disconnected", "closed"]
+            and not self.reconnecting
+        ):
             logging.warning(f"ICE connection {self.pc.iceConnectionState}. Exiting...")
             await self.clean_exit()
-
 
     async def handle_connection(self):
         """Handles receiving SDP answer from Worker and ICE candidates from Worker."""
@@ -368,26 +361,28 @@ sleap-nn track \\
                 data = json.loads(message)
 
                 # Receive answer SDP from worker
-                if data.get('type') == 'answer':
+                if data.get("type") == "answer":
                     logging.info(f"Received answer from worker: {data}")
                     await self.pc.setRemoteDescription(
-                        RTCSessionDescription(sdp=data.get('sdp'), type=data.get('type'))
+                        RTCSessionDescription(
+                            sdp=data.get("sdp"), type=data.get("type")
+                        )
                     )
 
                 # Handle "trickle ICE" for non-local ICE candidates
-                elif data.get('type') == 'candidate':
+                elif data.get("type") == "candidate":
                     logging.info("Received ICE candidate")
-                    candidate = data.get('candidate')
+                    candidate = data.get("candidate")
                     await self.pc.addIceCandidate(candidate)
 
                 # Worker quit
-                elif data.get('type') == 'quit':
+                elif data.get("type") == "quit":
                     logging.info("Worker has quit. Closing connection...")
                     await self.clean_exit()
                     break
 
                 # Client authenticated
-                elif data.get('type') == 'registered_auth':
+                elif data.get("type") == "registered_auth":
                     logging.info(f"Client authenticated with server.")
 
                 else:
@@ -398,12 +393,8 @@ sleap-nn track \\
         except Exception as e:
             logging.error(f"Error handling message: {e}")
 
-
     async def run_client(
-        self,
-        file_path: str = None,
-        output_dir: str = ".",
-        session_string: str = None
+        self, file_path: str = None, output_dir: str = ".", session_string: str = None
     ):
         """Connects to worker and runs inference workflow.
 
@@ -431,8 +422,8 @@ sleap-nn track \\
 
             # Sign-in anonymously with Cognito
             sign_in_json = self.request_anonymous_signin()
-            id_token = sign_in_json['id_token']
-            self.peer_id = sign_in_json['username']
+            id_token = sign_in_json["id_token"]
+            self.peer_id = sign_in_json["username"]
             self.cognito_username = self.peer_id
 
             if not id_token:
@@ -449,7 +440,9 @@ sleap-nn track \\
                 if not session_string:
                     session_str_json = None
                     while True:
-                        session_string = input("Please enter RTC session string (or type 'exit' to quit): ")
+                        session_string = input(
+                            "Please enter RTC session string (or type 'exit' to quit): "
+                        )
                         if session_string.lower() == "exit":
                             print("Exiting client.")
                             return
@@ -469,14 +462,20 @@ sleap-nn track \\
 
                 # Register with signaling server
                 logging.info(f"Registering {self.peer_id} with signaling server...")
-                await self.websocket.send(json.dumps({
-                    'type': 'register',
-                    'peer_id': self.peer_id,
-                    'room_id': worker_room_id,
-                    'token': worker_token,
-                    'id_token': id_token,
-                }))
-                logging.info(f"{self.peer_id} sent to signaling server for registration!")
+                await self.websocket.send(
+                    json.dumps(
+                        {
+                            "type": "register",
+                            "peer_id": self.peer_id,
+                            "room_id": worker_room_id,
+                            "token": worker_token,
+                            "id_token": id_token,
+                        }
+                    )
+                )
+                logging.info(
+                    f"{self.peer_id} sent to signaling server for registration!"
+                )
 
                 # Set target worker
                 self.target_worker = worker_peer_id
@@ -488,13 +487,17 @@ sleap-nn track \\
 
                 # Create and send SDP offer to worker
                 await self.pc.setLocalDescription(await self.pc.createOffer())
-                await websocket.send(json.dumps({
-                    'type': self.pc.localDescription.type,
-                    'sender': self.peer_id,
-                    'target': self.target_worker,
-                    'sdp': self.pc.localDescription.sdp
-                }))
-                logging.info('Offer sent to worker')
+                await websocket.send(
+                    json.dumps(
+                        {
+                            "type": self.pc.localDescription.type,
+                            "sender": self.peer_id,
+                            "target": self.target_worker,
+                            "sdp": self.pc.localDescription.sdp,
+                        }
+                    )
+                )
+                logging.info("Offer sent to worker")
 
                 # Handle incoming messages from server
                 await self.handle_connection()

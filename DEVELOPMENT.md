@@ -213,3 +213,283 @@ Before merging:
 - [ ] Addressed all review comments
 - [ ] All CI checks passing
 - [ ] Using "Squash and merge" in GitHub UI
+
+## Shared Storage Configuration
+
+SLEAP-RTC supports high-performance file transfer via shared filesystem (NFS, local mounts) in addition to the original RTC chunked transfer. This is particularly beneficial for large training packages (5-9 GB).
+
+### Overview
+
+**Transfer Methods:**
+1. **Shared Storage** (recommended for large files): Client writes files to shared storage, sends only paths over RTC
+2. **RTC Transfer** (fallback): Sends files as chunked binary data over WebRTC data channel
+
+The system automatically selects the optimal method:
+- If shared storage is configured on both Client and Worker → Use shared storage
+- Otherwise → Use RTC transfer (backward compatible)
+
+### Performance Comparison
+
+| Transfer Method | 5 GB File | Advantages |
+|----------------|-----------|------------|
+| **Shared Storage** | ~10-30 seconds | ✅ Fast, ✅ Scalable, ✅ No network overhead |
+| **RTC Transfer** | ~15-30 minutes | ✅ No setup required, ✅ Works anywhere |
+
+### Configuration
+
+#### Environment Variable (Recommended)
+
+Set the `SHARED_STORAGE_ROOT` environment variable to the shared filesystem path:
+
+```bash
+# On Client (macOS/local)
+export SHARED_STORAGE_ROOT="/Volumes/talmo/amick"
+
+# On Worker (Vast.ai/RunAI)
+export SHARED_STORAGE_ROOT="/home/jovyan/vast/amick"
+```
+
+#### CLI Argument
+
+Pass the path directly when starting Client or Worker:
+
+```bash
+# Client
+python -m sleap_rtc.client --shared-storage-root /Volumes/talmo/amick
+
+# Worker
+python -m sleap_rtc.worker --shared-storage-root /home/jovyan/vast/amick
+```
+
+#### Verification
+
+Check if shared storage is detected:
+
+```python
+from sleap_rtc.config import SharedStorageConfig
+
+root = SharedStorageConfig.get_shared_storage_root()
+if root:
+    print(f"✓ Shared storage configured: {root}")
+else:
+    print("✗ Shared storage not configured (will use RTC transfer)")
+```
+
+### Platform-Specific Setup
+
+#### Vast.ai Configuration
+
+Vast.ai workers typically mount shared storage at `/home/jovyan/vast/amick`:
+
+```bash
+# SSH into Vast.ai instance
+ssh -p <port> root@<vast-ip>
+
+# Verify mount point exists
+ls -la /home/jovyan/vast/amick
+
+# Set environment variable in worker startup script
+export SHARED_STORAGE_ROOT="/home/jovyan/vast/amick"
+python -m sleap_rtc.worker
+```
+
+**Common Issues:**
+- Mount point doesn't exist → Check Vast.ai storage configuration
+- Permission denied → Verify directory is writable: `touch /home/jovyan/vast/amick/test.txt`
+
+#### RunAI Configuration
+
+RunAI workspaces may use different mount points:
+
+```bash
+# Check available mounts
+df -h
+
+# Common RunAI paths
+export SHARED_STORAGE_ROOT="/workspace/shared"
+# or
+export SHARED_STORAGE_ROOT="/data/shared"
+```
+
+#### Local Development (Docker)
+
+For local testing with Docker:
+
+```bash
+# Create shared volume in docker-compose.yml
+volumes:
+  shared_storage:
+    driver: local
+
+services:
+  client:
+    volumes:
+      - shared_storage:/shared
+    environment:
+      - SHARED_STORAGE_ROOT=/shared
+
+  worker:
+    volumes:
+      - shared_storage:/shared
+    environment:
+      - SHARED_STORAGE_ROOT=/shared
+```
+
+### Troubleshooting
+
+#### Shared Storage Not Detected
+
+**Symptom:** Logs show "Shared storage not configured, will use RTC transfer"
+
+**Solutions:**
+1. Verify environment variable is set: `echo $SHARED_STORAGE_ROOT`
+2. Check path exists: `ls -la $SHARED_STORAGE_ROOT`
+3. Verify path is a directory: `test -d $SHARED_STORAGE_ROOT && echo "OK" || echo "Not a directory"`
+4. Check read/write permissions: `touch $SHARED_STORAGE_ROOT/test.txt && rm $SHARED_STORAGE_ROOT/test.txt`
+
+#### Path Validation Errors
+
+**Symptom:** Worker logs show "PATH_ERROR::Path outside shared storage"
+
+**Solutions:**
+1. Ensure Client and Worker use the same logical shared storage (even if mount points differ)
+2. Verify both peers have read/write access
+3. Check for symlink issues: Paths are resolved before validation
+
+#### Disk Space Errors
+
+**Symptom:** Client logs show "Insufficient disk space on shared storage"
+
+**Solutions:**
+1. Check available space: `df -h $SHARED_STORAGE_ROOT`
+2. Clean up old job directories: `rm -rf $SHARED_STORAGE_ROOT/jobs/job_*`
+3. The system requires 120% of file size (20% buffer for extracted files)
+
+#### File Copy Timeout
+
+**Symptom:** Client logs show "File copy timed out after X seconds"
+
+**Solutions:**
+1. Check network speed to shared storage: `dd if=/dev/zero of=$SHARED_STORAGE_ROOT/test.dat bs=1M count=1024`
+2. Verify shared storage is mounted correctly (not hanging)
+3. Consider increasing timeout for very slow storage (modify code if needed)
+
+#### Permission Denied Errors
+
+**Symptom:** Worker cannot read files or Client cannot write files
+
+**Solutions:**
+1. Check directory permissions: `ls -la $SHARED_STORAGE_ROOT`
+2. Ensure user has write access: `id` and verify user/group permissions
+3. For Docker: Verify volume mount permissions in docker-compose.yml
+4. Try creating a test file: `echo "test" > $SHARED_STORAGE_ROOT/test.txt`
+
+### Testing Shared Storage
+
+Run the test suite to verify shared storage functionality:
+
+```bash
+# Test filesystem utilities
+python test_filesystem.py
+
+# Test error handling
+python test_error_handling.py
+
+# Test worker shared storage integration
+python test_worker_shared_storage.py
+```
+
+**Manual Testing:**
+
+```python
+from pathlib import Path
+from sleap_rtc.config import SharedStorageConfig
+from sleap_rtc.filesystem import safe_copy, safe_mkdir, check_disk_space
+
+# 1. Verify configuration
+root = SharedStorageConfig.get_shared_storage_root()
+print(f"Root: {root}")
+
+# 2. Check disk space (5 GB)
+has_space = check_disk_space(root, 5 * 1024**3)
+print(f"Has 5 GB available: {has_space}")
+
+# 3. Test write access
+test_dir = root / "test_jobs" / "test_123"
+safe_mkdir(test_dir)
+test_file = test_dir / "test.txt"
+test_file.write_text("Hello, shared storage!")
+print(f"✓ Write test successful: {test_file}")
+
+# 4. Test read access
+content = test_file.read_text()
+print(f"✓ Read test successful: {content}")
+
+# 5. Cleanup
+import shutil
+shutil.rmtree(test_dir.parent)
+print("✓ Cleanup successful")
+```
+
+### Security Considerations
+
+The shared storage implementation includes multiple security layers:
+
+1. **Path Validation:** All paths are validated to prevent traversal attacks
+   ```python
+   # Example: This is blocked
+   bad_path = "../../etc/passwd"
+   # Raises: PathValidationError
+   ```
+
+2. **Symlink Resolution:** Symlinks are resolved before validation
+   ```python
+   # Symlinks pointing outside shared root are rejected
+   ```
+
+3. **Permission Checks:** Read/write permissions verified before operations
+
+4. **Relative Paths:** Only relative paths sent over network (security by design)
+
+**Best Practices:**
+- Never disable path validation
+- Regularly audit shared storage access logs
+- Use dedicated shared storage mount (don't share with sensitive data)
+- Set appropriate filesystem permissions (755 for directories, 644 for files)
+
+### Architecture Notes
+
+**Message Flow (Shared Storage):**
+```
+Client                          Worker
+------                          ------
+1. Copy file to shared storage
+2. JOB_ID::job_abc123       →
+3. SHARED_INPUT_PATH::...   →   Validate path exists & within root
+4.                          ←   PATH_VALIDATED::input
+5. SHARED_OUTPUT_PATH::...  →   Create output directory
+6.                          ←   PATH_VALIDATED::output
+7. SHARED_STORAGE_JOB::start →  Process job (read from shared storage)
+8.                          ←   TRAINING_COMPLETE
+9.                          ←   JOB_COMPLETE::job_abc123::output_path
+10. Read results from shared storage
+```
+
+**File Organization:**
+```
+$SHARED_STORAGE_ROOT/
+├── jobs/
+│   ├── job_abc123/
+│   │   ├── training.zip     (input, copied by Client)
+│   │   └── models/          (output, written by Worker)
+│   │       ├── model1.h5
+│   │       └── model2.h5
+│   └── job_def456/
+│       └── ...
+```
+
+For implementation details, see:
+- `sleap_rtc/filesystem.py` - Core filesystem utilities
+- `sleap_rtc/config.py` - Configuration management
+- `sleap_rtc/protocol.py` - Message protocol definitions
+- OpenSpec change proposal: `openspec/changes/add-shared-filesystem-transfer/`

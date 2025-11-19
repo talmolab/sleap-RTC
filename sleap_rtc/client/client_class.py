@@ -19,12 +19,31 @@ from pathlib import Path
 from typing import List, Optional, Text, Tuple
 from websockets.client import ClientConnection
 
-from sleap_rtc.config import get_config
+from sleap_rtc.config import get_config, SharedStorageConfig, SharedStorageConfigError
 from sleap_rtc.exceptions import (
     NoWorkersAvailableError,
     NoWorkersAcceptedError,
     JobFailedError,
-    WorkerDiscoveryError
+    WorkerDiscoveryError,
+)
+from sleap_rtc.filesystem import (
+    safe_copy,
+    safe_mkdir,
+    to_relative_path,
+    to_absolute_path,
+    get_file_info,
+    check_disk_space,
+    SharedStorageError,
+)
+from sleap_rtc.protocol import (
+    MSG_JOB_ID,
+    MSG_SHARED_INPUT_PATH,
+    MSG_SHARED_OUTPUT_PATH,
+    MSG_SHARED_STORAGE_JOB,
+    MSG_PATH_VALIDATED,
+    MSG_PATH_ERROR,
+    format_message,
+    parse_message,
 )
 
 # Setup logging.
@@ -35,12 +54,14 @@ CHUNK_SIZE = 64 * 1024
 MAX_RECONNECT_ATTEMPTS = 5
 RETRY_DELAY = 5  # seconds
 
+
 class RTCClient:
     def __init__(
         self,
         DNS: Optional[str] = None,
         port_number: str = "8080",
-        gui: bool = False
+        gui: bool = False,
+        shared_storage_root: Optional[str] = None,
     ):
         # Initialize RTC peer connection and websocket.
         self.pc = RTCPeerConnection()
@@ -55,25 +76,44 @@ class RTCClient:
         self.port_number = port_number
         self.gui = gui
 
+        # Initialize shared storage configuration.
+        try:
+            self.shared_storage_root = SharedStorageConfig.get_shared_storage_root(
+                cli_override=shared_storage_root
+            )
+            if self.shared_storage_root:
+                logging.info(f"Shared storage enabled: {self.shared_storage_root}")
+                # Create jobs directory in shared storage
+                self.shared_jobs_dir = self.shared_storage_root / "jobs"
+                safe_mkdir(self.shared_jobs_dir)
+            else:
+                logging.info("Shared storage not configured, will use RTC transfer")
+        except SharedStorageConfigError as e:
+            logging.error(f"Shared storage configuration error: {e}")
+            logging.info("Falling back to RTC transfer")
+            self.shared_storage_root = None
+
         # Other variables.
         self.received_files = {}
         self.target_worker = None
         self.reconnecting = False
         self.current_job_id = None  # For tracking active job submissions
+        self.path_validation_queue = (
+            asyncio.Queue()
+        )  # For PATH_VALIDATED/PATH_ERROR responses
 
         # Response queues for coordinating websocket messages
         # (Only handle_connection() calls recv(), other functions wait on these queues)
         self.registration_queue = asyncio.Queue()  # For registered_auth responses
-        self.peer_list_queue = asyncio.Queue()     # For peer_list responses
-        self.job_response_queues = {}              # job_id -> asyncio.Queue for job responses
-    
+        self.peer_list_queue = asyncio.Queue()  # For peer_list responses
+        self.job_response_queues = {}  # job_id -> asyncio.Queue for job responses
 
     def parse_session_string(self, session_string: str):
         prefix = "sleap-session:"
         if not session_string.startswith(prefix):
             raise ValueError(f"Session string must start with '{prefix}'")
-        
-        encoded = session_string[len(prefix):]
+
+        encoded = session_string[len(prefix) :]
         try:
             json_str = base64.urlsafe_b64decode(encoded).decode()
             data = json.loads(json_str)
@@ -84,11 +124,9 @@ class RTCClient:
             }
         except jsonpickle.UnpicklingError as e:
             raise ValueError(f"Failed to decode session string: {e}")
-        
 
     def request_peer_room_deletion(self, peer_id: str):
         """Requests the signaling server to delete the room and associated user/worker."""
-
         config = get_config()
         url = config.get_http_endpoint("/delete-peer")
         json = {
@@ -99,32 +137,32 @@ class RTCClient:
         response = requests.post(url, json=json)
 
         if response.status_code == 200:
-            return # Success
+            return  # Success
         else:
             logging.error(f"Failed to delete room and peer: {response.text}")
             return None
 
-
     def request_anonymous_signin(self) -> str:
         """Request an anonymous token from Signaling Server."""
-
         config = get_config()
         url = config.get_http_endpoint("/anonymous-signin")
         response = requests.post(url)
 
         if response.status_code == 200:
-            return response.json() # should be string type
+            return response.json()  # should be string type
         else:
             logging.error(f"Failed to get anonymous token: {response.text}")
             return None
-        
-    
-    async def start_zmq_listener(self, channel: RTCDataChannel, zmq_address: str = "tcp://127.0.0.1:9000"):
+
+    async def start_zmq_listener(
+        self, channel: RTCDataChannel, zmq_address: str = "tcp://127.0.0.1:9000"
+    ):
         """Starts a ZMQ ctrl SUB socket to listen for ZMQ commands from the LossViewer.
-        
+
         Args:
             channel: The RTCDataChannel to send progress reports to.
             zmq_address: Address of the ZMQ socket to connect to.
+
         Returns:
             None
         """
@@ -142,14 +180,15 @@ class RTCClient:
 
         def recv_msg():
             """Receives a message from the ZMQ socket in a non-blocking way.
-            
+
             Returns:
                 The received message as a JSON object, or None if no message is available.
             """
-            
             try:
                 # logging.info("Receiving message from ZMQ...")
-                return socket.recv_string(flags=zmq.NOBLOCK)  # or jsonpickle.decode(msg_str) if needed
+                return socket.recv_string(
+                    flags=zmq.NOBLOCK
+                )  # or jsonpickle.decode(msg_str) if needed
             except zmq.Again:
                 return None
 
@@ -164,16 +203,18 @@ class RTCClient:
                     # logging.info("Progress report sent to client.")
                 except Exception as e:
                     logging.error(f"Failed to send ZMQ progress: {e}")
-                    
+
             # Polling interval.
             await asyncio.sleep(0.05)
 
-
-    def start_zmq_control(self, zmq_address: str = "tcp://127.0.0.1:9001"): # Publish Port
+    def start_zmq_control(
+        self, zmq_address: str = "tcp://127.0.0.1:9001"
+    ):  # Publish Port
         """Starts a ZMQ ctrl PUB socket to forward ZMQ commands to the LossViewer.
-    
+
         Args:
             zmq_address: Address of the ZMQ socket to connect to.
+
         Returns:
             None
         """
@@ -190,17 +231,15 @@ class RTCClient:
         self.ctrl_socket = socket
         logging.info("ZMQ control socket initialized.")
 
-
     async def clean_exit(self):
         """Cleans up the client connection and closes the peer connection and websocket.
-        
+
         Args:
             pc: RTCPeerConnection object
             websocket: ClientConnection object
         Returns:
             None
         """
-
         logging.info("Closing WebRTC connection...")
         if self.pc:
             await self.pc.close()
@@ -213,9 +252,8 @@ class RTCClient:
         if self.cognito_username:
             self.request_peer_room_deletion(self.cognito_username)
             self.cognito_username = None
-        
-        logging.info("Client shutdown complete. Exiting...")
 
+        logging.info("Client shutdown complete. Exiting...")
 
     async def reconnect(self):
         """Attempts to reconnect the client to the worker peer by creating a new offer with ICE restart flag.
@@ -226,12 +264,13 @@ class RTCClient:
         Returns:
             bool: True if reconnection was successful, False otherwise
         """
-
         # Attempt to reconnect.
         while self.reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
             try:
                 self.reconnect_attempts += 1
-                logging.info(f"Reconnection attempt {self.reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS}...")
+                logging.info(
+                    f"Reconnection attempt {self.reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS}..."
+                )
 
                 # Create new offer with ICE restart flag.
                 logging.info("Creating new offer with manual ICE restart...")
@@ -239,12 +278,16 @@ class RTCClient:
 
                 # Send new offer to the worker via signaling.
                 logging.info(f"Sending new offer to worker: {self.target_worker}")
-                await self.websocket.send(json.dumps({
-                    'type': self.pc.localDescription.type,
-                    'sender': self.peer_id, # should be own peer_id (Zoom username)
-                    'target': self.target_worker, # should be Worker's peer_id
-                    'sdp': self.pc.localDescription.sdp
-                }))
+                await self.websocket.send(
+                    json.dumps(
+                        {
+                            "type": self.pc.localDescription.type,
+                            "sender": self.peer_id,  # should be own peer_id (Zoom username)
+                            "target": self.target_worker,  # should be Worker's peer_id
+                            "sdp": self.pc.localDescription.sdp,
+                        }
+                    )
+                )
 
                 # Wait for connection to complete.
                 for _ in range(30):
@@ -259,17 +302,16 @@ class RTCClient:
                         return True
 
                 logging.warning("Reconnection timed out. Retrying...")
-        
+
             except Exception as e:
                 logging.error(f"Reconnection failed with error: {e}")
 
             await asyncio.sleep(RETRY_DELAY)
-        
+
         # Maximum reconnection attempts reached.
         logging.error("Maximum reconnection attempts reached. Exiting...")
         await self.clean_exit()
         return False
-
 
     async def handle_connection(self):
         """Handles receiving all WebSocket messages and routes them appropriately.
@@ -285,7 +327,6 @@ class RTCClient:
             JSONDecodeError: Invalid JSON received
             Exception: An error occurred while handling the message
         """
-
         # Handle incoming websocket messages.
         try:
             async for message in self.websocket:
@@ -293,59 +334,70 @@ class RTCClient:
                     logging.info(f"Received int message: {message}")
 
                 data = json.loads(message)
-                msg_type = data.get('type')
+                msg_type = data.get("type")
 
                 # Receive answer SDP from worker and set it as this peer's remote description.
-                if msg_type == 'answer':
+                if msg_type == "answer":
                     logging.info(f"Received answer from worker")
                     await self.pc.setRemoteDescription(
-                        RTCSessionDescription(sdp=data.get('sdp'), type='answer')
+                        RTCSessionDescription(sdp=data.get("sdp"), type="answer")
                     )
 
                 # Handle "trickle ICE" for non-local ICE candidates.
-                elif msg_type == 'candidate':
+                elif msg_type == "candidate":
                     logging.info("Received ICE candidate")
-                    candidate = data.get('candidate')
+                    candidate = data.get("candidate")
                     await self.pc.addIceCandidate(candidate)
 
                 # NOT initiator, received quit request from worker.
-                elif msg_type == 'quit':
+                elif msg_type == "quit":
                     logging.info("Worker has quit. Closing connection...")
                     await self.clean_exit()
                     break
 
                 # Registration confirmation → route to queue
-                elif msg_type == 'registered_auth':
+                elif msg_type == "registered_auth":
                     logging.info("Client authenticated with server")
                     await self.registration_queue.put(data)
 
                 # Peer discovery response → route to queue
-                elif msg_type == 'peer_list':
+                elif msg_type == "peer_list":
                     workers = data.get("peers", [])
                     logging.info(f"Discovered {len(workers)} workers")
                     await self.peer_list_queue.put(workers)
 
                 # Peer messages (job responses, progress updates) → route to job-specific queue
-                elif msg_type == 'peer_message':
-                    payload = data.get('payload', {})
-                    app_msg_type = payload.get('app_message_type')
+                elif msg_type == "peer_message":
+                    payload = data.get("payload", {})
+                    app_msg_type = payload.get("app_message_type")
 
-                    if app_msg_type == 'job_response':
+                    if app_msg_type == "job_response":
                         # Route to job-specific queue
-                        job_id = payload.get('job_id')
+                        job_id = payload.get("job_id")
                         if job_id and job_id in self.job_response_queues:
-                            await self.job_response_queues[job_id].put({
-                                "worker_id": data.get("from_peer_id"),
-                                "accepted": payload.get("accepted"),
-                                "reason": payload.get("reason", ""),
-                                "estimated_duration_minutes": payload.get("estimated_duration_minutes", 0),
-                                "estimated_start_time_sec": payload.get("estimated_start_time_sec", 0),
-                                "worker_info": payload.get("worker_info", {})
-                            })
+                            await self.job_response_queues[job_id].put(
+                                {
+                                    "worker_id": data.get("from_peer_id"),
+                                    "accepted": payload.get("accepted"),
+                                    "reason": payload.get("reason", ""),
+                                    "estimated_duration_minutes": payload.get(
+                                        "estimated_duration_minutes", 0
+                                    ),
+                                    "estimated_start_time_sec": payload.get(
+                                        "estimated_start_time_sec", 0
+                                    ),
+                                    "worker_info": payload.get("worker_info", {}),
+                                }
+                            )
 
-                    elif app_msg_type in ['job_started', 'job_progress', 'job_completed', 'job_failed']:
+                    elif app_msg_type in [
+                        "job_started",
+                        "job_progress",
+                        "job_completed",
+                        "job_failed",
+                    ]:
                         # Route to job progress queue
-                        job_id = payload.get('job_id')
+                        job_id = payload.get("job_id")
                         if job_id and job_id in self.job_response_queues:
                             await self.job_response_queues[job_id].put(payload)
 
@@ -361,15 +413,12 @@ class RTCClient:
         except Exception as e:
             logging.error(f"Error handling message: {e}")
 
-
     async def keep_ice_alive(self):
         """Sends periodic keep-alive messages to the worker peer to maintain the connection."""
-
         while True:
             await asyncio.sleep(15)
             if self.data_channel.readyState == "open":
                 self.data_channel.send(b"KEEP_ALIVE")
-
 
     async def send_client_file(self, file_path: str = None, output_dir: str = ""):
         """Handles direct, one-way file transfer from client to be sent to worker peer.
@@ -379,11 +428,12 @@ class RTCClient:
         Returns:
             None
         """
-        
         # Check channel state before sending file.
         if self.data_channel.readyState != "open":
-            logging.info(f"Data channel not open. Ready state is: {self.data_channel.readyState}")
-            return 
+            logging.info(
+                f"Data channel not open. Ready state is: {self.data_channel.readyState}"
+            )
+            return
 
         # Send file to worker.
         logging.info(f"Given file path {file_path}")
@@ -417,7 +467,10 @@ class RTCClient:
             with open(file_path, "rb") as file:
                 logging.info(f"File opened: {file_path}")
                 while chunk := file.read(CHUNK_SIZE):
-                    while self.data_channel.bufferedAmount is not None and self.data_channel.bufferedAmount > 16 * 1024 * 1024: # Wait if buffer >16MB
+                    while (
+                        self.data_channel.bufferedAmount is not None
+                        and self.data_channel.bufferedAmount > 16 * 1024 * 1024
+                    ):  # Wait if buffer >16MB
                         await asyncio.sleep(0.1)
 
                     self.data_channel.send(chunk)
@@ -429,10 +482,164 @@ class RTCClient:
         if self.gui:
             self.start_zmq_control()
             asyncio.create_task(self.start_zmq_listener(self.data_channel))
-            logging.info(f'{self.data_channel.label} ZMQ control socket started')
-            
+            logging.info(f"{self.data_channel.label} ZMQ control socket started")
+
         return
-    
+
+    async def send_file_via_shared_storage(
+        self, file_path: str = None, output_dir: str = ""
+    ) -> bool:
+        """Send file via shared filesystem instead of RTC transfer.
+
+        This method copies the file to shared storage and sends the path to the worker
+        over the RTC data channel. The worker can then access the file directly from
+        shared storage without transferring data over RTC.
+
+        Args:
+            file_path: Path to the local file to send.
+            output_dir: Output directory name (where worker saves results).
+
+        Returns:
+            True if successful, False if shared storage transfer failed (caller should
+            fall back to RTC transfer).
+
+        Raises:
+            None - errors are caught and logged, returns False for fallback.
+        """
+        try:
+            # Validate data channel
+            if self.data_channel.readyState != "open":
+                logging.warning(
+                    f"Data channel not open (state: {self.data_channel.readyState}). "
+                    f"Cannot send file via shared storage."
+                )
+                return False
+
+            # Validate file path
+            if not file_path:
+                logging.error("No file path provided")
+                return False
+
+            local_file = Path(file_path)
+            if not local_file.exists():
+                logging.error(f"File does not exist: {file_path}")
+                return False
+
+            # Generate unique job ID
+            job_id = f"job_{uuid.uuid4().hex[:8]}"
+            logging.info(f"Starting shared storage transfer for job {job_id}")
+
+            # Create job directory in shared storage
+            job_dir = self.shared_jobs_dir / job_id
+            safe_mkdir(job_dir)
+
+            # Check disk space before copying
+            file_size = local_file.stat().st_size
+            # Add 20% buffer for safety (extracted files, output files, etc.)
+            required_space = int(file_size * 1.2)
+
+            if not check_disk_space(self.shared_storage_root, required_space):
+                error_msg = (
+                    f"Insufficient disk space on shared storage. "
+                    f"Required: {required_space / 1e9:.2f} GB, "
+                    f"File size: {file_size / 1e9:.2f} GB"
+                )
+                logging.error(error_msg)
+                raise SharedStorageError(error_msg)
+
+            # Copy file to shared storage with timeout
+            shared_file_path = job_dir / local_file.name
+            logging.info(f"Copying {local_file.name} to shared storage...")
+
+            # Calculate timeout based on file size (assume 100 MB/s minimum transfer rate)
+            # Add 30 seconds base overhead for safety
+            copy_timeout = max(60, (file_size / (100 * 1024 * 1024)) + 30)
+            logging.debug(
+                f"File copy timeout set to {copy_timeout:.0f} seconds for {file_size / 1e9:.2f} GB file"
+            )
+
+            try:
+                # Run synchronous copy in thread pool to avoid blocking event loop
+                await asyncio.wait_for(
+                    asyncio.to_thread(safe_copy, local_file, shared_file_path),
+                    timeout=copy_timeout,
+                )
+
+                file_info = get_file_info(shared_file_path)
+                logging.info(
+                    f"✓ File copied to shared storage: {file_info['size'] / 1e6:.1f} MB"
+                )
+
+            except asyncio.TimeoutError:
+                error_msg = (
+                    f"File copy timed out after {copy_timeout:.0f} seconds. "
+                    f"This may indicate slow shared storage or network issues."
+                )
+                logging.error(error_msg)
+                raise SharedStorageError(error_msg)
+
+            # Create output directory
+            output_subdir = output_dir if output_dir else "models"
+            output_path = job_dir / output_subdir
+            safe_mkdir(output_path)
+
+            # Convert to relative paths (for cross-platform compatibility)
+            relative_input = to_relative_path(
+                shared_file_path, self.shared_storage_root
+            )
+            relative_output = to_relative_path(output_path, self.shared_storage_root)
+
+            logging.info(f"Sending paths to worker via RTC:")
+            logging.info(f"  Input:  {relative_input}")
+            logging.info(f"  Output: {relative_output}")
+
+            # Obtain file metadata.
+            file_name = Path(file_path).name
+            file_size = Path(file_path).stat().st_size
+
+            # Send metadata next.
+            self.data_channel.send(f"FILE_META::{file_name}:{file_size}:{self.gui}")
+
+            # Send paths over RTC data channel
+            self.data_channel.send(format_message(MSG_JOB_ID, job_id))
+            self.data_channel.send(
+                format_message(MSG_SHARED_INPUT_PATH, relative_input)
+            )
+            self.data_channel.send(
+                format_message(MSG_SHARED_OUTPUT_PATH, relative_output)
+            )
+            self.data_channel.send(format_message(MSG_SHARED_STORAGE_JOB, "start"))
+
+            # Wait for path validation response from worker
+            try:
+                response = await asyncio.wait_for(
+                    self.path_validation_queue.get(), timeout=10.0
+                )
+
+                # Parse response message
+                msg_type, msg_args = parse_message(response)
+
+                if msg_type == MSG_PATH_VALIDATED:
+                    logging.info("✓ Worker validated paths successfully")
+                    return True
+                elif msg_type == MSG_PATH_ERROR:
+                    error_msg = msg_args[0] if msg_args else "Unknown error"
+                    logging.error(f"Worker path validation failed: {error_msg}")
+                    return False
+                else:
+                    logging.warning(f"Unexpected response: {response}")
+                    return False
+
+            except asyncio.TimeoutError:
+                logging.error("Timeout waiting for worker path validation")
+                return False
+
+        except SharedStorageError as e:
+            logging.error(f"Shared storage error: {e}")
+            return False
+        except Exception as e:
+            logging.error(f"Unexpected error in shared storage transfer: {e}")
+            return False
 
     async def on_channel_open(self):
         """Event handler function for when the datachannel is open.
@@ -442,33 +649,55 @@ class RTCClient:
         Returns:
             None
         """
-
         # Initiate keep-alive task.
         asyncio.create_task(self.keep_ice_alive())
         logging.info(f"{self.data_channel.label} is open")
 
-        # Initiate file upload to send entire training zip file to worker peer.
-        await self.send_client_file(self.file_path, self.output_dir)
+        # Try shared storage transfer first, fall back to RTC if not available or fails
+        transfer_success = False
+        if self.shared_storage_root:
+            logging.info("Attempting shared storage transfer...")
+            transfer_success = await self.send_file_via_shared_storage(
+                self.file_path, self.output_dir
+            )
 
+        # Fall back to RTC transfer if shared storage not configured or failed
+        if not transfer_success:
+            if self.shared_storage_root:
+                logging.warning(
+                    "Shared storage transfer failed, falling back to RTC transfer"
+                )
+            else:
+                logging.info("Using RTC transfer")
+            await self.send_client_file(self.file_path, self.output_dir)
 
     async def on_message(self, message):
         """Event handler function for when a message is received on the datachannel from Worker.
 
         Args:
             message: The received message, either as a string or bytes.
+
         Returns:
             None
         """
-
         # Log the received message.
         logging.info(f"Client received: {message}")
-        
+
         # Handle string and bytes messages differently.
         if isinstance(message, str):
+            # Parse message type
+            msg_type, msg_args = parse_message(message)
+
+            # Handle shared storage path validation responses
+            if msg_type in (MSG_PATH_VALIDATED, MSG_PATH_ERROR):
+                # Put response in queue for send_file_via_shared_storage to handle
+                await self.path_validation_queue.put(message)
+                return
+
             # if message == b"KEEP_ALIVE":
             #     logging.info("Keep alive message received.")
             #     return
-            
+
             if message == "END_OF_FILE":
                 # File transfer complete, save to disk.
                 logging.info("File transfer complete. Saving file to disk...")
@@ -477,15 +706,15 @@ class RTCClient:
                 try:
                     os.makedirs(self.output_dir, exist_ok=True)
                     file_path = Path(self.output_dir).joinpath(file_name)
-    
+
                     with open(file_path, "wb") as file:
                         file.write(file_data)
-                    logging.info(f"File saved as: {file_path}") 
+                    logging.info(f"File saved as: {file_path}")
                 except PermissionError:
                     logging.error(f"Permission denied when writing to: {output_dir}")
                 except Exception as e:
                     logging.error(f"Failed to save file: {e}")
-                
+
                 self.received_files.clear()
 
                 # Update monitor window with file transfer and training completion.
@@ -500,16 +729,16 @@ class RTCClient:
                 # Progress report received from worker.
                 logging.info(message)
                 _, progress = message.split("PROGRESS_REPORT::", 1)
-                
+
                 # Update LossViewer window with received progress report.
                 if self.gui:
                     rtc_progress_msg = {
                         "event": "rtc_update_monitor",
-                        "rtc_msg": progress
+                        "rtc_msg": progress,
                     }
                     self.ctrl_socket.send_string(jsonpickle.encode(rtc_progress_msg))
 
-            elif "FILE_META::" in message: 
+            elif "FILE_META::" in message:
                 # Metadata received (file name & size).
                 _, meta = message.split("FILE_META::", 1)
                 file_name, file_size, output_dir = meta.split(":")
@@ -517,12 +746,14 @@ class RTCClient:
                 # Initialize received_files with file name as key and empty bytearray as value.
                 if file_name not in self.received_files:
                     self.received_files[file_name] = bytearray()
-                logging.info(f"File name received: {file_name}, of size {file_size}, saving to {output_dir}")
+                logging.info(
+                    f"File name received: {file_name}, of size {file_size}, saving to {output_dir}"
+                )
 
             elif "ZMQ_CTRL::" in message:
                 # ZMQ control message received.
                 _, zmq_ctrl = message.split("ZMQ_CTRL::", 1)
-                
+
                 # Handle ZMQ control messages (i.e. STOP or CANCEL).
 
             elif "TRAIN_JOB_START::" in message:
@@ -556,8 +787,12 @@ class RTCClient:
                             logging.info("Resetting monitor window.")
                             job = config_info.config
                             model_type = config_info.head_name
-                            plateau_patience = job.optimization.early_stopping.plateau_patience
-                            plateau_min_delta = job.optimization.early_stopping.plateau_min_delta
+                            plateau_patience = (
+                                job.optimization.early_stopping.plateau_patience
+                            )
+                            plateau_min_delta = (
+                                job.optimization.early_stopping.plateau_min_delta
+                            )
 
                             # Send reset ZMQ message to LossViewer window.
                             # In separate thread from LossViewer, must use ZMQ PUB socket to update.
@@ -567,51 +802,59 @@ class RTCClient:
                                 "plateau_patience": plateau_patience,
                                 "plateau_min_delta": plateau_min_delta,
                                 "window_title": f"Training Model - {str(model_type)}",
-                                "message": "Preparing to run training..."
+                                "message": "Preparing to run training...",
                             }
                             self.ctrl_socket.send_string(jsonpickle.encode(reset_msg))
-                            
+
                             # Further updates to the LossViewer window handled by PROGRESS_REPORT messages when training starts remotely.
 
-                            logging.info(f"Start training {str(model_type)} job with config: {job}")
-                
+                            logging.info(
+                                f"Start training {str(model_type)} job with config: {job}"
+                            )
+
                     except Exception as e:
                         logging.error(f"Failed to parse training job config: {e}")
 
-            elif "TRAIN_JOB_END::" in message: # ONLY TO SIGNAL TRAINING JOB END, NOT WHOLE TRAINING SESSION END.
+            elif (
+                "TRAIN_JOB_END::" in message
+            ):  # ONLY TO SIGNAL TRAINING JOB END, NOT WHOLE TRAINING SESSION END.
                 # Training job end message received.
                 _, job_info = message.split("TRAIN_JOB_END::", 1)
-                logging.info(f"Train job completed: {job_info}, checking for next job...")
+                logging.info(
+                    f"Train job completed: {job_info}, checking for next job..."
+                )
 
                 # Update LossViewer window to indicate training completion based on how many training jobs left.
                 if self.gui:
                     if len(self.config_info_list) == 0:
-                        logging.info("No more training jobs to run. Closing LossViewer window.")
+                        logging.info(
+                            "No more training jobs to run. Closing LossViewer window."
+                        )
                     else:
-                        logging.info(f"More training jobs to run: {len(self.config_info_list)} remaining.")
-    
-                
+                        logging.info(
+                            f"More training jobs to run: {len(self.config_info_list)} remaining."
+                        )
 
             elif "TRAIN_JOB_ERROR::" in message:
                 # Training job error message received.
                 _, error_info = message.split("TRAIN_JOB_ERROR::", 1)
                 logging.error(f"Training job encountered an error: {error_info}")
-                
+
         elif isinstance(message, bytes):
             if message == b"KEEP_ALIVE":
                 logging.info("Keep alive message received.")
                 return
-            
+
             elif b"PROGRESS_REPORT::" in message:
                 # Progress report received from worker as bytes.
                 logging.info(message.decode())
                 _, progress = message.decode().split("PROGRESS_REPORT::", 1)
-                
+
                 # Update LossViewer window with received progress report.
                 if self.gui:
                     rtc_progress_msg = {
                         "event": "rtc_update_monitor",
-                        "rtc_msg": progress
+                        "rtc_msg": progress,
                     }
                     self.ctrl_socket.send_string(jsonpickle.encode(rtc_progress_msg))
 
@@ -619,7 +862,6 @@ class RTCClient:
             if file_name not in self.received_files:
                 self.received_files[file_name] = bytearray()
             self.received_files[file_name].extend(message)
-
 
     # @pc.on("iceconnectionstatechange")
     async def _send_peer_message(self, to_peer_id: str, payload: dict):
@@ -630,17 +872,25 @@ class RTCClient:
             payload: Application-specific message payload
         """
         try:
-            await self.websocket.send(json.dumps({
-                "type": "peer_message",
-                "from_peer_id": self.peer_id,
-                "to_peer_id": to_peer_id,
-                "payload": payload
-            }))
-            logging.info(f"Sent peer message to {to_peer_id}: {payload.get('app_message_type', 'unknown')}")
+            await self.websocket.send(
+                json.dumps(
+                    {
+                        "type": "peer_message",
+                        "from_peer_id": self.peer_id,
+                        "to_peer_id": to_peer_id,
+                        "payload": payload,
+                    }
+                )
+            )
+            logging.info(
+                f"Sent peer message to {to_peer_id}: {payload.get('app_message_type', 'unknown')}"
+            )
         except Exception as e:
             logging.error(f"Failed to send peer message: {e}")
 
-    async def discover_workers(self, room_id: str = None, **filter_requirements) -> list:
+    async def discover_workers(
+        self, room_id: str = None, **filter_requirements
+    ) -> list:
         """Discover available workers matching requirements (DEPRECATED: use _discover_workers_in_room).
 
         NOTE: This method is deprecated. For room-based discovery, use _discover_workers_in_room() instead.
@@ -658,7 +908,9 @@ class RTCClient:
         """
         # SECURITY: Require room_id to prevent global discovery
         if not room_id:
-            logging.error("SECURITY: room_id required for worker discovery. Global discovery is disabled.")
+            logging.error(
+                "SECURITY: room_id required for worker discovery. Global discovery is disabled."
+            )
             return []
 
         # Build filters with room_id for security
@@ -666,9 +918,7 @@ class RTCClient:
             "role": "worker",
             "room_id": room_id,  # SECURITY: Always scope to room
             "tags": ["sleap-rtc"],
-            "properties": {
-                "status": "available"
-            }
+            "properties": {"status": "available"},
         }
 
         # Add GPU memory requirement
@@ -688,19 +938,22 @@ class RTCClient:
         # Try new discovery API
         try:
             # Send discovery request
-            await self.websocket.send(json.dumps({
-                "type": "discover_peers",
-                "from_peer_id": self.peer_id,
-                "filters": filters
-            }))
-
-            # Wait for response from queue (routed by handle_connection)
-            workers = await asyncio.wait_for(
-                self.peer_list_queue.get(),
-                timeout=5.0
+            await self.websocket.send(
+                json.dumps(
+                    {
+                        "type": "discover_peers",
+                        "from_peer_id": self.peer_id,
+                        "filters": filters,
+                    }
+                )
             )
 
-            logging.info(f"Discovered {len(workers)} available workers in room {room_id}")
+            # Wait for response from queue (routed by handle_connection)
+            workers = await asyncio.wait_for(self.peer_list_queue.get(), timeout=5.0)
+
+            logging.info(
+                f"Discovered {len(workers)} available workers in room {room_id}"
+            )
             return workers
 
         except asyncio.TimeoutError:
@@ -719,22 +972,14 @@ class RTCClient:
         # Check if we have a target worker already set (from session string)
         if self.target_worker:
             logging.info(f"Using target worker from session: {self.target_worker}")
-            return [{
-                "peer_id": self.target_worker,
-                "role": "worker",
-                "metadata": {}
-            }]
+            return [{"peer_id": self.target_worker, "role": "worker", "metadata": {}}]
 
         # Check environment variable
         worker_peer_id = os.environ.get("SLEAP_RTC_WORKER_PEER_ID")
 
         if worker_peer_id:
             logging.info(f"Using worker from environment: {worker_peer_id}")
-            return [{
-                "peer_id": worker_peer_id,
-                "role": "worker",
-                "metadata": {}
-            }]
+            return [{"peer_id": worker_peer_id, "role": "worker", "metadata": {}}]
 
         # No fallback available
         logging.error("No workers discovered and no fallback peer_id available")
@@ -751,6 +996,7 @@ class RTCClient:
         # Try to get SLEAP version
         try:
             import sleap
+
             sleap_version = sleap.__version__
         except (ImportError, AttributeError):
             sleap_version = "unknown"
@@ -758,31 +1004,36 @@ class RTCClient:
         logging.info(f"Registering {self.peer_id} with room {room_id}...")
 
         # Send registration message
-        await self.websocket.send(json.dumps({
-            'type': 'register',
-            'peer_id': self.peer_id,
-            'room_id': room_id,
-            'token': token,
-            'id_token': id_token,
-            'role': 'client',
-            'metadata': {
-                'tags': ['sleap-rtc', 'training-client'],
-                'properties': {
-                    'sleap_version': sleap_version,
-                    'platform': platform.system(),
-                    'user_id': os.environ.get('USER', 'unknown')
+        await self.websocket.send(
+            json.dumps(
+                {
+                    "type": "register",
+                    "peer_id": self.peer_id,
+                    "room_id": room_id,
+                    "token": token,
+                    "id_token": id_token,
+                    "role": "client",
+                    "metadata": {
+                        "tags": ["sleap-rtc", "training-client"],
+                        "properties": {
+                            "sleap_version": sleap_version,
+                            "platform": platform.system(),
+                            "user_id": os.environ.get("USER", "unknown"),
+                        },
+                    },
                 }
-            }
-        }))
+            )
+        )
 
         # Wait for confirmation from queue (routed by handle_connection)
         try:
             response = await asyncio.wait_for(
-                self.registration_queue.get(),
-                timeout=5.0
+                self.registration_queue.get(), timeout=5.0
             )
             if response.get("type") == "registered_auth":
-                logging.info(f"Client {self.peer_id} successfully registered with room {room_id}")
+                logging.info(
+                    f"Client {self.peer_id} successfully registered with room {room_id}"
+                )
             else:
                 logging.warning(f"Unexpected registration response: {response}")
         except asyncio.TimeoutError:
@@ -790,7 +1041,9 @@ class RTCClient:
         except Exception as e:
             logging.error(f"Registration error: {e}")
 
-    async def _discover_workers_in_room(self, room_id: str, min_gpu_memory: int = None) -> list:
+    async def _discover_workers_in_room(
+        self, room_id: str, min_gpu_memory: int = None
+    ) -> list:
         """Discover available workers in the specified room.
 
         Args:
@@ -805,32 +1058,29 @@ class RTCClient:
             "role": "worker",
             "room_id": room_id,  # CRITICAL: Scope discovery to this room only
             "tags": ["sleap-rtc"],
-            "properties": {
-                "status": "available"
-            }
+            "properties": {"status": "available"},
         }
 
         # Add GPU memory filter if specified
         if min_gpu_memory:
-            filters["properties"]["gpu_memory_mb"] = {
-                "$gte": min_gpu_memory
-            }
+            filters["properties"]["gpu_memory_mb"] = {"$gte": min_gpu_memory}
 
         logging.info(f"Discovering workers in room {room_id}...")
 
         try:
             # Send discovery request
-            await self.websocket.send(json.dumps({
-                "type": "discover_peers",
-                "from_peer_id": self.peer_id,
-                "filters": filters
-            }))
+            await self.websocket.send(
+                json.dumps(
+                    {
+                        "type": "discover_peers",
+                        "from_peer_id": self.peer_id,
+                        "filters": filters,
+                    }
+                )
+            )
 
             # Wait for response from queue (routed by handle_connection)
-            workers = await asyncio.wait_for(
-                self.peer_list_queue.get(),
-                timeout=5.0
-            )
+            workers = await asyncio.wait_for(self.peer_list_queue.get(), timeout=5.0)
 
             logging.info(f"Discovered {len(workers)} available workers in room")
             return workers
@@ -857,13 +1107,19 @@ class RTCClient:
         # Sort by GPU memory (descending)
         sorted_workers = sorted(
             workers,
-            key=lambda w: w.get('metadata', {}).get('properties', {}).get('gpu_memory_mb', 0),
-            reverse=True
+            key=lambda w: w.get("metadata", {})
+            .get("properties", {})
+            .get("gpu_memory_mb", 0),
+            reverse=True,
         )
 
         selected = sorted_workers[0]
-        peer_id = selected['peer_id']
-        gpu_memory = selected.get('metadata', {}).get('properties', {}).get('gpu_memory_mb', 'unknown')
+        peer_id = selected["peer_id"]
+        gpu_memory = (
+            selected.get("metadata", {})
+            .get("properties", {})
+            .get("gpu_memory_mb", "unknown")
+        )
 
         logging.info(f"Auto-selected worker {peer_id} (GPU memory: {gpu_memory}MB)")
         return peer_id
@@ -883,12 +1139,12 @@ class RTCClient:
             print("=" * 80)
 
             for i, worker in enumerate(workers, 1):
-                peer_id = worker['peer_id']
-                metadata = worker.get('metadata', {}).get('properties', {})
-                gpu_model = metadata.get('gpu_model', 'Unknown')
-                gpu_memory = metadata.get('gpu_memory_mb', 0)
-                cuda_version = metadata.get('cuda_version', 'Unknown')
-                hostname = metadata.get('hostname', 'Unknown')
+                peer_id = worker["peer_id"]
+                metadata = worker.get("metadata", {}).get("properties", {})
+                gpu_model = metadata.get("gpu_model", "Unknown")
+                gpu_memory = metadata.get("gpu_memory_mb", 0)
+                cuda_version = metadata.get("cuda_version", "Unknown")
+                hostname = metadata.get("hostname", "Unknown")
 
                 print(f"\n  {i}. {peer_id}")
                 print(f"     GPU Model:    {gpu_model}")
@@ -897,17 +1153,20 @@ class RTCClient:
                 print(f"     Hostname:     {hostname}")
 
             print("\n" + "=" * 80)
-            print("Commands: Enter worker number (1-{}), or 'refresh' to update list".format(len(workers)))
+            print(
+                "Commands: Enter worker number (1-{}), or 'refresh' to update list".format(
+                    len(workers)
+                )
+            )
             print("=" * 80)
 
             choice = input("\nSelect worker: ").strip().lower()
 
-            if choice == 'refresh':
+            if choice == "refresh":
                 logging.info("Refreshing worker list...")
                 # Re-query workers
                 refreshed_workers = await self._discover_workers_in_room(
-                    room_id=self.current_room_id,
-                    min_gpu_memory=None
+                    room_id=self.current_room_id, min_gpu_memory=None
                 )
                 if refreshed_workers:
                     workers = refreshed_workers
@@ -920,11 +1179,13 @@ class RTCClient:
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < len(workers):
-                    selected_worker = workers[idx]['peer_id']
+                    selected_worker = workers[idx]["peer_id"]
                     print(f"\nSelected: {selected_worker}")
                     return selected_worker
                 else:
-                    print(f"Invalid selection. Please enter a number between 1 and {len(workers)}")
+                    print(
+                        f"Invalid selection. Please enter a number between 1 and {len(workers)}"
+                    )
             except ValueError:
                 print("Invalid input. Please enter a number or 'refresh'")
 
@@ -952,7 +1213,7 @@ class RTCClient:
                     # Wait for response from queue (routed by handle_connection)
                     response = await asyncio.wait_for(
                         self.job_response_queues[job_id].get(),
-                        timeout=max(0.1, remaining)
+                        timeout=max(0.1, remaining),
                     )
 
                     # Only collect job_response messages (not progress/started/etc)
@@ -1009,7 +1270,9 @@ class RTCClient:
 
                 elif app_msg_type == "job_failed":
                     error = payload.get("error", {})
-                    logging.error(f"Job failed: {error.get('message', 'Unknown error')}")
+                    logging.error(
+                        f"Job failed: {error.get('message', 'Unknown error')}"
+                    )
                     raise JobFailedError(
                         f"Job failed with code {error.get('code', 'UNKNOWN')}: {error.get('message', 'Unknown error')}"
                     )
@@ -1019,7 +1282,9 @@ class RTCClient:
             if job_id in self.job_response_queues:
                 del self.job_response_queues[job_id]
 
-    async def submit_training_job(self, dataset_path: str, config: dict, room_id: str = None, **job_requirements):
+    async def submit_training_job(
+        self, dataset_path: str, config: dict, room_id: str = None, **job_requirements
+    ):
         """Submit training job to available workers (DEPRECATED: use room-based connection flow).
 
         NOTE: This method is deprecated. Use the room-based connection flow with
@@ -1040,9 +1305,7 @@ class RTCClient:
         """
         # 1. Discover available workers (room-scoped for security)
         workers = await self.discover_workers(
-            room_id=room_id,
-            job_type="training",
-            **job_requirements
+            room_id=room_id, job_type="training", **job_requirements
         )
 
         if not workers:
@@ -1067,10 +1330,10 @@ class RTCClient:
             "dataset_info": {
                 "format": "slp",
                 "path": dataset_path,
-                "estimated_size_mb": dataset_size_mb
+                "estimated_size_mb": dataset_size_mb,
             },
             "config": config,
-            "requirements": job_requirements
+            "requirements": job_requirements,
         }
 
         # 3. Send job request to all discovered workers
@@ -1095,17 +1358,24 @@ class RTCClient:
             )
 
         # 5. Select best worker (e.g., fastest estimated time)
-        selected = min(accepted, key=lambda r: r.get("estimated_duration_minutes", 999999))
+        selected = min(
+            accepted, key=lambda r: r.get("estimated_duration_minutes", 999999)
+        )
 
-        logging.info(f"Selected worker: {selected['worker_id']} "
-                     f"(estimate: {selected['estimated_duration_minutes']} min)")
+        logging.info(
+            f"Selected worker: {selected['worker_id']} "
+            f"(estimate: {selected['estimated_duration_minutes']} min)"
+        )
 
         # 6. Send job assignment to selected worker
-        await self._send_peer_message(selected["worker_id"], {
-            "app_message_type": "job_assignment",
-            "job_id": job_id,
-            "initiate_connection": True
-        })
+        await self._send_peer_message(
+            selected["worker_id"],
+            {
+                "app_message_type": "job_assignment",
+                "job_id": job_id,
+                "initiate_connection": True,
+            },
+        )
 
         # Store job info for monitoring
         self.current_job_id = job_id
@@ -1124,7 +1394,6 @@ class RTCClient:
         Returns:
             None
         """
-
         # Log the current ICE connection state.
         logging.info(f"ICE connection state is now {self.pc.iceConnectionState}")
 
@@ -1134,12 +1403,19 @@ class RTCClient:
             logging.info("ICE connection established.")
             logging.info(f"reconnect attempts reset to {self.reconnect_attempts}")
 
-        elif self.pc.iceConnectionState in ["failed", "disconnected", "closed"] and not self.reconnecting:
-            logging.warning(f"ICE connection {self.pc.iceConnectionState}. Attempting reconnect...")
+        elif (
+            self.pc.iceConnectionState in ["failed", "disconnected", "closed"]
+            and not self.reconnecting
+        ):
+            logging.warning(
+                f"ICE connection {self.pc.iceConnectionState}. Attempting reconnect..."
+            )
             self.reconnecting = True
 
             if self.target_worker is None:
-                logging.info(f"No target worker available for reconnection. target_worker is {self.target_worker}.")
+                logging.info(
+                    f"No target worker available for reconnection. target_worker is {self.target_worker}."
+                )
                 await self.clean_exit()
                 return
 
@@ -1150,20 +1426,19 @@ class RTCClient:
                 await self.clean_exit()
                 return
 
-
     async def run_client(
-            self,
-            file_path: str = None,
-            output_dir: str = ".",
-            zmq_ports: list = None,
-            config_info_list: list = None,
-            session_string: str = None,
-            room_id: str = None,
-            token: str = None,
-            worker_id: str = None,
-            auto_select: bool = False,
-            min_gpu_memory: int = None
-        ):
+        self,
+        file_path: str = None,
+        output_dir: str = ".",
+        zmq_ports: list = None,
+        config_info_list: list = None,
+        session_string: str = None,
+        room_id: str = None,
+        token: str = None,
+        worker_id: str = None,
+        auto_select: bool = False,
+        min_gpu_memory: int = None,
+    ):
         """Sends initial SDP offer to worker peer and establishes both connection & datachannel to be used by both parties.
 
         Args:
@@ -1191,7 +1466,7 @@ class RTCClient:
             self.file_path = file_path
             self.output_dir = output_dir
             self.zmq_ports = zmq_ports
-            self.config_info_list = config_info_list # only passed if not CLI
+            self.config_info_list = config_info_list  # only passed if not CLI
 
             # Register event handlers for the data channel.
             channel.on("open", self.on_channel_open)
@@ -1199,22 +1474,22 @@ class RTCClient:
 
             # Initialize reconnect attempts.
             logging.info("Setting up RTC data channel reconnect attempts...")
-            self.reconnect_attempts = 0 
+            self.reconnect_attempts = 0
 
             # Sign-in anonymously with Cognito to get an ID token.
             sign_in_json = self.request_anonymous_signin()
-            id_token = sign_in_json['id_token']
-            self.peer_id = sign_in_json['username']
+            id_token = sign_in_json["id_token"]
+            self.peer_id = sign_in_json["username"]
             self.cognito_username = self.peer_id
 
             if not id_token:
                 logging.error("Failed to get anonymous ID token. Exiting client.")
                 return
-            
+
             logging.info(f"Anonymous ID token received: {id_token}")
 
             # No room creation needed for GUI Client since using Worker credentials.
-            # Only needs its own Cognito ID token and peer ID 
+            # Only needs its own Cognito ID token and peer ID
             # Create the room and get the room ID and token.
             # room_json = self.request_create_room(id_token)
             # logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
@@ -1231,18 +1506,24 @@ class RTCClient:
                 try:
                     # BRANCH 1: Session string (direct connection to specific worker)
                     if session_string:
-                        logging.info("Using session string for direct worker connection")
+                        logging.info(
+                            "Using session string for direct worker connection"
+                        )
 
                         # Prompt for session string if not provided
                         if not session_string:
                             session_str_json = None
                             while True:
-                                session_string = input("Please enter RTC session string (or type 'exit' to quit): ")
+                                session_string = input(
+                                    "Please enter RTC session string (or type 'exit' to quit): "
+                                )
                                 if session_string.lower() == "exit":
                                     print("Exiting client.")
                                     return
                                 try:
-                                    session_str_json = self.parse_session_string(session_string)
+                                    session_str_json = self.parse_session_string(
+                                        session_string
+                                    )
                                     break  # Exit loop if parsing succeeds
                                 except ValueError as e:
                                     print(f"Error: {e}")
@@ -1259,31 +1540,32 @@ class RTCClient:
                         await self._register_with_room(
                             room_id=worker_room_id,
                             token=worker_token,
-                            id_token=id_token
+                            id_token=id_token,
                         )
 
                         # Set target worker from session string
                         self.target_worker = worker_peer_id
-                        logging.info(f"Selected worker from session string: {self.target_worker}")
+                        logging.info(
+                            f"Selected worker from session string: {self.target_worker}"
+                        )
 
                     # BRANCH 2: Room-based discovery
                     elif room_id:
-                        logging.info(f"Using room-based worker discovery: room_id={room_id}")
+                        logging.info(
+                            f"Using room-based worker discovery: room_id={room_id}"
+                        )
 
                         # Store room info for discovery
                         self.current_room_id = room_id
 
                         # Register with room
                         await self._register_with_room(
-                            room_id=room_id,
-                            token=token,
-                            id_token=id_token
+                            room_id=room_id, token=token, id_token=id_token
                         )
 
                         # Discover workers in room
                         workers = await self._discover_workers_in_room(
-                            room_id=room_id,
-                            min_gpu_memory=min_gpu_memory
+                            room_id=room_id, min_gpu_memory=min_gpu_memory
                         )
 
                         if not workers:
@@ -1301,11 +1583,15 @@ class RTCClient:
                             logging.info(f"Auto-selected worker: {self.target_worker}")
                         else:
                             # Interactive worker selection
-                            self.target_worker = await self._prompt_worker_selection(workers)
+                            self.target_worker = await self._prompt_worker_selection(
+                                workers
+                            )
                             logging.info(f"User selected worker: {self.target_worker}")
 
                     else:
-                        logging.error("No connection method provided (session_string or room_id required)")
+                        logging.error(
+                            "No connection method provided (session_string or room_id required)"
+                        )
                         return
 
                     if not self.target_worker:
@@ -1314,13 +1600,17 @@ class RTCClient:
 
                     # Create and send SDP offer to worker peer.
                     await self.pc.setLocalDescription(await self.pc.createOffer())
-                    await websocket.send(json.dumps({
-                        'type': self.pc.localDescription.type, # type: 'offer'
-                        'sender': self.peer_id, # should be own peer_id (Zoom username)
-                        'target': self.target_worker, # should match Worker's peer_id (Zoom username)
-                        'sdp': self.pc.localDescription.sdp
-                    }))
-                    logging.info('Offer sent to worker')
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": self.pc.localDescription.type,  # type: 'offer'
+                                "sender": self.peer_id,  # should be own peer_id (Zoom username)
+                                "target": self.target_worker,  # should match Worker's peer_id (Zoom username)
+                                "sdp": self.pc.localDescription.sdp,
+                            }
+                        )
+                    )
+                    logging.info("Offer sent to worker")
 
                     # Wait for connection_task to complete (handles all incoming messages)
                     await connection_task

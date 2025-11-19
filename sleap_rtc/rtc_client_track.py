@@ -19,7 +19,7 @@ def run_RTCclient_track(
     worker_id: str = None,
     auto_select: bool = False,
     min_gpu_memory: int = None,
-    **kwargs
+    **kwargs,
 ) -> None:
     """Main entry point for remote inference client.
 
@@ -62,7 +62,7 @@ def run_RTCclient_track(
             data_path=data_path,
             model_paths=model_paths,
             output=output,
-            only_suggested_frames=only_suggested_frames
+            only_suggested_frames=only_suggested_frames,
         )
     except Exception as e:
         logger.error(f"Failed to create track package: {e}")
@@ -82,7 +82,7 @@ def run_RTCclient_track(
                 worker_id=worker_id,
                 auto_select=auto_select,
                 min_gpu_memory=min_gpu_memory,
-                **kwargs
+                **kwargs,
             )
         )
     except KeyboardInterrupt:
