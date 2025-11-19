@@ -21,14 +21,18 @@ def parse_training_script(training_script_path: str):
     return jobs
 
 
-async def run_all_training_jobs(channel: RTCDataChannel, train_script_path: str, save_dir: str):
+async def run_all_training_jobs(
+    channel: RTCDataChannel, train_script_path: str, save_dir: str
+):
     training_jobs = parse_training_script(train_script_path)
 
     for config_name, labels_name in training_jobs:
         job_name = Path(config_name).stem
 
         # Send RTC msg over channel to indicate job start.
-        logging.info(f"Starting training job: {job_name} with config: {config_name} and labels: {labels_name}")
+        logging.info(
+            f"Starting training job: {job_name} with config: {config_name} and labels: {labels_name}"
+        )
         channel.send(f"TRAIN_JOB_START::{job_name}")
 
         cmd = [
@@ -39,7 +43,7 @@ async def run_all_training_jobs(channel: RTCDataChannel, train_script_path: str,
             "--controller_port",
             "9000",
             "--publish_port",
-            "9001"
+            "9001",
         ]
         logging.info(f"[RUNNING] {' '.join(cmd)}")
 
@@ -47,7 +51,7 @@ async def run_all_training_jobs(channel: RTCDataChannel, train_script_path: str,
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=save_dir
+            cwd=save_dir,
         )
 
         assert process.stdout is not None
@@ -71,7 +75,9 @@ async def run_all_training_jobs(channel: RTCDataChannel, train_script_path: str,
             if channel.readyState == "open":
                 channel.send(f"TRAIN_END::{job_name}")
         else:
-            logging.warning(f"[FAILED] Job {job_name} exited with code {process.returncode}.")
+            logging.warning(
+                f"[FAILED] Job {job_name} exited with code {process.returncode}."
+            )
             if channel.readyState == "open":
                 channel.send(f"TRAIN_ERROR::{job_name}::{process.returncode}")
 
