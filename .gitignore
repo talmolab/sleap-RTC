@@ -213,3 +213,9 @@ CLAUDE.md
 
 # OpenSpec (local development proposals)
 openspec/
+
+# Test data and artifacts
+.DS_Store
+__MACOSX/
+*.training_job.zip
+labels.v9291.slp.training_job/
