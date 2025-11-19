@@ -8,12 +8,14 @@ from sleap_rtc.rtc_client import run_RTCclient
 from sleap_rtc.rtc_client_track import run_RTCclient_track
 import sys
 
+
 @click.group()
 def cli():
     pass
 
+
 def show_worker_help():
-    """Display """
+    """Display"""
     help_text = """
     sleap-rtc worker - Set this machine as a sleap-RTC worker node.
 
@@ -27,6 +29,7 @@ def show_worker_help():
         server.
     """
     click.echo(help_text)
+
 
 @cli.command()
 @click.option(
@@ -51,6 +54,7 @@ def worker(room_id, token):
         sys.exit(1)
 
     run_RTCworker(room_id=room_id, token=token)
+
 
 @cli.command(name="client-train")
 @click.option(
@@ -197,8 +201,9 @@ def client_train(**kwargs):
         session_string=session_string,
         pkg_path=kwargs.pop("pkg_path"),
         zmq_ports=kwargs.pop("zmq_ports"),
-        **kwargs
+        **kwargs,
     )
+
 
 @cli.command(name="client-track")
 @click.option(
@@ -348,16 +353,20 @@ def client_track(**kwargs):
         model_paths=list(kwargs.pop("model_paths")),
         output=kwargs.pop("output"),
         only_suggested_frames=kwargs.pop("only_suggested_frames"),
-        **kwargs
+        **kwargs,
     )
+
 
 # Deprecated alias for backward compatibility
 @cli.command(name="client", hidden=True)
 @click.pass_context
 def client_deprecated(ctx, **kwargs):
     """[DEPRECATED] Use 'client-train' instead."""
-    logger.warning("Warning: 'sleap-rtc client' is deprecated. Use 'sleap-rtc client-train' instead.")
+    logger.warning(
+        "Warning: 'sleap-rtc client' is deprecated. Use 'sleap-rtc client-train' instead."
+    )
     ctx.invoke(client_train, **kwargs)
+
 
 if __name__ == "__main__":
     cli()
