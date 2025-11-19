@@ -13,7 +13,7 @@ def run_RTCclient(
     worker_id: str = None,
     auto_select: bool = False,
     min_gpu_memory: int = None,
-    **kwargs
+    **kwargs,
 ):
     """Standalone function to run the RTC client with CLI arguments.
 
@@ -32,22 +32,25 @@ def run_RTCclient(
     client = RTCClient(
         DNS=None,  # Use config
         port_number="8080",
-        gui=False  # Indicate that this is running in CLI mode
+        gui=False,  # Indicate that this is running in CLI mode
     )
 
     # Map CLI arguments to method parameters
     method_kwargs = {
-        'file_path': pkg_path,
-        'output_dir': '.',
-        'zmq_ports': [zmq_ports.get('controller', 9000), zmq_ports.get('publish', 9001)],  # Convert dict to list
-        'config_info_list': None, # None since CLI (used for updating LossViewer)
-        'session_string': session_string,
+        "file_path": pkg_path,
+        "output_dir": ".",
+        "zmq_ports": [
+            zmq_ports.get("controller", 9000),
+            zmq_ports.get("publish", 9001),
+        ],  # Convert dict to list
+        "config_info_list": None,  # None since CLI (used for updating LossViewer)
+        "session_string": session_string,
         # Room-based connection parameters
-        'room_id': room_id,
-        'token': token,
-        'worker_id': worker_id,
-        'auto_select': auto_select,
-        'min_gpu_memory': min_gpu_memory,
+        "room_id": room_id,
+        "token": token,
+        "worker_id": worker_id,
+        "auto_select": auto_select,
+        "min_gpu_memory": min_gpu_memory,
     }
 
     # Add any additional kwargs
@@ -61,4 +64,3 @@ def run_RTCclient(
     except Exception as e:
         logging.error(f"Client error: {e}")
         raise
-
