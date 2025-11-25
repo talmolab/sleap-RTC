@@ -15,6 +15,7 @@ import zmq
 import socket
 import platform
 import time
+from typing import Optional
 
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
 
@@ -49,6 +50,15 @@ from sleap_rtc.worker.file_manager import FileManager
 from sleap_rtc.worker.job_coordinator import JobCoordinator
 from sleap_rtc.worker.state_manager import StateManager
 from sleap_rtc.worker.progress_reporter import ProgressReporter
+from sleap_rtc.worker.crdt_state import RoomStateCRDT
+from sleap_rtc.worker.admin_controller import AdminController
+from sleap_rtc.worker.mesh_coordinator import MeshCoordinator
+from sleap_rtc.worker.mesh_messages import (
+    MessageType,
+    deserialize_message,
+    serialize_message,
+    validate_message,
+)
 
 # Setup logging.
 logging.basicConfig(level=logging.INFO)
@@ -129,6 +139,32 @@ class RTCWorkerClient:
         self.room_token = None
         self.id_token = None  # Cognito ID token for authentication
 
+        # Mesh networking attributes (Phase 3-6)
+        self.cognito_username = None  # Set during run_worker
+        self.peer_id = None  # Our peer_id, set from signaling server
+        self.mesh_initialized = False
+        self.signaling_dns = None  # Signaling server DNS for mesh connections
+        self.admin_peer_id = None  # Current admin's peer_id
+        self.mesh_coordinator = None  # MeshCoordinator instance
+        self.admin_controller = None  # AdminController instance
+        self.room_state_crdt = None  # RoomStateCRDT instance
+        self.worker_connections = {}  # peer_id -> RTCPeerConnection for workers
+        self.client_connections = {}  # peer_id -> RTCPeerConnection for clients
+        self.data_channels = {}  # peer_id -> RTCDataChannel for mesh messaging
+
+        # Heartbeat attributes (Phase 4)
+        self.heartbeat_sequence = 0  # Sequence number for heartbeat messages
+        self.heartbeat_task = None  # Background task for sending heartbeats
+        self.heartbeat_check_task = None  # Background task for checking heartbeat timeouts
+        self.heartbeat_interval = 5.0  # Seconds between heartbeats
+        self.heartbeat_timeout = 15.0  # Seconds before peer is considered dead (3x interval)
+        self.last_heartbeat = {}  # peer_id -> last heartbeat timestamp
+
+        # Network partition recovery attributes (Phase 5)
+        self.partition_check_task = None  # Background task for partition detection
+        self.partition_check_interval = 30.0  # Seconds between partition checks
+        self.is_partitioned = False  # Whether we're currently in a network partition
+        self.partition_detected_at = None  # Timestamp when partition was detected
 
     async def clean_exit(self):
         """Handles cleanup and shutdown of the worker.
@@ -160,6 +196,1000 @@ class RTCWorkerClient:
             self.cognito_username = None
 
         logging.info("Client shutdown complete. Exiting...")
+
+    # ===== Connection Registry Methods (Phase 2) =====
+
+    def _get_connection_type(self, peer_id: str) -> str:
+        """Get the type of connection for a peer_id.
+
+        Returns:
+            "client", "worker", "admin", or "unknown"
+        """
+        if peer_id in self.worker_connections:
+            if peer_id == self.admin_peer_id:
+                return "admin"
+            return "worker"
+        elif peer_id in self.client_connections:
+            return "client"
+        return "unknown"
+
+    async def _handle_admin_disconnect(self, peer_id: str):
+        """Handle admin worker disconnect - trigger re-election.
+
+        Args:
+            peer_id: Admin worker's peer_id
+        """
+        logging.warning(f"Admin connection closed: {peer_id}")
+
+        # Remove from worker connections
+        if peer_id in self.worker_connections:
+            del self.worker_connections[peer_id]
+
+        # Track if we were admin before re-election
+        was_admin = self.admin_controller.is_admin if self.admin_controller else False
+
+        # Trigger re-election via AdminController (if available)
+        if self.admin_controller:
+            await self.admin_controller.handle_admin_departure(peer_id)
+
+            # Check if our admin status changed after re-election
+            is_now_admin = self.admin_controller.is_admin
+
+            # Handle admin promotion (non-admin -> admin)
+            if not was_admin and is_now_admin:
+                logging.info("Promoted to admin after re-election")
+                if self.mesh_coordinator:
+                    await self.mesh_coordinator.on_admin_promotion()
+
+            # Handle admin demotion (admin -> non-admin) - shouldn't happen in this flow
+            elif was_admin and not is_now_admin:
+                logging.info("Demoted from admin after re-election")
+                if self.mesh_coordinator:
+                    await self.mesh_coordinator.on_admin_demotion()
+        else:
+            logging.warning("AdminController not initialized, cannot trigger re-election")
+
+        self.admin_peer_id = None
+
+    async def _handle_worker_disconnect(self, peer_id: str):
+        """Handle non-admin worker disconnect.
+
+        Args:
+            peer_id: Worker's peer_id
+        """
+        logging.info(f"Worker peer disconnected: {peer_id}")
+
+        # Remove from worker connections
+        if peer_id in self.worker_connections:
+            del self.worker_connections[peer_id]
+
+        # Update CRDT and potentially trigger re-election
+        if self.admin_controller:
+            await self.admin_controller.handle_worker_departure(peer_id)
+        else:
+            logging.warning("AdminController not initialized, cannot handle worker departure")
+
+    async def _handle_client_disconnect(self, peer_id: str):
+        """Handle client disconnect - existing behavior.
+
+        Args:
+            peer_id: Client's peer_id
+        """
+        logging.info(f"Client disconnected: {peer_id}")
+
+        # Remove from client connections
+        if peer_id in self.client_connections:
+            del self.client_connections[peer_id]
+
+        # TODO: Add existing cleanup logic for client jobs
+        # (update status, clean up files, etc.)
+        # This will be integrated when we refactor existing client connection code
+
+    async def on_mesh_iceconnectionstatechange(self, peer_id: str, pc: RTCPeerConnection):
+        """Handle ICE connection state changes for mesh connections.
+
+        This is separate from on_iceconnectionstatechange which handles
+        the main client connection.
+
+        Args:
+            peer_id: The peer_id of the mesh connection
+            pc: The RTCPeerConnection for this mesh connection
+        """
+        ice_state = pc.iceConnectionState
+        logging.info(f"Mesh ICE state with {peer_id}: {ice_state}")
+
+        if self.shutting_down:
+            logging.info("Worker shutting down - ignoring mesh ICE state change")
+            return
+
+        # Success states
+        if ice_state in ["connected", "completed"]:
+            logging.info(f"Mesh connection established with {peer_id}")
+            return
+
+        # Negotiation states
+        if ice_state in ["checking", "new"]:
+            logging.debug(f"Mesh ICE {ice_state} with {peer_id}")
+            return
+
+        # Failure states - handle disconnect
+        if ice_state in ["closed", "failed", "disconnected"]:
+            logging.warning(f"Mesh connection {ice_state} with {peer_id}")
+
+            # Determine connection type and handle appropriately
+            conn_type = self._get_connection_type(peer_id)
+
+            if conn_type == "admin":
+                await self._handle_admin_disconnect(peer_id)
+            elif conn_type == "worker":
+                await self._handle_worker_disconnect(peer_id)
+            else:
+                logging.debug(f"Unknown peer {peer_id} disconnected")
+
+            # Clean up data channel
+            if peer_id in self.data_channels:
+                del self.data_channels[peer_id]
+
+            # Clean up heartbeat tracking
+            if peer_id in self.last_heartbeat:
+                del self.last_heartbeat[peer_id]
+
+    # ===== End Connection Registry Methods =====
+
+    # ===== Mesh Message Handling (Phase 4) =====
+
+    async def _handle_mesh_message(self, message_str: str, from_peer_id: str):
+        """Handle incoming mesh protocol message.
+
+        Routes message to appropriate handler based on type.
+
+        Args:
+            message_str: JSON string message
+            from_peer_id: Sender's peer_id
+        """
+        try:
+            # Deserialize message
+            message = deserialize_message(message_str)
+
+            # Validate message
+            if not validate_message(message):
+                logging.warning(f"Invalid mesh message from {from_peer_id}")
+                return
+
+            # Route by message type
+            msg_type = message.type
+
+            if msg_type == MessageType.STATUS_UPDATE.value:
+                await self._handle_status_update(message, from_peer_id)
+            elif msg_type == MessageType.STATE_BROADCAST.value:
+                await self._handle_state_broadcast(message, from_peer_id)
+            elif msg_type == MessageType.HEARTBEAT.value:
+                await self._handle_heartbeat(message, from_peer_id)
+            elif msg_type == MessageType.HEARTBEAT_RESPONSE.value:
+                await self._handle_heartbeat_response(message, from_peer_id)
+            elif msg_type == MessageType.QUERY_WORKERS.value:
+                await self._handle_query_workers(message, from_peer_id)
+            elif msg_type == MessageType.WORKER_LIST.value:
+                await self._handle_worker_list(message, from_peer_id)
+            elif msg_type == MessageType.PEER_JOINED.value:
+                await self._handle_peer_joined_notification(message, from_peer_id)
+            elif msg_type == MessageType.PEER_LEFT.value:
+                await self._handle_peer_left_notification(message, from_peer_id)
+            else:
+                logging.warning(f"Unknown mesh message type: {msg_type}")
+
+        except Exception as e:
+            logging.error(f"Error handling mesh message from {from_peer_id}: {e}")
+            logging.exception(e)
+
+    async def _handle_status_update(self, message, from_peer_id: str):
+        """Handle status update from worker (admin only).
+
+        Args:
+            message: StatusUpdateMessage
+            from_peer_id: Sender's peer_id
+        """
+        if not self.admin_controller or not self.admin_controller.is_admin:
+            logging.warning(f"Received status update but not admin: {from_peer_id}")
+            return
+
+        logging.info(
+            f"Received status update from {from_peer_id}: {message.status}"
+        )
+
+        # Update CRDT with new status
+        if self.room_state_crdt:
+            worker = self.room_state_crdt.get_worker(from_peer_id)
+            if worker:
+                # Update worker status in CRDT
+                self.room_state_crdt.update_worker_status(
+                    from_peer_id, message.status, message.current_job
+                )
+
+                # Broadcast updated state to all workers
+                await self._broadcast_state()
+            else:
+                logging.warning(f"Worker not found in CRDT: {from_peer_id}")
+
+    async def _handle_state_broadcast(self, message, from_peer_id: str):
+        """Handle state broadcast from admin (non-admin workers).
+
+        Args:
+            message: StateBroadcastMessage
+            from_peer_id: Admin's peer_id
+        """
+        if from_peer_id != self.admin_peer_id:
+            logging.warning(
+                f"Received state broadcast from non-admin: {from_peer_id}"
+            )
+            return
+
+        logging.debug(f"Received state broadcast from admin (version {message.version})")
+
+        # Merge CRDT snapshot
+        if self.room_state_crdt and message.crdt_snapshot:
+            try:
+                self.room_state_crdt.merge(message.crdt_snapshot)
+                logging.debug("CRDT state merged successfully")
+            except Exception as e:
+                logging.error(f"Failed to merge CRDT state: {e}")
+
+    async def _handle_heartbeat(self, message, from_peer_id: str):
+        """Handle heartbeat from peer.
+
+        Args:
+            message: HeartbeatMessage
+            from_peer_id: Sender's peer_id
+        """
+        # Update last heartbeat timestamp
+        self.last_heartbeat[from_peer_id] = message.timestamp
+        logging.debug(f"Heartbeat from {from_peer_id} (seq {message.sequence})")
+
+        # TODO: Send heartbeat response (optional, for RTT measurement)
+
+    async def _handle_heartbeat_response(self, message, from_peer_id: str):
+        """Handle heartbeat response from peer.
+
+        Args:
+            message: HeartbeatResponseMessage
+            from_peer_id: Sender's peer_id
+        """
+        # Calculate RTT (optional)
+        if message.original_timestamp:
+            rtt = message.timestamp - message.original_timestamp
+            logging.debug(f"RTT to {from_peer_id}: {rtt*1000:.2f}ms")
+
+    async def _handle_query_workers(self, message, from_peer_id: str):
+        """Handle worker query from client (admin only).
+
+        Args:
+            message: QueryWorkersMessage
+            from_peer_id: Client's peer_id
+        """
+        if not self.admin_controller or not self.admin_controller.is_admin:
+            logging.warning(f"Received query_workers but not admin: {from_peer_id}")
+            return
+
+        logging.info(f"Client {from_peer_id} querying workers with filters: {message.filters}")
+
+        # Use AdminController to handle query
+        if self.admin_controller:
+            # This will be implemented in AdminController
+            result = await self.admin_controller.handle_client_query(message.filters)
+            # TODO: Send response back to client
+            logging.debug(f"Query result: {result}")
+
+    async def _handle_worker_list(self, message, from_peer_id: str):
+        """Handle worker list response from admin (client side).
+
+        Args:
+            message: WorkerListMessage
+            from_peer_id: Admin's peer_id
+        """
+        logging.info(f"Received worker list from admin: {len(message.workers)} workers")
+        # This would be handled by client code
+        # Workers don't typically need to process this
+
+    async def _handle_peer_joined_notification(self, message, from_peer_id: str):
+        """Handle notification that peer joined (from admin).
+
+        Args:
+            message: PeerJoinedMessage
+            from_peer_id: Admin's peer_id
+        """
+        logging.info(f"Peer joined: {message.peer_id}")
+
+        # Add to CRDT if we have it
+        if self.room_state_crdt and message.metadata:
+            self.room_state_crdt.add_worker(message.peer_id, message.metadata)
+
+        # Optionally: establish connection to new peer
+        # (handled by MeshCoordinator in Phase 3)
+
+    async def _handle_peer_left_notification(self, message, from_peer_id: str):
+        """Handle notification that peer left (from admin).
+
+        Args:
+            message: PeerLeftMessage
+            from_peer_id: Admin's peer_id
+        """
+        logging.info(f"Peer left: {message.peer_id}")
+
+        # Remove from CRDT
+        if self.room_state_crdt:
+            self.room_state_crdt.remove_worker(message.peer_id)
+
+    async def _broadcast_state(self):
+        """Broadcast CRDT state to all workers (admin only).
+
+        Called when admin updates CRDT and needs to sync with workers.
+        """
+        if not self.admin_controller or not self.admin_controller.is_admin:
+            logging.warning("Cannot broadcast state: not admin")
+            return
+
+        if not self.room_state_crdt:
+            logging.warning("Cannot broadcast state: no CRDT")
+            return
+
+        logging.debug("Broadcasting state to all workers")
+
+        # Use AdminController to broadcast
+        await self.admin_controller.broadcast_state_update()
+
+    def _send_mesh_message_to_peer(self, peer_id: str, message):
+        """Send mesh message to specific peer via data channel.
+
+        Args:
+            peer_id: Target peer_id
+            message: Message object to send
+        """
+        # Check if we have data channel for peer
+        if peer_id not in self.data_channels:
+            logging.warning(f"Cannot send message to {peer_id}: no data channel")
+            return
+
+        data_channel = self.data_channels[peer_id]
+
+        # Check data channel state
+        if data_channel.readyState != "open":
+            logging.warning(
+                f"Cannot send message to {peer_id}: channel state is {data_channel.readyState}"
+            )
+            return
+
+        try:
+            # Serialize and send message
+            message_str = serialize_message(message)
+            data_channel.send(message_str)
+            logging.debug(f"Sent {message.type} to {peer_id}")
+        except Exception as e:
+            logging.error(f"Failed to send message to {peer_id}: {e}")
+
+    async def send_status_update(self, status: str, current_job=None):
+        """Send status update to admin.
+
+        If partitioned, queues update for later (read-only mode).
+
+        Args:
+            status: New status (available, busy, reserved, maintenance)
+            current_job: Current job info (optional)
+        """
+        # Phase 5: Read-only mode during partition
+        if self.is_partitioned:
+            logging.warning(
+                f"Partitioned: Queueing status update ({status}) for later"
+            )
+            self.pending_status_updates.append({
+                "status": status,
+                "current_job": current_job
+            })
+            return
+
+        if not self.admin_peer_id:
+            logging.debug("No admin to send status update to")
+            return
+
+        from sleap_rtc.worker.mesh_messages import create_status_update
+
+        message = create_status_update(self.peer_id, status, current_job)
+        self._send_mesh_message_to_peer(self.admin_peer_id, message)
+        logging.info(f"Sent status update to admin: {status}")
+
+    # ===== End Mesh Message Handling =====
+
+    # ===== Heartbeat Mechanism (Phase 4) =====
+
+    async def _heartbeat_loop(self):
+        """Send periodic heartbeats to all connected peers.
+
+        Runs in background, sends heartbeat every heartbeat_interval seconds.
+        """
+        logging.info(f"Starting heartbeat loop (interval: {self.heartbeat_interval}s)")
+
+        while not self.shutting_down:
+            try:
+                # Send heartbeat to all connected workers
+                for peer_id in list(self.worker_connections.keys()):
+                    await self._send_heartbeat(peer_id)
+
+                # Wait for next heartbeat
+                await asyncio.sleep(self.heartbeat_interval)
+
+            except asyncio.CancelledError:
+                logging.info("Heartbeat loop cancelled")
+                break
+            except Exception as e:
+                logging.error(f"Error in heartbeat loop: {e}")
+                await asyncio.sleep(self.heartbeat_interval)
+
+    async def _send_heartbeat(self, peer_id: str):
+        """Send heartbeat to specific peer.
+
+        Args:
+            peer_id: Target peer_id
+        """
+        from sleap_rtc.worker.mesh_messages import create_heartbeat
+
+        self.heartbeat_sequence += 1
+        message = create_heartbeat(self.peer_id, self.heartbeat_sequence)
+        self._send_mesh_message_to_peer(peer_id, message)
+        logging.debug(f"Sent heartbeat to {peer_id} (seq {self.heartbeat_sequence})")
+
+    async def _heartbeat_check_loop(self):
+        """Check for missing heartbeats and detect failed peers.
+
+        Runs in background, checks every heartbeat_interval seconds.
+        """
+        logging.info(f"Starting heartbeat check loop (timeout: {self.heartbeat_timeout}s)")
+
+        while not self.shutting_down:
+            try:
+                await self._check_heartbeat_timeouts()
+                await asyncio.sleep(self.heartbeat_interval)
+
+            except asyncio.CancelledError:
+                logging.info("Heartbeat check loop cancelled")
+                break
+            except Exception as e:
+                logging.error(f"Error in heartbeat check loop: {e}")
+                await asyncio.sleep(self.heartbeat_interval)
+
+    async def _check_heartbeat_timeouts(self):
+        """Check if any peers have timed out (3 missed heartbeats)."""
+        import time
+
+        current_time = time.time()
+
+        # Check each peer's last heartbeat
+        for peer_id in list(self.last_heartbeat.keys()):
+            last_beat = self.last_heartbeat.get(peer_id, 0)
+            time_since_beat = current_time - last_beat
+
+            # Timeout if no heartbeat for heartbeat_timeout seconds
+            if time_since_beat > self.heartbeat_timeout:
+                logging.warning(
+                    f"Heartbeat timeout for {peer_id}: {time_since_beat:.1f}s since last beat"
+                )
+
+                # Determine connection type and handle appropriately
+                connection_type = self._get_connection_type(peer_id)
+
+                if connection_type == "admin":
+                    logging.warning(f"Admin heartbeat timeout: {peer_id}")
+                    await self._handle_admin_disconnect(peer_id)
+                elif connection_type == "worker":
+                    logging.warning(f"Worker heartbeat timeout: {peer_id}")
+                    await self._handle_worker_disconnect(peer_id)
+
+                # Remove from heartbeat tracking
+                if peer_id in self.last_heartbeat:
+                    del self.last_heartbeat[peer_id]
+
+    def start_heartbeat_tasks(self):
+        """Start background heartbeat tasks.
+
+        Starts both heartbeat sending and heartbeat checking tasks.
+        """
+        if self.heartbeat_task is None or self.heartbeat_task.done():
+            self.heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            logging.info("Heartbeat sending task started")
+
+        if self.heartbeat_check_task is None or self.heartbeat_check_task.done():
+            self.heartbeat_check_task = asyncio.create_task(self._heartbeat_check_loop())
+            logging.info("Heartbeat checking task started")
+
+    async def stop_heartbeat_tasks(self):
+        """Stop background heartbeat tasks."""
+        if self.heartbeat_task:
+            self.heartbeat_task.cancel()
+            try:
+                await self.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            logging.info("Heartbeat sending task stopped")
+
+        if self.heartbeat_check_task:
+            self.heartbeat_check_task.cancel()
+            try:
+                await self.heartbeat_check_task
+            except asyncio.CancelledError:
+                pass
+            logging.info("Heartbeat checking task stopped")
+
+    # ===== End Heartbeat Mechanism =====
+
+    # ===== Partition Detection and Recovery (Phase 5) =====
+
+    def _detect_partition(self) -> bool:
+        """Detect if worker is partitioned from mesh.
+
+        Returns True if worker has lost connection to admin AND
+        connection to majority of workers.
+
+        Returns:
+            True if partitioned, False otherwise
+        """
+        # Can't be partitioned if no mesh initialized
+        if not self.room_state_crdt:
+            return False
+
+        # Get total workers from CRDT
+        all_workers = self.room_state_crdt.get_all_workers()
+        total_workers = len(all_workers)
+
+        if total_workers <= 1:
+            # Solo worker or just us - not partitioned
+            return False
+
+        # Count connected workers (excluding self)
+        connected_count = len([
+            peer_id for peer_id in self.worker_connections.keys()
+            if peer_id != self.peer_id
+        ])
+
+        # Check admin connection
+        has_admin = (
+            self.admin_peer_id
+            and self.admin_peer_id in self.worker_connections
+        )
+
+        # Calculate connectivity ratio
+        # Subtract 1 from total to exclude self
+        other_workers = total_workers - 1
+        connectivity = connected_count / other_workers if other_workers > 0 else 1.0
+
+        # Partitioned if:
+        # 1. Lost admin connection AND
+        # 2. Connected to less than 50% of workers
+        is_partitioned = not has_admin and connectivity < 0.5
+
+        if is_partitioned:
+            logging.warning(
+                f"Partition detected: admin={'present' if has_admin else 'lost'}, "
+                f"connectivity={connectivity:.1%} ({connected_count}/{other_workers})"
+            )
+
+        return is_partitioned
+
+    async def _partition_check_loop(self):
+        """Periodically check for network partition.
+
+        Runs in background, checks every partition_check_interval seconds.
+        """
+        logging.info(
+            f"Starting partition check loop (interval: {self.partition_check_interval}s)"
+        )
+
+        while not self.shutting_down:
+            try:
+                await self._check_partition_status()
+                await asyncio.sleep(self.partition_check_interval)
+
+            except asyncio.CancelledError:
+                logging.info("Partition check loop cancelled")
+                break
+            except Exception as e:
+                logging.error(f"Error in partition check loop: {e}")
+                await asyncio.sleep(self.partition_check_interval)
+
+    async def _check_partition_status(self):
+        """Check current partition status and handle transitions."""
+        was_partitioned = self.is_partitioned
+        is_now_partitioned = self._detect_partition()
+
+        # Partition state changed
+        if was_partitioned != is_now_partitioned:
+            if is_now_partitioned:
+                # Entered partition
+                await self._on_partition_detected()
+            else:
+                # Partition healed
+                await self._on_partition_recovered()
+
+        self.is_partitioned = is_now_partitioned
+
+    async def _on_partition_detected(self):
+        """Handle detection of network partition.
+
+        Enters read-only mode and starts retry attempts.
+        """
+        import time
+
+        self.partition_detected_at = time.time()
+        logging.warning(
+            "PARTITION DETECTED: Entering read-only mode. "
+            "Will use stale state until reconnection."
+        )
+
+        # Log partition details
+        self._log_connection_health()
+
+        # Start retry attempts for lost connections
+        await self._start_reconnection_attempts()
+
+    async def _on_partition_recovered(self):
+        """Handle partition recovery.
+
+        Requests state reconciliation and resumes normal operation.
+        """
+        import time
+
+        partition_duration = (
+            time.time() - self.partition_detected_at
+            if self.partition_detected_at
+            else 0
+        )
+
+        logging.info(
+            f"PARTITION RECOVERED after {partition_duration:.1f}s. "
+            "Reconciling state..."
+        )
+
+        # Request CRDT snapshot from admin
+        await self._request_crdt_snapshot()
+
+        # Flush pending status updates
+        await self._flush_pending_updates()
+
+        # Reset partition state
+        self.partition_detected_at = None
+
+        logging.info("State reconciliation complete. Resuming normal operation.")
+
+    async def _request_crdt_snapshot(self):
+        """Request full CRDT snapshot from admin for state reconciliation."""
+        if not self.admin_peer_id or self.admin_peer_id not in self.worker_connections:
+            logging.warning("Cannot request CRDT snapshot: admin not connected")
+            return
+
+        # TODO: Implement snapshot request message type
+        # For now, admin will send state_broadcast which we'll merge
+        logging.debug(f"Requesting CRDT snapshot from admin: {self.admin_peer_id}")
+
+    async def _flush_pending_updates(self):
+        """Send queued status updates after partition recovery."""
+        if not self.pending_status_updates:
+            return
+
+        logging.info(
+            f"Flushing {len(self.pending_status_updates)} pending status updates"
+        )
+
+        for update in self.pending_status_updates:
+            try:
+                await self.send_status_update(
+                    update.get("status"), update.get("current_job")
+                )
+            except Exception as e:
+                logging.error(f"Failed to send pending update: {e}")
+
+        self.pending_status_updates.clear()
+
+    async def _start_reconnection_attempts(self):
+        """Start reconnection attempts for lost connections."""
+        # Get list of workers we should be connected to
+        if not self.room_state_crdt:
+            return
+
+        all_workers = self.room_state_crdt.get_all_workers()
+
+        for peer_id in all_workers.keys():
+            if peer_id == self.peer_id:
+                continue  # Skip self
+
+            # Check if we're missing connection
+            if peer_id not in self.worker_connections:
+                logging.info(f"Starting reconnection attempts for {peer_id}")
+                # Start retry task
+                task = asyncio.create_task(
+                    self._retry_connection_with_backoff(peer_id)
+                )
+                self.retry_tasks[peer_id] = task
+
+    async def _retry_connection_with_backoff(
+        self, peer_id: str, max_attempts: int = 10
+    ):
+        """Retry connection to peer with exponential backoff.
+
+        Args:
+            peer_id: Peer to reconnect to
+            max_attempts: Maximum retry attempts
+        """
+        for attempt in range(max_attempts):
+            # Check if already reconnected
+            if peer_id in self.worker_connections:
+                logging.info(f"Already reconnected to {peer_id}")
+                return True
+
+            # Check if shutting down
+            if self.shutting_down:
+                return False
+
+            # Calculate delay with exponential backoff (cap at 32s)
+            delay = min(2**attempt, 32)
+
+            logging.info(
+                f"Reconnection attempt {attempt + 1}/{max_attempts} "
+                f"for {peer_id} in {delay}s"
+            )
+
+            await asyncio.sleep(delay)
+
+            # Attempt reconnection
+            try:
+                success = await self._attempt_reconnection(peer_id)
+                if success:
+                    logging.info(f"Successfully reconnected to {peer_id}")
+                    # Remove from retry tasks
+                    if peer_id in self.retry_tasks:
+                        del self.retry_tasks[peer_id]
+                    return True
+            except Exception as e:
+                logging.error(f"Reconnection attempt failed for {peer_id}: {e}")
+
+        logging.error(
+            f"Failed to reconnect to {peer_id} after {max_attempts} attempts"
+        )
+        # Remove from retry tasks
+        if peer_id in self.retry_tasks:
+            del self.retry_tasks[peer_id]
+        return False
+
+    async def _attempt_reconnection(self, peer_id: str) -> bool:
+        """Attempt to reconnect to a specific peer.
+
+        Args:
+            peer_id: Peer to reconnect to
+
+        Returns:
+            True if reconnection successful
+        """
+        if not self.mesh_coordinator:
+            return False
+
+        # Use MeshCoordinator to establish connection
+        if peer_id == self.admin_peer_id:
+            # Reconnecting to admin
+            return await self.mesh_coordinator.connect_to_admin(peer_id)
+        else:
+            # Reconnecting to worker
+            return await self.mesh_coordinator._connect_to_worker(peer_id)
+
+    def _log_connection_health(self):
+        """Log connection health metrics."""
+        if not self.room_state_crdt:
+            return
+
+        all_workers = self.room_state_crdt.get_all_workers()
+        total_peers = len(all_workers) - 1  # Exclude self
+
+        connected = len(self.worker_connections)
+        connectivity = connected / total_peers if total_peers > 0 else 1.0
+
+        has_admin = (
+            self.admin_peer_id and self.admin_peer_id in self.worker_connections
+        )
+
+        logging.info("=" * 60)
+        logging.info("MESH CONNECTION HEALTH")
+        logging.info("=" * 60)
+        logging.info(f"Total workers in room: {len(all_workers)}")
+        logging.info(f"Connected workers: {connected}/{total_peers} ({connectivity:.1%})")
+        logging.info(
+            f"Admin connection: {'✓ Connected' if has_admin else '✗ Disconnected'}"
+        )
+        logging.info(f"Partition status: {'✗ PARTITIONED' if self.is_partitioned else '✓ Healthy'}")
+
+        if self.is_partitioned and self.partition_detected_at:
+            import time
+
+            duration = time.time() - self.partition_detected_at
+            logging.info(f"Partition duration: {duration:.1f}s")
+
+        logging.info("=" * 60)
+
+    def start_partition_check_task(self):
+        """Start background partition check task."""
+        if self.partition_check_task is None or self.partition_check_task.done():
+            self.partition_check_task = asyncio.create_task(
+                self._partition_check_loop()
+            )
+            logging.info("Partition check task started")
+
+    async def stop_partition_check_task(self):
+        """Stop background partition check task."""
+        if self.partition_check_task:
+            self.partition_check_task.cancel()
+            try:
+                await self.partition_check_task
+            except asyncio.CancelledError:
+                pass
+            logging.info("Partition check task stopped")
+
+    # ===== End Partition Detection and Recovery =====
+
+    async def _notify_admin_status(self) -> None:
+        """Notify signaling server that this worker is now admin.
+
+        Sends a register message with is_admin=True so the signaling server
+        can track this worker as the admin and provide discovery info to
+        future workers joining the room.
+        """
+        if not self.websocket:
+            logging.warning("Cannot notify admin status: WebSocket not connected")
+            return
+
+        logging.info("Notifying signaling server of admin status...")
+
+        try:
+            # Get SLEAP version
+            try:
+                import sleap
+                sleap_version = sleap.__version__
+            except (ImportError, AttributeError):
+                sleap_version = "unknown"
+
+            # Send register message with is_admin=True
+            await self.websocket.send(
+                json.dumps(
+                    {
+                        "type": "register",
+                        "peer_id": self.peer_id,
+                        "room_id": self.room_id,
+                        "token": self.room_token,
+                        "id_token": self.id_token,
+                        "role": "worker",
+                        "is_admin": True,  # Declare admin status
+                        "metadata": {
+                            "tags": [
+                                "sleap-rtc",
+                                "training-worker",
+                                "inference-worker",
+                            ],
+                            "properties": {
+                                "gpu_memory_mb": self.gpu_memory_mb,
+                                "gpu_model": self.gpu_model,
+                                "sleap_version": sleap_version,
+                                "cuda_version": self.cuda_version,
+                                "hostname": socket.gethostname(),
+                                "status": self.status,
+                                "max_concurrent_jobs": self.max_concurrent_jobs,
+                                "supported_models": self.supported_models,
+                                "supported_job_types": self.supported_job_types,
+                            },
+                        },
+                    }
+                )
+            )
+            logging.info("Admin status notification sent to signaling server")
+
+        except Exception as e:
+            logging.error(f"Failed to notify admin status: {e}")
+
+    async def initialize_mesh(
+        self,
+        dns: str,
+        discovered_admin: Optional[str] = None,
+        discovered_peers: Optional[list] = None,
+        peer_metadata: Optional[dict] = None,
+    ):
+        """Initialize mesh networking components after registration.
+
+        This method:
+        1. Creates CRDT for room state
+        2. Adds discovered workers to CRDT (if provided by signaling server)
+        3. Initializes AdminController
+        4. Runs admin election
+        5. Initializes MeshCoordinator
+        6. Connects to mesh based on role (admin keeps WebSocket, non-admin connects then closes)
+
+        Args:
+            dns: Signaling server DNS for WebSocket reconnection
+            discovered_admin: Admin peer_id from signaling server (optional)
+            discovered_peers: List of peer_ids from signaling server (optional)
+            peer_metadata: Metadata dict for discovered peers (optional)
+        """
+        logging.info("Initializing mesh networking...")
+
+        try:
+            # 1. Create CRDT for room state
+            self.room_state_crdt = RoomStateCRDT.create(self.room_id)
+            logging.info(f"CRDT initialized for room: {self.room_id}")
+
+            # 2. Add discovered workers to CRDT first (from signaling server)
+            if discovered_peers and peer_metadata:
+                logging.info(f"Adding {len(discovered_peers)} discovered workers to CRDT")
+                for peer_id in discovered_peers:
+                    if peer_id != self.peer_id:  # Don't add ourselves yet
+                        metadata = peer_metadata.get(peer_id, {})
+                        is_admin = peer_id == discovered_admin
+                        self.room_state_crdt.add_worker(peer_id, metadata, is_admin=is_admin)
+                        logging.info(f"Added discovered worker: {peer_id} (admin: {is_admin})")
+
+            # 3. Add ourselves to CRDT
+            self.room_state_crdt.add_worker(
+                self.peer_id,
+                metadata={
+                    "tags": ["sleap-rtc", "training-worker", "inference-worker"],
+                    "properties": {
+                        "gpu_memory_mb": self.gpu_memory_mb,
+                        "gpu_model": self.gpu_model,
+                        "status": self.status,
+                    },
+                },
+            )
+            logging.info(f"Added self ({self.peer_id}) to CRDT")
+
+            # 3. Initialize AdminController
+            self.admin_controller = AdminController(self, self.room_state_crdt)
+            logging.info("AdminController initialized")
+
+            # 4. Run admin election
+            await self.admin_controller.run_election()
+            admin_peer_id = self.admin_controller.admin_peer_id
+            is_admin = self.admin_controller.is_admin
+            logging.info(
+                f"Admin election complete: {admin_peer_id} is admin (this worker: {is_admin})"
+            )
+
+            # 5. Initialize MeshCoordinator
+            self.mesh_coordinator = MeshCoordinator(
+                worker=self, admin_controller=self.admin_controller, batch_size=3
+            )
+            await self.mesh_coordinator.initialize(self.websocket, dns)
+            logging.info("MeshCoordinator initialized")
+
+            # 6. Connect to mesh based on role
+            if is_admin:
+                logging.info(
+                    "This worker is admin - keeping WebSocket open for discovery"
+                )
+                # Admin keeps WebSocket open (already open from registration)
+                # Note: Admin status already declared in initial registration
+            else:
+                logging.info("This worker is non-admin - connecting to admin")
+                # Non-admin: connect to admin, then close WebSocket
+                if admin_peer_id != self.peer_id:
+                    success = await self.mesh_coordinator.connect_to_admin(admin_peer_id)
+                    if success:
+                        logging.info(f"Successfully connected to admin: {admin_peer_id}")
+                        # Request list of other workers from admin
+                        # TODO: Implement peer list request
+                    else:
+                        logging.error(f"Failed to connect to admin: {admin_peer_id}")
+
+            # 7. Start heartbeat tasks (Phase 4)
+            self.start_heartbeat_tasks()
+
+            # 8. Start partition check task (Phase 5)
+            self.start_partition_check_task()
+
+            logging.info("Mesh networking initialization complete")
+
+        except Exception as e:
+            logging.error(f"Failed to initialize mesh networking: {e}")
+            logging.exception(e)
 
     async def handle_connection(
         self, pc: RTCPeerConnection, websocket: ClientConnection, peer_id: str
@@ -252,6 +1282,20 @@ class RTCWorkerClient:
                     token = data.get("token")
                     peer_id = data.get("peer_id")
 
+                    # Set peer_id on this worker instance
+                    self.peer_id = peer_id
+
+                    # Extract discovery info from signaling server (Phase 6)
+                    discovered_admin = data.get("admin_peer_id")
+                    discovered_peers = data.get("peer_list", [])
+                    peer_metadata = data.get("peer_metadata", {})
+
+                    # Log discovery info
+                    if discovered_admin:
+                        logging.info(f"Discovered admin from signaling server: {discovered_admin}")
+                    if discovered_peers:
+                        logging.info(f"Discovered {len(discovered_peers)} peers from signaling server: {discovered_peers}")
+
                     # Print session string for direct worker connection (backward compatibility)
                     logging.info("=" * 80)
                     logging.info("Worker authenticated with server")
@@ -276,6 +1320,52 @@ class RTCWorkerClient:
                         "Use room credentials with --room-id and --token for worker discovery"
                     )
                     logging.info("=" * 80)
+
+                    # Initialize mesh networking (Phase 3)
+                    if not self.mesh_initialized and self.signaling_dns:
+                        await self.initialize_mesh(
+                            self.signaling_dns,
+                            discovered_admin=discovered_admin,
+                            discovered_peers=discovered_peers,
+                            peer_metadata=peer_metadata,
+                        )
+                        self.mesh_initialized = True
+
+                # Phase 6: Handle mesh connection messages from signaling server
+                elif msg_type == "mesh_offer":
+                    # Admin receives connection offer from non-admin via signaling server
+                    if self.mesh_coordinator:
+                        await self.mesh_coordinator.handle_signaling_offer(data)
+                    else:
+                        logging.warning("Received mesh_offer but mesh not initialized")
+
+                elif msg_type == "mesh_answer":
+                    # Non-admin receives connection answer from admin via signaling server
+                    if self.mesh_coordinator:
+                        await self.mesh_coordinator.handle_signaling_answer(data)
+                    else:
+                        logging.warning("Received mesh_answer but mesh not initialized")
+
+                elif msg_type == "ice_candidate":
+                    # Relay ICE candidates for mesh connections
+                    if self.mesh_coordinator:
+                        await self.mesh_coordinator.handle_signaling_ice_candidate(data)
+                    else:
+                        logging.warning("Received ice_candidate but mesh not initialized")
+
+                elif msg_type == "admin_conflict":
+                    # Handle race condition: another worker is already admin
+                    current_admin = data.get("current_admin")
+                    logging.warning(
+                        f"Admin conflict: {current_admin} is already admin, "
+                        f"demoting ourselves to non-admin"
+                    )
+                    if self.admin_controller:
+                        self.admin_controller.is_admin = False
+                        self.admin_controller.admin_peer_id = current_admin
+                        # Close WebSocket if we opened it (we're not admin)
+                        if self.mesh_coordinator and self.mesh_coordinator.websocket:
+                            await self.mesh_coordinator.on_admin_demotion()
 
                 # Handle "trickle ICE" for non-local ICE candidates (might be unnecessary)
                 elif msg_type == "candidate":
@@ -746,6 +1836,9 @@ class RTCWorkerClient:
             logging.info(f"Setting RTCPeerConnection...")
             self.pc = pc
 
+            # Store signaling server DNS for mesh networking
+            self.signaling_dns = DNS
+
             # Register PeerConnection functions with PC object.
             logging.info(f"Registering PeerConnection functions...")
             self.pc.on("datachannel", self.on_datachannel)
@@ -848,6 +1941,7 @@ class RTCWorkerClient:
                             ],  # from backend API call for room joining (Zoom meeting password)
                             "id_token": id_token,  # from anon. Cognito sign-in (Prevent peer spoofing, even anonymously)
                             "role": "worker",  # NEW: worker role for discovery
+                            "is_admin": True,  # NEW: Optimistically claim admin (server will resolve conflicts)
                             "metadata": {  # NEW: worker capabilities and status
                                 "tags": [
                                     "sleap-rtc",
