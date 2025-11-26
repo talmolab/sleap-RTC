@@ -165,6 +165,8 @@ class RTCWorkerClient:
         self.partition_check_interval = 30.0  # Seconds between partition checks
         self.is_partitioned = False  # Whether we're currently in a network partition
         self.partition_detected_at = None  # Timestamp when partition was detected
+        self.retry_tasks = {}  # peer_id -> asyncio.Task for reconnection attempts
+        self.pending_status_updates = []  # Queued status updates during partition
 
     async def clean_exit(self):
         """Handles cleanup and shutdown of the worker.
@@ -814,6 +816,9 @@ class RTCWorkerClient:
         was_partitioned = self.is_partitioned
         is_now_partitioned = self._detect_partition()
 
+        # Update partition state BEFORE calling handlers so logs show correct status
+        self.is_partitioned = is_now_partitioned
+
         # Partition state changed
         if was_partitioned != is_now_partitioned:
             if is_now_partitioned:
@@ -822,8 +827,6 @@ class RTCWorkerClient:
             else:
                 # Partition healed
                 await self._on_partition_recovered()
-
-        self.is_partitioned = is_now_partitioned
 
     async def _on_partition_detected(self):
         """Handle detection of network partition.
@@ -1161,8 +1164,8 @@ class RTCWorkerClient:
             self.admin_controller = AdminController(self, self.room_state_crdt)
             logging.info("AdminController initialized")
 
-            # 4. Run admin election
-            await self.admin_controller.run_election()
+            # 4. Run admin election (skip verification since mesh not established yet)
+            await self.admin_controller.run_election(verify=False)
             admin_peer_id = self.admin_controller.admin_peer_id
             is_admin = self.admin_controller.is_admin
             logging.info(
@@ -1191,13 +1194,17 @@ class RTCWorkerClient:
                 # Note: Admin status already declared in initial registration
             else:
                 logging.info("This worker is non-admin - connecting to admin")
-                # Non-admin: connect to admin, then close WebSocket
+                # Non-admin: connect to admin via WebSocket signaling
+                # WebSocket is kept open intentionally to enable:
+                # 1. Reconnection to new admin if current admin leaves
+                # 2. Receiving notifications about new workers joining
+                # 3. Fallback signaling if mesh relay fails
                 if admin_peer_id != self.peer_id:
                     success = await self.mesh_coordinator.connect_to_admin(admin_peer_id)
                     if success:
                         logging.info(f"Successfully connected to admin: {admin_peer_id}")
-                        # Request list of other workers from admin
-                        # TODO: Implement peer list request
+                        # Admin will send peer list via data channel once connection is open
+                        # Worker will then connect to other workers via mesh relay
                     else:
                         logging.error(f"Failed to connect to admin: {admin_peer_id}")
 

@@ -46,6 +46,10 @@ MSG_MESH_ANSWER = "mesh_answer"
 MSG_MESH_ICE_CANDIDATE = "mesh_ice_candidate"
 MSG_MESH_PEER_LIST = "mesh_peer_list"
 
+# Admin verification message types (for election confirmation)
+MSG_ADMIN_VERIFY = "admin_verify"
+MSG_ADMIN_VERIFY_ACK = "admin_verify_ack"
+
 
 class MeshCoordinator:
     """Coordinates worker-to-worker mesh connections.
@@ -554,11 +558,128 @@ class MeshCoordinator:
             except Exception as e:
                 logger.error(f"Failed to send mesh message via admin: {e}")
 
+    async def _send_peer_list_to_worker(self, target_peer_id: str):
+        """Send list of connected peers to a newly connected worker.
+
+        Called by admin when a new worker's data channel opens.
+        Enables the new worker to establish connections to other workers.
+
+        Args:
+            target_peer_id: peer_id of the worker to send the list to
+        """
+        if not self.admin_controller.is_admin:
+            logger.debug("Not sending peer list: not admin")
+            return
+
+        # Get list of other connected workers (excluding self and target)
+        other_peers = [
+            pid for pid in self.connected_peers
+            if pid != self.worker.peer_id and pid != target_peer_id
+        ]
+
+        if not other_peers:
+            logger.info(f"No other peers to send to {target_peer_id}")
+            return
+
+        # Gather peer metadata from CRDT if available
+        peer_metadata = {}
+        if self.worker.room_state_crdt:
+            all_workers = self.worker.room_state_crdt.get_all_workers()
+            for pid in other_peers:
+                if pid in all_workers:
+                    worker_data = all_workers[pid]
+                    peer_metadata[pid] = worker_data.get("metadata", {})
+
+        # Send peer list message
+        message = {
+            "type": MSG_MESH_PEER_LIST,
+            "peer_ids": other_peers,
+            "peer_metadata": peer_metadata,
+        }
+
+        # Get data channel to target
+        if target_peer_id not in self.worker.data_channels:
+            logger.error(f"Cannot send peer list: no data channel to {target_peer_id}")
+            return
+
+        data_channel = self.worker.data_channels[target_peer_id]
+
+        if data_channel.readyState != "open":
+            logger.warning(
+                f"Cannot send peer list: channel to {target_peer_id} is {data_channel.readyState}"
+            )
+            return
+
+        try:
+            message_str = json.dumps(message)
+            data_channel.send(message_str)
+            logger.info(
+                f"Sent peer list to {target_peer_id}: {len(other_peers)} peers"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send peer list to {target_peer_id}: {e}")
+
+    async def _notify_existing_workers_of_new_peer(self, new_peer_id: str):
+        """Notify all existing workers that a new peer has joined.
+
+        Called by admin when a new worker connects. Enables existing workers
+        to proactively establish connections to the new peer.
+
+        Args:
+            new_peer_id: peer_id of the newly connected worker
+        """
+        if not self.admin_controller.is_admin:
+            logger.debug("Not notifying workers: not admin")
+            return
+
+        # Get new peer's metadata from CRDT if available
+        peer_metadata = {}
+        if self.worker.room_state_crdt:
+            all_workers = self.worker.room_state_crdt.get_all_workers()
+            if new_peer_id in all_workers:
+                peer_metadata = all_workers[new_peer_id].get("metadata", {})
+
+        # Create notification message
+        message = {
+            "type": MSG_MESH_PEER_JOINED,
+            "peer_id": new_peer_id,
+            "metadata": peer_metadata,
+        }
+
+        # Send to all existing connected workers (except the new one)
+        message_str = json.dumps(message)
+        notified_count = 0
+
+        for peer_id in self.connected_peers:
+            if peer_id == new_peer_id or peer_id == self.worker.peer_id:
+                continue
+
+            if peer_id not in self.worker.data_channels:
+                continue
+
+            data_channel = self.worker.data_channels[peer_id]
+            if data_channel.readyState != "open":
+                continue
+
+            try:
+                data_channel.send(message_str)
+                notified_count += 1
+            except Exception as e:
+                logger.error(f"Failed to notify {peer_id} of new peer: {e}")
+
+        if notified_count > 0:
+            logger.info(
+                f"Notified {notified_count} workers of new peer: {new_peer_id}"
+            )
+
     async def _relay_mesh_message(self, message: Dict[str, Any]):
         """Relay a mesh message to its destination (admin only).
 
+        Admin relays SDP offers/answers and ICE candidates between workers
+        who don't have direct connections yet.
+
         Args:
-            message: Message to relay
+            message: Message to relay (must have to_peer_id field)
         """
         if not self.admin_controller.is_admin:
             logger.warning("Cannot relay mesh message: not admin")
@@ -569,8 +690,27 @@ class MeshCoordinator:
             logger.error("Cannot relay message: no to_peer_id")
             return
 
-        # TODO: Implement message relay via data channels
-        logger.debug(f"Relaying mesh message to {to_peer_id}: {message['type']}")
+        # Get data channel to target peer
+        if to_peer_id not in self.worker.data_channels:
+            logger.error(f"Cannot relay message: no data channel to {to_peer_id}")
+            return
+
+        data_channel = self.worker.data_channels[to_peer_id]
+
+        if data_channel.readyState != "open":
+            logger.warning(
+                f"Cannot relay message to {to_peer_id}: channel state is {data_channel.readyState}"
+            )
+            return
+
+        try:
+            message_str = json.dumps(message)
+            data_channel.send(message_str)
+            logger.debug(
+                f"Relayed {message['type']} from {message.get('from_peer_id')} to {to_peer_id}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to relay message to {to_peer_id}: {e}")
 
     async def _handle_mesh_message(self, message: str, from_peer_id: str):
         """Handle incoming mesh signaling message.
@@ -594,6 +734,11 @@ class MeshCoordinator:
                 await self._handle_peer_joined(data)
             elif msg_type == MSG_MESH_PEER_LIST:
                 await self._handle_peer_list(data)
+            # Admin verification messages (election confirmation)
+            elif msg_type == MSG_ADMIN_VERIFY:
+                await self._handle_admin_verify(data, from_peer_id)
+            elif msg_type == MSG_ADMIN_VERIFY_ACK:
+                await self._handle_admin_verify_ack(data, from_peer_id)
             # Application-level messages (forward to worker)
             elif msg_type == "heartbeat":
                 await self._forward_to_worker_handler("heartbeat", data, from_peer_id)
@@ -777,14 +922,46 @@ class MeshCoordinator:
             logger.error(f"Failed to handle mesh answer: {e}")
 
     async def _handle_mesh_ice_candidate(self, data: Dict[str, Any], from_peer_id: str):
-        """Handle incoming ICE candidate.
+        """Handle incoming ICE candidate from another worker.
+
+        Adds the ICE candidate to the peer connection to help establish
+        the optimal network path between workers.
 
         Args:
-            data: ICE candidate data
+            data: ICE candidate data with candidate, sdpMLineIndex, sdpMid
             from_peer_id: peer_id of sender
         """
-        # TODO: Implement ICE candidate handling
-        logger.debug(f"Received ICE candidate from {from_peer_id}")
+        # Determine the actual peer this ICE candidate is for
+        # It could be relayed by admin, so check from_peer_id in the message
+        actual_from_peer_id = data.get("from_peer_id", from_peer_id)
+
+        logger.debug(f"Received ICE candidate from {actual_from_peer_id}")
+
+        # Get peer connection for this peer
+        if actual_from_peer_id not in self.worker.worker_connections:
+            logger.warning(
+                f"Received ICE candidate for unknown peer: {actual_from_peer_id}"
+            )
+            return
+
+        pc = self.worker.worker_connections[actual_from_peer_id]
+
+        try:
+            candidate_data = data.get("candidate", {})
+            if not candidate_data:
+                logger.debug("Received empty ICE candidate (end of candidates)")
+                return
+
+            candidate = RTCIceCandidate(
+                candidate=candidate_data.get("candidate"),
+                sdpMLineIndex=candidate_data.get("sdpMLineIndex"),
+                sdpMid=candidate_data.get("sdpMid"),
+            )
+            await pc.addIceCandidate(candidate)
+            logger.debug(f"Added ICE candidate from {actual_from_peer_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to add ICE candidate from {actual_from_peer_id}: {e}")
 
     async def _handle_peer_joined(self, data: Dict[str, Any]):
         """Handle notification that a new peer joined the room.
@@ -818,6 +995,95 @@ class MeshCoordinator:
         # Connect to all workers in batches
         if workers_to_connect:
             await self.connect_to_workers_batched(workers_to_connect)
+
+    async def _handle_admin_verify(self, data: Dict[str, Any], from_peer_id: str):
+        """Handle admin verification request.
+
+        When a worker asks us to confirm we're the admin (after election),
+        respond with an acknowledgment.
+
+        Args:
+            data: Verification request data
+            from_peer_id: peer_id of requesting worker
+        """
+        request_id = data.get("request_id")
+        logger.info(f"Received admin_verify from {from_peer_id} (request_id: {request_id})")
+
+        # Send acknowledgment back
+        ack_message = {
+            "type": MSG_ADMIN_VERIFY_ACK,
+            "from_peer_id": self.worker.peer_id,
+            "request_id": request_id,
+        }
+
+        # Send directly to the requesting peer
+        if from_peer_id in self.worker.data_channels:
+            data_channel = self.worker.data_channels[from_peer_id]
+            if data_channel.readyState == "open":
+                try:
+                    data_channel.send(json.dumps(ack_message))
+                    logger.info(f"Sent admin_verify_ack to {from_peer_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send admin_verify_ack: {e}")
+            else:
+                logger.warning(
+                    f"Cannot send admin_verify_ack: channel to {from_peer_id} is {data_channel.readyState}"
+                )
+        else:
+            logger.warning(f"Cannot send admin_verify_ack: no channel to {from_peer_id}")
+
+    async def _handle_admin_verify_ack(self, data: Dict[str, Any], from_peer_id: str):
+        """Handle admin verification acknowledgment.
+
+        When the elected admin confirms they're alive, notify the AdminController.
+
+        Args:
+            data: Acknowledgment data with request_id
+            from_peer_id: peer_id of the admin
+        """
+        request_id = data.get("request_id")
+        logger.info(f"Received admin_verify_ack from {from_peer_id} (request_id: {request_id})")
+
+        # Notify AdminController that verification succeeded
+        if self.admin_controller:
+            self.admin_controller.on_admin_verify_ack(from_peer_id, request_id)
+
+    async def send_admin_verify(self, target_peer_id: str, request_id: str) -> bool:
+        """Send admin verification request to a peer.
+
+        Called by AdminController after election to verify the elected admin is alive.
+
+        Args:
+            target_peer_id: peer_id of the elected admin to verify
+            request_id: Unique ID for this verification request
+
+        Returns:
+            True if message was sent, False otherwise
+        """
+        if target_peer_id not in self.worker.data_channels:
+            logger.warning(f"Cannot send admin_verify: no channel to {target_peer_id}")
+            return False
+
+        data_channel = self.worker.data_channels[target_peer_id]
+        if data_channel.readyState != "open":
+            logger.warning(
+                f"Cannot send admin_verify: channel to {target_peer_id} is {data_channel.readyState}"
+            )
+            return False
+
+        message = {
+            "type": MSG_ADMIN_VERIFY,
+            "from_peer_id": self.worker.peer_id,
+            "request_id": request_id,
+        }
+
+        try:
+            data_channel.send(json.dumps(message))
+            logger.info(f"Sent admin_verify to {target_peer_id} (request_id: {request_id})")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send admin_verify: {e}")
+            return False
 
     async def on_admin_promotion(self):
         """Handle this worker becoming admin.
@@ -974,6 +1240,9 @@ class MeshCoordinator:
                 @channel.on("open")
                 def on_open():
                     logger.info(f"Data channel open with {from_peer_id}")
+                    # Admin duties: send peer list to new worker and notify existing workers
+                    asyncio.create_task(self._send_peer_list_to_worker(from_peer_id))
+                    asyncio.create_task(self._notify_existing_workers_of_new_peer(from_peer_id))
 
                 @channel.on("close")
                 def on_close():
