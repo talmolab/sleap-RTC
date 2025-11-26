@@ -723,13 +723,32 @@ class MeshCoordinator:
             data = json.loads(message)
             msg_type = data.get("type")
 
+            # Check if this message should be relayed (admin only)
+            # Messages with to_peer_id != self should be forwarded to target
+            to_peer_id = data.get("to_peer_id")
+            if (
+                to_peer_id
+                and to_peer_id != self.worker.peer_id
+                and self.admin_controller.is_admin
+            ):
+                logger.debug(
+                    f"Relaying {msg_type} from {from_peer_id} to {to_peer_id}"
+                )
+                await self._relay_mesh_message(data)
+                return
+
             # Mesh signaling messages (WebRTC connection establishment)
+            # For relayed messages, use from_peer_id from message data (original sender)
+            # not from the data channel sender (which would be admin for relayed messages)
             if msg_type == MSG_MESH_OFFER:
-                await self._handle_mesh_offer(data, from_peer_id)
+                original_sender = data.get("from_peer_id", from_peer_id)
+                await self._handle_mesh_offer(data, original_sender)
             elif msg_type == MSG_MESH_ANSWER:
-                await self._handle_mesh_answer(data, from_peer_id)
+                original_sender = data.get("from_peer_id", from_peer_id)
+                await self._handle_mesh_answer(data, original_sender)
             elif msg_type == MSG_MESH_ICE_CANDIDATE:
-                await self._handle_mesh_ice_candidate(data, from_peer_id)
+                original_sender = data.get("from_peer_id", from_peer_id)
+                await self._handle_mesh_ice_candidate(data, original_sender)
             elif msg_type == MSG_MESH_PEER_JOINED:
                 await self._handle_peer_joined(data)
             elif msg_type == MSG_MESH_PEER_LIST:
@@ -860,6 +879,26 @@ class MeshCoordinator:
             @pc.on("iceconnectionstatechange")
             async def on_ice_state_change():
                 await self.worker.on_mesh_iceconnectionstatechange(from_peer_id, pc)
+
+            # Set ICE candidate handler - send candidates via mesh signaling (through admin)
+            @pc.on("icecandidate")
+            async def on_ice_candidate(event):
+                if event.candidate:
+                    await self._send_mesh_message(
+                        {
+                            "type": MSG_MESH_ICE_CANDIDATE,
+                            "from_peer_id": self.worker.peer_id,
+                            "to_peer_id": from_peer_id,
+                            "candidate": {
+                                "candidate": event.candidate.candidate,
+                                "sdpMLineIndex": event.candidate.sdpMLineIndex,
+                                "sdpMid": event.candidate.sdpMid,
+                            },
+                        }
+                    )
+                    logger.debug(
+                        f"Sent ICE candidate to {from_peer_id} via mesh signaling"
+                    )
 
             # Set remote description (offer)
             offer = RTCSessionDescription(
@@ -1228,7 +1267,8 @@ class MeshCoordinator:
             @pc.on("datachannel")
             def on_datachannel(channel):
                 logger.info(
-                    f"Received data channel from {from_peer_id}: {channel.label}"
+                    f"Received data channel from {from_peer_id}: {channel.label} "
+                    f"(state: {channel.readyState})"
                 )
 
                 # Store data channel IMMEDIATELY - don't wait for on_open
@@ -1236,13 +1276,23 @@ class MeshCoordinator:
                 self.worker.data_channels[from_peer_id] = channel
                 logger.info(f"Stored data channel for {from_peer_id}")
 
-                # Set up channel event handlers
-                @channel.on("open")
-                def on_open():
-                    logger.info(f"Data channel open with {from_peer_id}")
+                # Define admin duties to run when channel is ready
+                def do_admin_duties():
+                    logger.info(f"Data channel open with {from_peer_id}, sending peer list")
                     # Admin duties: send peer list to new worker and notify existing workers
                     asyncio.create_task(self._send_peer_list_to_worker(from_peer_id))
                     asyncio.create_task(self._notify_existing_workers_of_new_peer(from_peer_id))
+
+                # Set up channel event handlers
+                @channel.on("open")
+                def on_open():
+                    do_admin_duties()
+
+                # If channel is ALREADY open, fire admin duties immediately
+                # (on_open won't fire if channel opened before handler was registered)
+                if channel.readyState == "open":
+                    logger.info(f"Channel already open with {from_peer_id}, triggering admin duties")
+                    do_admin_duties()
 
                 @channel.on("close")
                 def on_close():

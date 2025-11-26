@@ -1360,6 +1360,20 @@ class RTCWorkerClient:
                         )
                         self.mesh_initialized = True
 
+                        # If admin, wait for admin WebSocket handler instead of continuing this loop
+                        # This prevents two coroutines from reading the same WebSocket
+                        if self.admin_controller and self.admin_controller.is_admin:
+                            logging.info(
+                                "Admin worker: waiting for admin WebSocket handler"
+                            )
+                            # Wait for the admin handler task to complete (keeps worker alive)
+                            if (
+                                self.mesh_coordinator
+                                and self.mesh_coordinator._admin_handler_task
+                            ):
+                                await self.mesh_coordinator._admin_handler_task
+                            return  # Exit after admin handler completes
+
                 # Phase 6: Handle mesh connection messages from signaling server
                 elif msg_type == "mesh_offer":
                     # Admin receives connection offer from non-admin via signaling server
