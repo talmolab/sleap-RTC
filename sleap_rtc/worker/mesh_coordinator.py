@@ -97,6 +97,9 @@ class MeshCoordinator:
         self.mesh_formation_in_progress = False
         self.connected_peers: set = set()  # Track successfully connected peers
 
+        # Admin WebSocket handler task
+        self._admin_handler_task: Optional[asyncio.Task] = None
+
     async def initialize(self, websocket: "ClientConnection", dns: str):
         """Initialize mesh coordinator with initial WebSocket connection.
 
@@ -127,9 +130,141 @@ class MeshCoordinator:
             logger.warning("Cannot start admin WebSocket handler: not admin")
             return
 
-        # TODO: Implement admin WebSocket message handling
-        # This will handle new worker connection requests
-        logger.debug("Admin WebSocket handler started")
+        # Cancel existing handler if any
+        if self._admin_handler_task and not self._admin_handler_task.done():
+            self._admin_handler_task.cancel()
+
+        # Start new handler task
+        self._admin_handler_task = asyncio.create_task(
+            self._admin_websocket_handler_loop()
+        )
+        logger.info("Admin WebSocket handler started")
+
+    async def _admin_websocket_handler_loop(self):
+        """Background task that handles WebSocket messages for admin.
+
+        This runs continuously while this worker is admin, processing:
+        - mesh_offer: New workers connecting via signaling server
+        - ice_candidate: ICE candidates for mesh connections
+        - offer: Client connection offers
+        - admin_conflict: Another worker claiming admin
+        - registered_auth: Registration confirmation
+        """
+        logger.info("Starting admin WebSocket handler loop")
+
+        try:
+            async for message in self.websocket:
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type")
+
+                    logger.debug(f"Admin received message: {msg_type}")
+
+                    if msg_type == "registered_auth":
+                        # Registration confirmed after admin promotion
+                        peer_id = data.get("peer_id")
+                        room_id = data.get("room_id")
+                        logger.info(
+                            f"Admin re-registration confirmed: {peer_id} in room {room_id}"
+                        )
+
+                    elif msg_type == "mesh_offer":
+                        # New worker connecting via signaling server
+                        logger.info(f"Admin received mesh_offer from {data.get('from_peer_id')}")
+                        await self.handle_signaling_offer(data)
+
+                    elif msg_type == "ice_candidate":
+                        # ICE candidate for mesh connection
+                        await self.handle_signaling_ice_candidate(data)
+
+                    elif msg_type == "offer":
+                        # Client connection offer - delegate to worker
+                        logger.info(f"Admin received client offer from {data.get('sender')}")
+                        await self._handle_client_offer(data)
+
+                    elif msg_type == "admin_conflict":
+                        # Another worker is already admin
+                        current_admin = data.get("current_admin")
+                        logger.warning(
+                            f"Admin conflict: {current_admin} is already admin, "
+                            f"demoting ourselves"
+                        )
+                        self.admin_controller.is_admin = False
+                        self.admin_controller.admin_peer_id = current_admin
+                        self.worker.admin_peer_id = current_admin
+                        # Close WebSocket since we're not admin
+                        await self.on_admin_demotion()
+                        return  # Exit handler loop
+
+                    elif msg_type == "error":
+                        logger.error(f"Admin received error: {data.get('reason')}")
+
+                    else:
+                        logger.debug(f"Admin ignoring message type: {msg_type}")
+
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON received in admin handler")
+                except Exception as e:
+                    logger.error(f"Error processing admin message: {e}")
+
+        except asyncio.CancelledError:
+            logger.info("Admin WebSocket handler cancelled")
+        except Exception as e:
+            logger.error(f"Admin WebSocket handler error: {e}")
+
+    async def _handle_client_offer(self, data: Dict[str, Any]):
+        """Handle client connection offer received on admin WebSocket.
+
+        Delegates to the worker's existing client handling logic.
+
+        Args:
+            data: Offer data from signaling server
+        """
+        from aiortc import RTCSessionDescription
+
+        sender = data.get("sender")
+        sdp = data.get("sdp")
+
+        logger.info(f"Admin handling client offer from {sender}")
+
+        # Check worker status before accepting
+        if self.worker.status in ["busy", "reserved"]:
+            logger.warning(f"Rejecting client {sender} - worker is {self.worker.status}")
+            await self.websocket.send(
+                json.dumps({
+                    "type": "error",
+                    "target": sender,
+                    "reason": "worker_busy",
+                    "message": f"Worker is currently {self.worker.status}",
+                    "current_status": self.worker.status,
+                })
+            )
+            return
+
+        # Update status to reserved
+        await self.worker.state_manager.update_status("reserved")
+        logger.info("Worker status updated to 'reserved'")
+
+        # Set remote description and create answer
+        await self.worker.pc.setRemoteDescription(
+            RTCSessionDescription(sdp=sdp, type="offer")
+        )
+        await self.worker.pc.setLocalDescription(await self.worker.pc.createAnswer())
+
+        # Send answer back to client
+        await self.websocket.send(
+            json.dumps({
+                "type": self.worker.pc.localDescription.type,
+                "sender": self.worker.peer_id,
+                "target": sender,
+                "sdp": self.worker.pc.localDescription.sdp,
+            })
+        )
+
+        logger.info(f"Admin sent answer to client {sender}")
+
+        # Clear received files for new connection
+        self.worker.received_files.clear()
 
     async def connect_to_admin(self, admin_peer_id: str) -> bool:
         """Connect to admin worker via signaling server.
@@ -702,7 +837,13 @@ class MeshCoordinator:
 
             self.websocket = await websockets.connect(self.websocket_dns)
 
-            # Re-register with server as admin
+            # CRITICAL: Sync websocket references so state_manager uses new connection
+            self.worker.websocket = self.websocket
+            if self.worker.state_manager:
+                self.worker.state_manager.websocket = self.websocket
+                logger.info("Updated state_manager websocket reference")
+
+            # Re-register with server as admin (include full metadata for discovery)
             await self.websocket.send(
                 json.dumps(
                     {
@@ -712,7 +853,19 @@ class MeshCoordinator:
                         "token": self.worker.room_token,
                         "id_token": self.worker.id_token,
                         "role": "worker",
-                        "is_admin": True,  # NEW: Signal admin status
+                        "is_admin": True,  # Signal admin status
+                        "metadata": {
+                            "tags": [
+                                "sleap-rtc",
+                                "training-worker",
+                                "inference-worker",
+                            ],
+                            "properties": {
+                                "gpu_memory_mb": self.worker.gpu_memory_mb,
+                                "gpu_model": self.worker.gpu_model,
+                                "status": self.worker.status,
+                            },
+                        },
                     }
                 )
             )
@@ -726,9 +879,20 @@ class MeshCoordinator:
     async def on_admin_demotion(self):
         """Handle this worker losing admin status.
 
-        Closes WebSocket connection since non-admin workers don't need it.
+        Cancels admin handler task and closes WebSocket since non-admin
+        workers don't need it.
         """
         logger.info("Worker demoted from admin - closing WebSocket")
+
+        # Cancel handler task first
+        if self._admin_handler_task and not self._admin_handler_task.done():
+            self._admin_handler_task.cancel()
+            try:
+                await self._admin_handler_task
+            except asyncio.CancelledError:
+                pass
+            self._admin_handler_task = None
+            logger.info("Admin handler task cancelled")
 
         if self.websocket:
             await self.websocket.close()
