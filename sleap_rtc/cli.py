@@ -46,14 +46,20 @@ def show_worker_help():
     required=False,
     help="Room token for authentication (required if --room-id is provided).",
 )
-def worker(room_id, token):
+@click.option(
+    "--shared-storage-root",
+    type=str,
+    required=False,
+    help="Path to shared storage root (NFS mount, etc.). If not set, uses SHARED_STORAGE_ROOT env var or falls back to RTC transfer.",
+)
+def worker(room_id, token, shared_storage_root):
     """Start the sleap-RTC worker node."""
     # Validate that both room_id and token are provided together
     if (room_id and not token) or (token and not room_id):
         logger.error("Both --room-id and --token must be provided together")
         sys.exit(1)
 
-    run_RTCworker(room_id=room_id, token=token)
+    run_RTCworker(room_id=room_id, token=token, shared_storage_root=shared_storage_root)
 
 
 @cli.command(name="client-train")
@@ -116,6 +122,12 @@ def worker(room_id, token):
     required=False,
     default=None,
     help="Minimum GPU memory in MB required for training.",
+)
+@click.option(
+    "--shared-storage-root",
+    type=str,
+    required=False,
+    help="Path to shared storage root (NFS mount, etc.). If not set, uses SHARED_STORAGE_ROOT env var or falls back to RTC transfer.",
 )
 def client_train(**kwargs):
     """Run remote training on a worker.
@@ -271,6 +283,12 @@ def client_train(**kwargs):
     required=False,
     default=None,
     help="Minimum GPU memory in MB required for inference.",
+)
+@click.option(
+    "--shared-storage-root",
+    type=str,
+    required=False,
+    help="Path to shared storage root (NFS mount, etc.). If not set, uses SHARED_STORAGE_ROOT env var or falls back to RTC transfer.",
 )
 def client_track(**kwargs):
     """Run remote inference on a worker with pre-trained models.

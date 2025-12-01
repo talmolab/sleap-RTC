@@ -59,10 +59,33 @@ class StateManager:
         # Worker state
         self.status = "available"
 
+        # Admin status callback - returns True if this worker is currently admin
+        # Set by worker after admin_controller is initialized
+        self._is_admin_callback = None
+
         # Room credentials (set during registration)
         self.room_id: Optional[str] = None
         self.room_token: Optional[str] = None
         self.id_token: Optional[str] = None
+
+    @property
+    def is_admin(self) -> bool:
+        """Check if this worker is currently the admin.
+
+        Uses callback to admin_controller for real-time status,
+        avoiding stale cached values.
+        """
+        if self._is_admin_callback:
+            return self._is_admin_callback()
+        return False
+
+    def set_admin_callback(self, callback):
+        """Set callback to check admin status.
+
+        Args:
+            callback: Callable that returns True if this worker is admin
+        """
+        self._is_admin_callback = callback
 
     async def update_status(self, status: str, **extra_properties):
         """Update worker status in signaling server.
@@ -108,37 +131,41 @@ class StateManager:
             sleap_version = "unknown"
 
         try:
+            # Build registration message
+            registration_msg = {
+                "type": "register",
+                "peer_id": self.worker_id,
+                "room_id": self.room_id,
+                "token": self.room_token,
+                "id_token": self.id_token,  # Required for authentication
+                "role": "worker",
+                "metadata": {
+                    "tags": [
+                        "sleap-rtc",
+                        "training-worker",
+                        "inference-worker",
+                    ],
+                    "properties": {
+                        "gpu_memory_mb": self.capabilities.gpu_memory_mb,
+                        "gpu_model": self.capabilities.gpu_model,
+                        "sleap_version": sleap_version,
+                        "cuda_version": self.capabilities.cuda_version,
+                        "hostname": socket.gethostname(),
+                        "status": self.status,
+                        "max_concurrent_jobs": self.max_concurrent_jobs,
+                        "supported_models": self.capabilities.supported_models,
+                        "supported_job_types": self.capabilities.supported_job_types,
+                    },
+                },
+            }
+
+            # Include is_admin if this worker is the admin
+            if self.is_admin:
+                registration_msg["is_admin"] = True
+                logging.info("Re-registering as admin worker")
+
             # Send full registration message (not just metadata update)
-            await self.websocket.send(
-                json.dumps(
-                    {
-                        "type": "register",
-                        "peer_id": self.worker_id,
-                        "room_id": self.room_id,
-                        "token": self.room_token,
-                        "id_token": self.id_token,  # Required for authentication
-                        "role": "worker",
-                        "metadata": {
-                            "tags": [
-                                "sleap-rtc",
-                                "training-worker",
-                                "inference-worker",
-                            ],
-                            "properties": {
-                                "gpu_memory_mb": self.capabilities.gpu_memory_mb,
-                                "gpu_model": self.capabilities.gpu_model,
-                                "sleap_version": sleap_version,
-                                "cuda_version": self.capabilities.cuda_version,
-                                "hostname": socket.gethostname(),
-                                "status": self.status,
-                                "max_concurrent_jobs": self.max_concurrent_jobs,
-                                "supported_models": self.capabilities.supported_models,
-                                "supported_job_types": self.capabilities.supported_job_types,
-                            },
-                        },
-                    }
-                )
-            )
+            await self.websocket.send(json.dumps(registration_msg))
             logging.info("Worker re-registered with signaling server")
         except Exception as e:
             logging.error(f"Failed to re-register worker: {e}")

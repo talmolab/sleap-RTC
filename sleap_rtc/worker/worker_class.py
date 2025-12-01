@@ -165,6 +165,8 @@ class RTCWorkerClient:
         self.partition_check_interval = 30.0  # Seconds between partition checks
         self.is_partitioned = False  # Whether we're currently in a network partition
         self.partition_detected_at = None  # Timestamp when partition was detected
+        self.retry_tasks = {}  # peer_id -> asyncio.Task for reconnection attempts
+        self.pending_status_updates = []  # Queued status updates during partition
 
     async def clean_exit(self):
         """Handles cleanup and shutdown of the worker.
@@ -232,6 +234,10 @@ class RTCWorkerClient:
         if self.admin_controller:
             await self.admin_controller.handle_admin_departure(peer_id)
 
+            # Update admin_peer_id from election result
+            self.admin_peer_id = self.admin_controller.admin_peer_id
+            logging.info(f"New admin after re-election: {self.admin_peer_id}")
+
             # Check if our admin status changed after re-election
             is_now_admin = self.admin_controller.is_admin
 
@@ -248,8 +254,7 @@ class RTCWorkerClient:
                     await self.mesh_coordinator.on_admin_demotion()
         else:
             logging.warning("AdminController not initialized, cannot trigger re-election")
-
-        self.admin_peer_id = None
+            self.admin_peer_id = None  # Only reset if no controller to handle re-election
 
     async def _handle_worker_disconnect(self, peer_id: str):
         """Handle non-admin worker disconnect.
@@ -263,9 +268,22 @@ class RTCWorkerClient:
         if peer_id in self.worker_connections:
             del self.worker_connections[peer_id]
 
+        # Track if we were admin before handling departure
+        was_admin = self.admin_controller.is_admin if self.admin_controller else False
+
         # Update CRDT and potentially trigger re-election
         if self.admin_controller:
             await self.admin_controller.handle_worker_departure(peer_id)
+
+            # Sync admin_peer_id with controller (may have changed if departed was admin)
+            self.admin_peer_id = self.admin_controller.admin_peer_id
+
+            # Check if our admin status changed (in case departed was misidentified as non-admin)
+            is_now_admin = self.admin_controller.is_admin
+            if not was_admin and is_now_admin:
+                logging.info("Promoted to admin after worker departure")
+                if self.mesh_coordinator:
+                    await self.mesh_coordinator.on_admin_promotion()
         else:
             logging.warning("AdminController not initialized, cannot handle worker departure")
 
@@ -798,6 +816,9 @@ class RTCWorkerClient:
         was_partitioned = self.is_partitioned
         is_now_partitioned = self._detect_partition()
 
+        # Update partition state BEFORE calling handlers so logs show correct status
+        self.is_partitioned = is_now_partitioned
+
         # Partition state changed
         if was_partitioned != is_now_partitioned:
             if is_now_partitioned:
@@ -806,8 +827,6 @@ class RTCWorkerClient:
             else:
                 # Partition healed
                 await self._on_partition_recovered()
-
-        self.is_partitioned = is_now_partitioned
 
     async def _on_partition_detected(self):
         """Handle detection of network partition.
@@ -1145,13 +1164,19 @@ class RTCWorkerClient:
             self.admin_controller = AdminController(self, self.room_state_crdt)
             logging.info("AdminController initialized")
 
-            # 4. Run admin election
-            await self.admin_controller.run_election()
+            # 4. Run admin election (skip verification since mesh not established yet)
+            await self.admin_controller.run_election(verify=False)
             admin_peer_id = self.admin_controller.admin_peer_id
             is_admin = self.admin_controller.is_admin
             logging.info(
                 f"Admin election complete: {admin_peer_id} is admin (this worker: {is_admin})"
             )
+
+            # 4b. Set admin status callback for real-time admin checks during re-registration
+            if self.state_manager:
+                self.state_manager.set_admin_callback(
+                    lambda: self.admin_controller.is_admin if self.admin_controller else False
+                )
 
             # 5. Initialize MeshCoordinator
             self.mesh_coordinator = MeshCoordinator(
@@ -1169,13 +1194,17 @@ class RTCWorkerClient:
                 # Note: Admin status already declared in initial registration
             else:
                 logging.info("This worker is non-admin - connecting to admin")
-                # Non-admin: connect to admin, then close WebSocket
+                # Non-admin: connect to admin via WebSocket signaling
+                # WebSocket is kept open intentionally to enable:
+                # 1. Reconnection to new admin if current admin leaves
+                # 2. Receiving notifications about new workers joining
+                # 3. Fallback signaling if mesh relay fails
                 if admin_peer_id != self.peer_id:
                     success = await self.mesh_coordinator.connect_to_admin(admin_peer_id)
                     if success:
                         logging.info(f"Successfully connected to admin: {admin_peer_id}")
-                        # Request list of other workers from admin
-                        # TODO: Implement peer list request
+                        # Admin will send peer list via data channel once connection is open
+                        # Worker will then connect to other workers via mesh relay
                     else:
                         logging.error(f"Failed to connect to admin: {admin_peer_id}")
 
@@ -1313,6 +1342,16 @@ class RTCWorkerClient:
                     logging.info(f"  Room ID: {room_id}")
                     logging.info(f"  Token:   {token}")
                     logging.info("")
+                    logging.info("Copy command for other workers to join:")
+                    logging.info(
+                        f"  sleap-rtc worker --room-id {room_id} --token {token}"
+                    )
+                    logging.info("")
+                    logging.info("OR Clients:")
+                    logging.info(
+                        f"  sleap-rtc client --room-id {room_id} --token {token}"
+                    )
+                    logging.info("")
                     logging.info(
                         "Use session string with --session-string for direct connection"
                     )
@@ -1330,6 +1369,20 @@ class RTCWorkerClient:
                             peer_metadata=peer_metadata,
                         )
                         self.mesh_initialized = True
+
+                        # If admin, wait for admin WebSocket handler instead of continuing this loop
+                        # This prevents two coroutines from reading the same WebSocket
+                        if self.admin_controller and self.admin_controller.is_admin:
+                            logging.info(
+                                "Admin worker: waiting for admin WebSocket handler"
+                            )
+                            # Wait for the admin handler task to complete (keeps worker alive)
+                            if (
+                                self.mesh_coordinator
+                                and self.mesh_coordinator._admin_handler_task
+                            ):
+                                await self.mesh_coordinator._admin_handler_task
+                            return  # Exit after admin handler completes
 
                 # Phase 6: Handle mesh connection messages from signaling server
                 elif msg_type == "mesh_offer":
@@ -1759,6 +1812,7 @@ class RTCWorkerClient:
             # Re-register with signaling server (not just update metadata)
             # This ensures the worker appears in discovery queries again
             self.status = "available"
+            self.state_manager.status = "available"  # Sync state_manager status!
             await self.state_manager.reregister_worker()
 
             logging.info("Ready for new client connection!")
@@ -1791,6 +1845,7 @@ class RTCWorkerClient:
 
             # Re-register with signaling server (not just update metadata)
             self.status = "available"
+            self.state_manager.status = "available"  # Sync state_manager status!
             await self.state_manager.reregister_worker()
 
             logging.info("Ready for new client connection!")
@@ -1814,6 +1869,7 @@ class RTCWorkerClient:
 
             # Re-register with signaling server (not just update metadata)
             self.status = "available"
+            self.state_manager.status = "available"  # Sync state_manager status!
             await self.state_manager.reregister_worker()
 
             logging.info("Ready for new client connection!")

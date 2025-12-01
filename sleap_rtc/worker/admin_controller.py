@@ -34,6 +34,9 @@ class AdminController:
         admin_peer_id: Current admin's peer_id
     """
 
+    # Timeout for admin verification (seconds)
+    ADMIN_VERIFY_TIMEOUT = 2.0
+
     def __init__(self, worker, crdt_state: RoomStateCRDT):
         """Initialize AdminController.
 
@@ -46,6 +49,10 @@ class AdminController:
         self.is_admin = False
         self.admin_peer_id: Optional[str] = None
         self._election_lock = asyncio.Lock()
+
+        # Admin verification tracking
+        self._pending_verifications: Dict[str, asyncio.Event] = {}
+        self._verification_counter = 0
 
     @staticmethod
     def elect_admin(workers: Dict[str, Dict[str, Any]]) -> str:
@@ -101,15 +108,89 @@ class AdminController:
 
         return elected_peer_id
 
-    async def run_election(self) -> str:
+    def on_admin_verify_ack(self, from_peer_id: str, request_id: str) -> None:
+        """Handle admin verification acknowledgment from MeshCoordinator.
+
+        Called when we receive an admin_verify_ack message confirming
+        the elected admin is alive.
+
+        Args:
+            from_peer_id: peer_id of the admin who responded
+            request_id: Request ID that was acknowledged
+        """
+        if request_id in self._pending_verifications:
+            event = self._pending_verifications[request_id]
+            event.set()
+            logger.debug(f"Admin verification succeeded for {from_peer_id} (request_id: {request_id})")
+        else:
+            logger.warning(f"Received unexpected admin_verify_ack (request_id: {request_id})")
+
+    async def verify_admin_alive(self, admin_peer_id: str) -> bool:
+        """Verify that the elected admin is alive and reachable.
+
+        Sends an admin_verify message and waits for acknowledgment.
+        Used after election to confirm the elected admin didn't leave
+        during the election process.
+
+        Args:
+            admin_peer_id: peer_id of the elected admin to verify
+
+        Returns:
+            True if admin responded within timeout, False otherwise
+        """
+        # Generate unique request ID
+        self._verification_counter += 1
+        request_id = f"{self.worker.peer_id}-{self._verification_counter}"
+
+        # Create event to wait for response
+        event = asyncio.Event()
+        self._pending_verifications[request_id] = event
+
+        try:
+            # Send verification request via MeshCoordinator
+            if not self.worker.mesh_coordinator:
+                logger.warning("Cannot verify admin: no MeshCoordinator")
+                return False
+
+            sent = await self.worker.mesh_coordinator.send_admin_verify(
+                admin_peer_id, request_id
+            )
+            if not sent:
+                logger.warning(f"Failed to send admin_verify to {admin_peer_id}")
+                return False
+
+            # Wait for acknowledgment with timeout
+            try:
+                await asyncio.wait_for(event.wait(), timeout=self.ADMIN_VERIFY_TIMEOUT)
+                logger.info(f"Admin {admin_peer_id} verified alive")
+                return True
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"Admin verification timed out for {admin_peer_id} "
+                    f"after {self.ADMIN_VERIFY_TIMEOUT}s"
+                )
+                return False
+
+        finally:
+            # Clean up pending verification
+            if request_id in self._pending_verifications:
+                del self._pending_verifications[request_id]
+
+    async def run_election(self, verify: bool = True) -> str:
         """Run admin election based on current CRDT state.
 
         This method:
         1. Checks if there's already an established admin in CRDT
         2. If admin exists and is still active, respect that admin
         3. Otherwise, runs election algorithm
-        4. Updates local state with election result
-        5. Updates CRDT admin_peer_id if changed
+        4. If elected admin is not self, verify they're alive (optional)
+        5. If verification fails, remove from CRDT and re-elect
+        6. Updates local state with election result
+        7. Updates CRDT admin_peer_id if changed
+
+        Args:
+            verify: If True, verify elected admin is alive before accepting.
+                    Set to False to skip verification (e.g., during initial setup).
 
         Returns:
             peer_id of the elected admin
@@ -136,6 +217,40 @@ class AdminController:
             else:
                 # No admin or admin departed - run full election
                 elected_peer_id = self.elect_admin(all_workers)
+
+            # Verify elected admin is alive (if not self and verification enabled)
+            if verify and elected_peer_id != self.worker.peer_id:
+                # Check if we have a connection to verify
+                if elected_peer_id in self.worker.worker_connections:
+                    # Release lock temporarily for async verification
+                    self._election_lock.release()
+                    try:
+                        is_alive = await self.verify_admin_alive(elected_peer_id)
+                    finally:
+                        await self._election_lock.acquire()
+
+                    if not is_alive:
+                        # Admin didn't respond - remove from CRDT and re-elect
+                        logger.warning(
+                            f"Elected admin {elected_peer_id} not responding, "
+                            f"removing from CRDT and re-electing"
+                        )
+                        self.crdt_state.remove_worker(elected_peer_id)
+
+                        # Re-run election without the unresponsive admin
+                        all_workers = self.crdt_state.get_all_workers()
+                        if not all_workers:
+                            raise ValueError(
+                                "Cannot run election: no workers after removing unresponsive admin"
+                            )
+                        elected_peer_id = self.elect_admin(all_workers)
+
+                        # If new election also picked someone else, verify again (recursive check)
+                        # Note: This could be a loop, but we limit it by removing workers
+                else:
+                    logger.debug(
+                        f"Skipping verification for {elected_peer_id}: no direct connection"
+                    )
 
             # Update local state
             old_admin = self.admin_peer_id

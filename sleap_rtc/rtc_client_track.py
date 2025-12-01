@@ -19,6 +19,7 @@ def run_RTCclient_track(
     worker_id: str = None,
     auto_select: bool = False,
     min_gpu_memory: int = None,
+    shared_storage_root: str = None,
     **kwargs,
 ) -> None:
     """Main entry point for remote inference client.
@@ -34,6 +35,8 @@ def run_RTCclient_track(
         worker_id: Specific worker peer-id to connect to (skips discovery)
         auto_select: Automatically select best worker by GPU memory
         min_gpu_memory: Minimum GPU memory in MB for worker filtering
+        shared_storage_root: Optional path to shared storage root. If not provided,
+            uses SHARED_STORAGE_ROOT env var or falls back to RTC transfer.
         **kwargs: Additional arguments passed to run_client
 
     Returns:
@@ -53,6 +56,7 @@ def run_RTCclient_track(
     client = RTCTrackClient(
         DNS=None,  # Use config
         port_number="8080",
+        shared_storage_root=shared_storage_root,
     )
 
     # Create track package
