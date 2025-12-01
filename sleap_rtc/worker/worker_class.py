@@ -1342,6 +1342,16 @@ class RTCWorkerClient:
                     logging.info(f"  Room ID: {room_id}")
                     logging.info(f"  Token:   {token}")
                     logging.info("")
+                    logging.info("Copy command for other workers to join:")
+                    logging.info(
+                        f"  sleap-rtc worker --room-id {room_id} --token {token}"
+                    )
+                    logging.info("")
+                    logging.info("OR Clients:")
+                    logging.info(
+                        f"  sleap-rtc client --room-id {room_id} --token {token}"
+                    )
+                    logging.info("")
                     logging.info(
                         "Use session string with --session-string for direct connection"
                     )
