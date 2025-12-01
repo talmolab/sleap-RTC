@@ -19,7 +19,8 @@ from websockets.client import ClientConnection
 import websockets
 import requests
 
-from sleap_rtc.config import get_config
+from sleap_rtc.config import get_config, SharedStorageConfig, SharedStorageConfigError
+from sleap_rtc.filesystem import safe_mkdir
 
 logging.basicConfig(level=logging.INFO)
 
@@ -39,6 +40,7 @@ class RTCTrackClient:
         self,
         DNS: Optional[str] = None,
         port_number: str = "8080",
+        shared_storage_root: Optional[str] = None,
     ):
         # Initialize RTC peer connection and websocket
         self.pc = RTCPeerConnection()
@@ -50,6 +52,23 @@ class RTCTrackClient:
         config = get_config()
         self.DNS = DNS if DNS is not None else config.signaling_websocket
         self.port_number = port_number
+
+        # Initialize shared storage configuration
+        try:
+            self.shared_storage_root = SharedStorageConfig.get_shared_storage_root(
+                cli_override=shared_storage_root
+            )
+            if self.shared_storage_root:
+                logging.info(f"Shared storage enabled: {self.shared_storage_root}")
+                # Create jobs directory in shared storage
+                self.shared_jobs_dir = self.shared_storage_root / "jobs"
+                safe_mkdir(self.shared_jobs_dir)
+            else:
+                logging.info("Shared storage not configured, will use RTC transfer")
+        except SharedStorageConfigError as e:
+            logging.error(f"Shared storage configuration error: {e}")
+            logging.info("Falling back to RTC transfer")
+            self.shared_storage_root = None
 
         # Inference-specific variables
         self.chunk_size = CHUNK_SIZE

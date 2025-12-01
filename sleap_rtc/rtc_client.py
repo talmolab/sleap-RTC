@@ -13,6 +13,7 @@ def run_RTCclient(
     worker_id: str = None,
     auto_select: bool = False,
     min_gpu_memory: int = None,
+    shared_storage_root: str = None,
     **kwargs,
 ):
     """Standalone function to run the RTC client with CLI arguments.
@@ -26,6 +27,8 @@ def run_RTCclient(
         worker_id: Specific worker peer-id to connect to (skips discovery)
         auto_select: Automatically select best worker by GPU memory
         min_gpu_memory: Minimum GPU memory in MB for worker filtering
+        shared_storage_root: Optional path to shared storage root. If not provided,
+            uses SHARED_STORAGE_ROOT env var or falls back to RTC transfer.
         **kwargs: Additional arguments passed to run_client
     """
     # Create client instance (DNS will be loaded from config)
@@ -33,6 +36,7 @@ def run_RTCclient(
         DNS=None,  # Use config
         port_number="8080",
         gui=False,  # Indicate that this is running in CLI mode
+        shared_storage_root=shared_storage_root,
     )
 
     # Map CLI arguments to method parameters
