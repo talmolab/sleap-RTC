@@ -247,6 +247,11 @@ class RTCWorkerClient:
                 if self.mesh_coordinator:
                     await self.mesh_coordinator.on_admin_promotion()
 
+                # Broadcast updated CRDT state to sync all workers
+                # (departed worker has been removed, new admin elected)
+                await self.admin_controller.broadcast_state_update()
+                logging.info("Broadcast CRDT state after admin promotion")
+
             # Handle admin demotion (admin -> non-admin) - shouldn't happen in this flow
             elif was_admin and not is_now_admin:
                 logging.info("Demoted from admin after re-election")
@@ -284,6 +289,11 @@ class RTCWorkerClient:
                 logging.info("Promoted to admin after worker departure")
                 if self.mesh_coordinator:
                     await self.mesh_coordinator.on_admin_promotion()
+
+            # If we're admin, broadcast updated CRDT to sync departed worker removal
+            if self.admin_controller.is_admin:
+                await self.admin_controller.broadcast_state_update()
+                logging.info("Broadcast CRDT state after worker departure")
         else:
             logging.warning("AdminController not initialized, cannot handle worker departure")
 
@@ -432,10 +442,14 @@ class RTCWorkerClient:
     async def _handle_state_broadcast(self, message, from_peer_id: str):
         """Handle state broadcast from admin (non-admin workers).
 
+        Merges CRDT state from admin and checks if election state needs updating.
+
         Args:
             message: StateBroadcastMessage
             from_peer_id: Admin's peer_id
         """
+        import base64
+
         if from_peer_id != self.admin_peer_id:
             logging.warning(
                 f"Received state broadcast from non-admin: {from_peer_id}"
@@ -444,13 +458,30 @@ class RTCWorkerClient:
 
         logging.debug(f"Received state broadcast from admin (version {message.version})")
 
-        # Merge CRDT snapshot
+        # Apply CRDT update
         if self.room_state_crdt and message.crdt_snapshot:
             try:
-                self.room_state_crdt.merge(message.crdt_snapshot)
-                logging.debug("CRDT state merged successfully")
+                # Check if this is a base64-encoded binary CRDT update
+                if isinstance(message.crdt_snapshot, dict) and "_crdt_b64" in message.crdt_snapshot:
+                    crdt_b64 = message.crdt_snapshot["_crdt_b64"]
+                    crdt_binary = base64.b64decode(crdt_b64)
+                    self.room_state_crdt.apply_update(crdt_binary)
+                    logging.debug("CRDT binary update applied successfully")
+                else:
+                    # Legacy: try to merge as dict (will fail, but log clearly)
+                    logging.error(
+                        "Received legacy dict snapshot instead of binary CRDT update. "
+                        "State synchronization may be incomplete."
+                    )
+                    return
+
+                # Check if admin status needs updating after merge
+                # This handles partition recovery and ensures consistent election
+                if self.admin_controller:
+                    await self.admin_controller.on_state_update()
+
             except Exception as e:
-                logging.error(f"Failed to merge CRDT state: {e}")
+                logging.error(f"Failed to apply CRDT update: {e}")
 
     async def _handle_heartbeat(self, message, from_peer_id: str):
         """Handle heartbeat from peer.

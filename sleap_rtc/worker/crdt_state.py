@@ -101,6 +101,17 @@ class RoomStateCRDT:
         update = other.doc.get_update()
         self.doc.apply_update(update)
 
+    def apply_update(self, update_bytes: bytes) -> None:
+        """Apply a binary CRDT update to this document.
+
+        This is used when receiving serialized updates from other workers.
+        pycrdt automatically handles conflict resolution.
+
+        Args:
+            update_bytes: Binary CRDT update (from serialize())
+        """
+        self.doc.apply_update(update_bytes)
+
     def _get_root(self) -> Optional[Map]:
         """Get the root state map."""
         return self.doc.get("state", type=Map)
