@@ -104,6 +104,9 @@ class MeshCoordinator:
         # Admin WebSocket handler task
         self._admin_handler_task: Optional[asyncio.Task] = None
 
+        # Non-admin WebSocket handler task (for post-demotion signaling)
+        self._non_admin_handler_task: Optional[asyncio.Task] = None
+
     async def initialize(self, websocket: "ClientConnection", dns: str):
         """Initialize mesh coordinator with initial WebSocket connection.
 
@@ -672,6 +675,58 @@ class MeshCoordinator:
                 f"Notified {notified_count} workers of new peer: {new_peer_id}"
             )
 
+    async def _do_admin_duties_async(self, new_peer_id: str, offer_data: Dict[str, Any]):
+        """Perform admin duties when a new worker connects.
+
+        This is called when a new worker's data channel opens with the admin.
+        Handles CRDT synchronization and mesh coordination.
+
+        Args:
+            new_peer_id: peer_id of the newly connected worker
+            offer_data: Original offer data which may contain worker metadata
+        """
+        try:
+            # 1. Extract metadata from offer data (signaling server should include it)
+            metadata = offer_data.get("metadata", {})
+            if not metadata:
+                # Fallback: create minimal metadata
+                logger.warning(f"No metadata in offer from {new_peer_id}, using defaults")
+                metadata = {
+                    "tags": ["sleap-rtc"],
+                    "properties": {"status": "available"},
+                }
+
+            # 2. Add new worker to admin's CRDT
+            if self.worker.room_state_crdt:
+                logger.info(f"Adding new worker {new_peer_id} to CRDT")
+                self.worker.room_state_crdt.add_worker(
+                    new_peer_id, metadata, is_admin=False
+                )
+
+                # Also update via AdminController for consistency
+                if self.admin_controller:
+                    # Note: We don't call handle_worker_joined because that would
+                    # trigger re-election, which we don't want for normal joins.
+                    # Re-election only happens if new worker has more GPU memory,
+                    # but we handle that separately.
+                    pass
+
+            # 3. Broadcast updated CRDT state to ALL workers (including the new one)
+            if self.admin_controller and self.admin_controller.is_admin:
+                logger.info("Broadcasting updated CRDT state to all workers")
+                await self.admin_controller.broadcast_state_update()
+
+            # 4. Send peer list to the new worker
+            await self._send_peer_list_to_worker(new_peer_id)
+
+            # 5. Notify existing workers about the new peer
+            await self._notify_existing_workers_of_new_peer(new_peer_id)
+
+            logger.info(f"Admin duties completed for new worker: {new_peer_id}")
+
+        except Exception as e:
+            logger.error(f"Failed to complete admin duties for {new_peer_id}: {e}")
+
     async def _relay_mesh_message(self, message: Dict[str, Any]):
         """Relay a mesh message to its destination (admin only).
 
@@ -1005,33 +1060,78 @@ class MeshCoordinator:
     async def _handle_peer_joined(self, data: Dict[str, Any]):
         """Handle notification that a new peer joined the room.
 
+        Updates local CRDT with new peer's info and establishes mesh connection.
+
         Args:
             data: Peer joined notification data
+                - peer_id: New worker's peer_id
+                - metadata: New worker's metadata (optional)
         """
         peer_id = data.get("peer_id")
+        if not peer_id:
+            logger.warning("peer_joined message missing peer_id")
+            return
+
         logger.info(f"New peer joined room: {peer_id}")
 
-        # If we're not in mesh formation, connect to new peer
+        # 1. Add new peer to local CRDT for consistent election state
+        metadata = data.get("metadata", {})
+        if not metadata:
+            # Use minimal defaults if no metadata provided
+            metadata = {
+                "tags": ["sleap-rtc"],
+                "properties": {"status": "available"},
+            }
+
+        if self.worker.room_state_crdt:
+            try:
+                self.worker.room_state_crdt.add_worker(peer_id, metadata, is_admin=False)
+                logger.info(f"Added new peer {peer_id} to local CRDT")
+            except Exception as e:
+                logger.error(f"Failed to add peer {peer_id} to CRDT: {e}")
+
+        # 2. Connect to new peer if we're not in initial mesh formation
         if not self.mesh_formation_in_progress:
             await self._connect_to_worker(peer_id)
 
     async def _handle_peer_list(self, data: Dict[str, Any]):
         """Handle list of existing peers in room.
 
+        Updates local CRDT with peer metadata and establishes mesh connections.
+
         Args:
             data: Peer list data
+                - peer_ids: List of peer IDs in the room
+                - peer_metadata: Dict mapping peer_id to metadata (optional)
         """
         peer_ids = data.get("peer_ids", [])
+        peer_metadata = data.get("peer_metadata", {})
         logger.info(f"Received peer list: {len(peer_ids)} workers")
 
-        # Filter out self and admin (already connected)
+        # 1. Add all peers to local CRDT for consistent election state
+        if self.worker.room_state_crdt:
+            for pid in peer_ids:
+                if pid != self.worker.peer_id:  # Don't add self
+                    metadata = peer_metadata.get(pid, {})
+                    if not metadata:
+                        metadata = {
+                            "tags": ["sleap-rtc"],
+                            "properties": {"status": "available"},
+                        }
+                    try:
+                        self.worker.room_state_crdt.add_worker(pid, metadata, is_admin=False)
+                        logger.debug(f"Added peer {pid} to local CRDT from peer list")
+                    except Exception as e:
+                        logger.error(f"Failed to add peer {pid} to CRDT: {e}")
+
+        # 2. Filter out self and admin (already connected) for mesh connections
         workers_to_connect = [
             pid
             for pid in peer_ids
             if pid != self.worker.peer_id and pid != self.worker.admin_peer_id
         ]
 
-        # Connect to all workers in batches
+        # 3. Connect to all workers in batches
         if workers_to_connect:
             await self.connect_to_workers_batched(workers_to_connect)
 
@@ -1182,14 +1282,18 @@ class MeshCoordinator:
             logger.error(f"Failed to open admin WebSocket: {e}")
 
     async def on_admin_demotion(self):
-        """Handle this worker losing admin status.
+        """Handle this worker losing admin status due to conflict resolution.
 
-        Cancels admin handler task and closes WebSocket since non-admin
-        workers don't need it.
+        When another worker is already admin (split-brain resolution), this worker:
+        1. Cancels admin handler task
+        2. Closes admin WebSocket
+        3. Reopens WebSocket as non-admin
+        4. Connects to the actual admin
+        5. Starts non-admin signaling handler
         """
-        logger.info("Worker demoted from admin - closing WebSocket")
+        logger.info("Worker demoted from admin - reconnecting as non-admin")
 
-        # Cancel handler task first
+        # 1. Cancel admin handler task
         if self._admin_handler_task and not self._admin_handler_task.done():
             self._admin_handler_task.cancel()
             try:
@@ -1199,10 +1303,142 @@ class MeshCoordinator:
             self._admin_handler_task = None
             logger.info("Admin handler task cancelled")
 
+        # 2. Close admin WebSocket
         if self.websocket:
             await self.websocket.close()
             self.websocket = None
             logger.info("Admin WebSocket closed")
+
+        # 3. Reconnect as non-admin worker
+        actual_admin = self.admin_controller.admin_peer_id
+        if not actual_admin or actual_admin == self.worker.peer_id:
+            logger.error("Cannot reconnect: no valid admin peer_id")
+            return
+
+        try:
+            import websockets
+
+            if not self.websocket_dns:
+                logger.error("Cannot reconnect: no DNS stored")
+                return
+
+            logger.info(f"Reopening WebSocket to connect to admin: {actual_admin}")
+            self.websocket = await websockets.connect(self.websocket_dns)
+
+            # Sync websocket references
+            self.worker.websocket = self.websocket
+            if self.worker.state_manager:
+                self.worker.state_manager.websocket = self.websocket
+                logger.info("Updated state_manager websocket reference")
+
+            # 4. Re-register as non-admin worker
+            await self.websocket.send(
+                json.dumps(
+                    {
+                        "type": "register",
+                        "peer_id": self.worker.peer_id,
+                        "room_id": self.worker.room_id,
+                        "token": self.worker.room_token,
+                        "id_token": self.worker.id_token,
+                        "role": "worker",
+                        "is_admin": False,  # Not admin anymore
+                        "metadata": {
+                            "tags": [
+                                "sleap-rtc",
+                                "training-worker",
+                                "inference-worker",
+                            ],
+                            "properties": {
+                                "gpu_memory_mb": self.worker.gpu_memory_mb,
+                                "gpu_model": self.worker.gpu_model,
+                                "status": self.worker.status,
+                            },
+                        },
+                    }
+                )
+            )
+            logger.info("Re-registered as non-admin worker")
+
+            # 5. Start non-admin signaling handler (for mesh_answer, ice_candidate)
+            self._start_non_admin_websocket_handler()
+
+            # 6. Connect to actual admin
+            success = await self.connect_to_admin(actual_admin)
+            if success:
+                logger.info(f"Successfully connected to actual admin: {actual_admin}")
+            else:
+                logger.error(f"Failed to connect to actual admin: {actual_admin}")
+
+        except Exception as e:
+            logger.error(f"Failed to reconnect as non-admin: {e}")
+
+    def _start_non_admin_websocket_handler(self):
+        """Start background task to handle WebSocket signaling messages (non-admin).
+
+        Handles mesh_answer and ice_candidate messages for connection establishment
+        after demotion from admin status.
+        """
+        # Cancel existing handler if any
+        if self._non_admin_handler_task and not self._non_admin_handler_task.done():
+            self._non_admin_handler_task.cancel()
+
+        # Start new handler task
+        self._non_admin_handler_task = asyncio.create_task(
+            self._non_admin_websocket_handler_loop()
+        )
+        logger.info("Non-admin WebSocket handler started")
+
+    async def _non_admin_websocket_handler_loop(self):
+        """Background task that handles WebSocket messages for non-admin after demotion.
+
+        Processes signaling messages needed to establish connection to actual admin:
+        - mesh_answer: Connection answer from admin
+        - ice_candidate: ICE candidates for mesh connections
+        - registered_auth: Registration confirmation
+        - error: Error messages from signaling server
+        """
+        logger.info("Starting non-admin WebSocket handler loop")
+
+        try:
+            async for message in self.websocket:
+                try:
+                    data = json.loads(message)
+                    msg_type = data.get("type")
+
+                    if msg_type == "registered_auth":
+                        logger.info(
+                            f"Non-admin re-registration confirmed: {data.get('peer_id')} "
+                            f"in room {data.get('room_id')}"
+                        )
+
+                    elif msg_type == "mesh_answer":
+                        # Connection answer from admin
+                        await self.handle_signaling_answer(data)
+
+                    elif msg_type == "ice_candidate":
+                        # ICE candidates for mesh connection
+                        await self.handle_signaling_ice_candidate(data)
+
+                    elif msg_type == "worker_joined":
+                        # New worker notification (for future mesh expansion)
+                        peer_id = data.get("peer_id")
+                        logger.info(f"Worker joined notification: {peer_id}")
+
+                    elif msg_type == "error":
+                        logger.error(f"Non-admin received error: {data.get('reason')}")
+
+                    else:
+                        logger.debug(f"Non-admin ignoring message type: {msg_type}")
+
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON received in non-admin handler")
+                except Exception as e:
+                    logger.error(f"Error processing non-admin message: {e}")
+
+        except asyncio.CancelledError:
+            logger.info("Non-admin WebSocket handler cancelled")
+        except Exception as e:
+            logger.error(f"Non-admin WebSocket handler error: {e}")
 
     async def close_websocket_after_mesh_connection(self):
         """Close WebSocket after successfully connecting to mesh (non-admin only).
@@ -1278,10 +1514,13 @@ class MeshCoordinator:
 
                 # Define admin duties to run when channel is ready
                 def do_admin_duties():
-                    logger.info(f"Data channel open with {from_peer_id}, sending peer list")
-                    # Admin duties: send peer list to new worker and notify existing workers
-                    asyncio.create_task(self._send_peer_list_to_worker(from_peer_id))
-                    asyncio.create_task(self._notify_existing_workers_of_new_peer(from_peer_id))
+                    logger.info(f"Data channel open with {from_peer_id}, performing admin duties")
+                    # Admin duties:
+                    # 1. Add new worker to CRDT (critical for consistent election)
+                    # 2. Broadcast updated state to all workers
+                    # 3. Send peer list to new worker
+                    # 4. Notify existing workers of new peer
+                    asyncio.create_task(self._do_admin_duties_async(from_peer_id, data))
 
                 # Set up channel event handlers
                 @channel.on("open")

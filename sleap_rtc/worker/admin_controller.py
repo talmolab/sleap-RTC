@@ -386,6 +386,8 @@ class AdminController:
 
         Implemented in Phase 4.
         """
+        import base64
+
         if not self.is_admin:
             logger.warning("Cannot broadcast state: not admin")
             return
@@ -394,15 +396,19 @@ class AdminController:
         state = self.crdt_state.get_state()
         version = state.get("version", 0)
 
+        # Serialize CRDT to binary and base64 encode for JSON transport
+        crdt_binary = self.crdt_state.serialize()
+        crdt_b64 = base64.b64encode(crdt_binary).decode("utf-8")
+
         logger.debug(f"Broadcasting state update (version {version}) to all workers")
 
         # Import here to avoid circular dependency
         from sleap_rtc.worker.mesh_messages import create_state_broadcast, serialize_message
 
-        # Create broadcast message
+        # Create broadcast message with base64-encoded CRDT binary
         message = create_state_broadcast(
             from_peer_id=self.worker.peer_id,
-            crdt_snapshot=state,
+            crdt_snapshot={"_crdt_b64": crdt_b64},  # Wrap in dict with marker
             version=version
         )
 
