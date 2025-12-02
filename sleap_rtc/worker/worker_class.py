@@ -171,14 +171,25 @@ class RTCWorkerClient:
     async def clean_exit(self):
         """Handles cleanup and shutdown of the worker.
 
-        Args:
-            pc: RTCPeerConnection object
-            websocket: WebSocket connection object
+        If this worker is admin, broadcasts final CRDT state before closing
+        connections to ensure other workers have consistent state for re-election.
+
         Returns:
             None
         """
         # Set flag BEFORE closing connection & iceConnection state change triggers
         self.shutting_down = True
+
+        # If admin, broadcast final CRDT state before closing connections
+        # This ensures other workers have up-to-date state for re-election
+        if self.admin_controller and self.admin_controller.is_admin:
+            logging.info("Admin shutting down - broadcasting final CRDT state")
+            try:
+                await self.admin_controller.broadcast_state_update()
+                # Brief delay to ensure broadcast propagates before connections close
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logging.error(f"Failed to broadcast final CRDT state: {e}")
 
         logging.info("Closing WebRTC connection...")
         if self.pc:
