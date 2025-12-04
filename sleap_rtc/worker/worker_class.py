@@ -17,7 +17,7 @@ import platform
 import time
 from typing import Optional
 
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel, RTCConfiguration, RTCIceServer
 
 # from run_training import run_all_training_jobs
 from pathlib import Path
@@ -139,6 +139,10 @@ class RTCWorkerClient:
         self.room_token = None
         self.id_token = None  # Cognito ID token for authentication
 
+        # ICE server configuration (received from signaling server during registration)
+        self.ice_servers: list = []  # For client-worker connections (STUN + TURN)
+        self.mesh_ice_servers: list = []  # For worker-worker mesh connections (STUN only)
+
         # Mesh networking attributes (Phase 3-6)
         self.cognito_username = None  # Set during run_worker
         self.peer_id = None  # Our peer_id, set from signaling server
@@ -209,6 +213,56 @@ class RTCWorkerClient:
             self.cognito_username = None
 
         logging.info("Client shutdown complete. Exiting...")
+
+    # ===== RTCPeerConnection Factory Methods =====
+
+    def _create_peer_connection(self, for_mesh: bool = False) -> RTCPeerConnection:
+        """Create RTCPeerConnection with ICE servers from signaling server.
+
+        Args:
+            for_mesh: If True, use mesh_ice_servers (STUN only for worker-worker).
+                      If False, use ice_servers (STUN + TURN for client-worker).
+
+        Returns:
+            RTCPeerConnection configured with appropriate ICE servers.
+        """
+        ice_servers = self.mesh_ice_servers if for_mesh else self.ice_servers
+
+        if ice_servers:
+            # Build RTCConfiguration from ICE servers
+            ice_server_objects = []
+            for server in ice_servers:
+                ice_server_objects.append(RTCIceServer(**server))
+
+            config = RTCConfiguration(iceServers=ice_server_objects)
+            connection_type = "mesh" if for_mesh else "client"
+            logging.info(f"Creating RTCPeerConnection for {connection_type} with {len(ice_server_objects)} ICE server(s)")
+            pc = RTCPeerConnection(configuration=config)
+        else:
+            # Fallback to default (no ICE servers)
+            logging.warning("No ICE servers configured, using default RTCPeerConnection")
+            pc = RTCPeerConnection()
+
+        return pc
+
+    def _create_client_peer_connection(self) -> RTCPeerConnection:
+        """Create RTCPeerConnection for client connections (STUN + TURN).
+
+        Returns:
+            RTCPeerConnection configured for client-worker communication.
+        """
+        pc = self._create_peer_connection(for_mesh=False)
+        pc.on("datachannel", self.on_datachannel)
+        pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
+        return pc
+
+    def _create_mesh_peer_connection(self) -> RTCPeerConnection:
+        """Create RTCPeerConnection for mesh connections (STUN only).
+
+        Returns:
+            RTCPeerConnection configured for worker-worker mesh communication.
+        """
+        return self._create_peer_connection(for_mesh=True)
 
     # ===== Connection Registry Methods (Phase 2) =====
 
@@ -1361,6 +1415,17 @@ class RTCWorkerClient:
                     discovered_peers = data.get("peer_list", [])
                     peer_metadata = data.get("peer_metadata", {})
 
+                    # Extract ICE server configuration from signaling server
+                    # Note: ICE servers are stored for potential reconnections and mesh connections.
+                    # For client-worker connections, only the CLIENT needs TURN configured -
+                    # the worker can connect to the client's relay candidate without TURN credentials.
+                    self.ice_servers = data.get("ice_servers", [])
+                    self.mesh_ice_servers = data.get("mesh_ice_servers", [])
+                    if self.ice_servers:
+                        logging.info(f"Received {len(self.ice_servers)} ICE server(s) for client connections")
+                    if self.mesh_ice_servers:
+                        logging.info(f"Received {len(self.mesh_ice_servers)} ICE server(s) for mesh connections")
+
                     # Log discovery info
                     if discovered_admin:
                         logging.info(f"Discovered admin from signaling server: {discovered_admin}")
@@ -1841,10 +1906,8 @@ class RTCWorkerClient:
             # Close old peer connection
             await self.pc.close()
 
-            # Create new peer connection
-            self.pc = RTCPeerConnection()
-            self.pc.on("datachannel", self.on_datachannel)
-            self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
+            # Create new peer connection with ICE servers
+            self.pc = self._create_client_peer_connection()
 
             # Clear the job state
             if self.job_coordinator:
@@ -1875,10 +1938,8 @@ class RTCWorkerClient:
             logging.error("Reconnection timed out. Closing connection.")
             await self.pc.close()
 
-            # Create new peer connection
-            self.pc = RTCPeerConnection()
-            self.pc.on("datachannel", self.on_datachannel)
-            self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
+            # Create new peer connection with ICE servers
+            self.pc = self._create_client_peer_connection()
 
             # Clear the job state
             if self.job_coordinator:
@@ -1899,10 +1960,8 @@ class RTCWorkerClient:
             # Close old peer connection
             await self.pc.close()
 
-            # Create new peer connection
-            self.pc = RTCPeerConnection()
-            self.pc.on("datachannel", self.on_datachannel)
-            self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
+            # Create new peer connection with ICE servers
+            self.pc = self._create_client_peer_connection()
 
             # Clear the job state
             if self.job_coordinator:

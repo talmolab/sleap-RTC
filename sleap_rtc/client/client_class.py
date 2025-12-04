@@ -13,7 +13,7 @@ import zmq
 import platform
 import time
 
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel, RTCConfiguration, RTCIceServer
 from functools import partial
 from pathlib import Path
 from typing import List, Optional, Text, Tuple
@@ -64,10 +64,13 @@ class RTCClient:
         shared_storage_root: Optional[str] = None,
     ):
         # Initialize RTC peer connection and websocket.
-        self.pc = RTCPeerConnection()
+        # Note: RTCPeerConnection is created later in run_client after receiving ICE servers
+        self.pc: RTCPeerConnection = None
         self.websocket: ClientConnection = None
         self.data_channel: RTCDataChannel = None
-        self.pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
+
+        # ICE server configuration (received from signaling server during registration)
+        self.ice_servers: list = []
 
         # Initialize given parameters.
         # Use config if DNS not provided via CLI
@@ -1034,6 +1037,12 @@ class RTCClient:
                 logging.info(
                     f"Client {self.peer_id} successfully registered with room {room_id}"
                 )
+                # Store ICE servers from signaling server response
+                self.ice_servers = response.get("ice_servers", [])
+                if self.ice_servers:
+                    logging.info(f"Received {len(self.ice_servers)} ICE server(s) from signaling server")
+                else:
+                    logging.warning("No ICE servers received from signaling server")
             else:
                 logging.warning(f"Unexpected registration response: {response}")
         except asyncio.TimeoutError:
@@ -1426,6 +1435,30 @@ class RTCClient:
                 await self.clean_exit()
                 return
 
+    def _create_peer_connection(self) -> RTCPeerConnection:
+        """Create RTCPeerConnection with ICE servers from signaling server.
+
+        Returns:
+            RTCPeerConnection configured with ICE servers.
+        """
+        if self.ice_servers:
+            # Build RTCConfiguration from ICE servers
+            ice_server_objects = []
+            for server in self.ice_servers:
+                ice_server_objects.append(RTCIceServer(**server))
+
+            config = RTCConfiguration(iceServers=ice_server_objects)
+            logging.info(f"Creating RTCPeerConnection with {len(ice_server_objects)} ICE server(s)")
+            pc = RTCPeerConnection(configuration=config)
+        else:
+            # Fallback to default (no ICE servers)
+            logging.warning("No ICE servers configured, using default RTCPeerConnection")
+            pc = RTCPeerConnection()
+
+        # Register ICE connection state change handler
+        pc.on("iceconnectionstatechange", self.on_iceconnectionstatechange)
+        return pc
+
     async def run_client(
         self,
         file_path: str = None,
@@ -1456,21 +1489,11 @@ class RTCClient:
             None
         """
         try:
-            # Initialize data channel.
-            channel = self.pc.createDataChannel("my-data-channel")
-            self.data_channel = channel
-            logging.info("channel(%s) %s" % (channel.label, "created by local party."))
-
-            # Set local variable
-            # self.win = win
+            # Set local variables (peer connection and data channel created after registration)
             self.file_path = file_path
             self.output_dir = output_dir
             self.zmq_ports = zmq_ports
             self.config_info_list = config_info_list  # only passed if not CLI
-
-            # Register event handlers for the data channel.
-            channel.on("open", self.on_channel_open)
-            channel.on("message", self.on_message)
 
             # Initialize reconnect attempts.
             logging.info("Setting up RTC data channel reconnect attempts...")
@@ -1488,16 +1511,10 @@ class RTCClient:
 
             logging.info(f"Anonymous ID token received: {id_token}")
 
-            # No room creation needed for GUI Client since using Worker credentials.
-            # Only needs its own Cognito ID token and peer ID
-            # Create the room and get the room ID and token.
-            # room_json = self.request_create_room(id_token)
-            # logging.info(f"Room created with ID: {room_json['room_id']} and token: {room_json['token']}")
-
-            # Initate the WebSocket connection to the signaling server.
+            # Initiate the WebSocket connection to the signaling server.
             async with websockets.connect(self.DNS) as websocket:
 
-                # Initate the websocket for the GUI client (so other functions can use).
+                # Initiate the websocket for the GUI client (so other functions can use).
                 self.websocket = websocket
 
                 # START handle_connection as background task to route messages to queues
@@ -1597,6 +1614,18 @@ class RTCClient:
                     if not self.target_worker:
                         logging.info("No target worker given. Cannot connect.")
                         return
+
+                    # Create RTCPeerConnection with ICE servers (received during registration)
+                    self.pc = self._create_peer_connection()
+
+                    # Initialize data channel
+                    channel = self.pc.createDataChannel("my-data-channel")
+                    self.data_channel = channel
+                    logging.info("channel(%s) %s" % (channel.label, "created by local party."))
+
+                    # Register event handlers for the data channel
+                    channel.on("open", self.on_channel_open)
+                    channel.on("message", self.on_message)
 
                     # Create and send SDP offer to worker peer.
                     await self.pc.setLocalDescription(await self.pc.createOffer())
