@@ -24,9 +24,9 @@ from loguru import logger
 
 # Default production signaling server URLs
 DEFAULT_SIGNALING_WEBSOCKET = (
-    "ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8080"
+    "ws://ec2-52-9-213-137.us-west-1.compute.amazonaws.com:8080"
 )
-DEFAULT_SIGNALING_HTTP = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001"
+DEFAULT_SIGNALING_HTTP = "http://ec2-52-9-213-137.us-west-1.compute.amazonaws.com:8001"
 
 # Valid environment names
 VALID_ENVIRONMENTS = {"development", "staging", "production"}
