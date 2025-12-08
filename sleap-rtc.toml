@@ -13,8 +13,8 @@ signaling_websocket = "ws://staging-server:8080"
 signaling_http = "http://staging-server:8001"
 
 [environments.production]
-signaling_websocket = "ws://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8080"
-signaling_http = "http://ec2-54-176-92-10.us-west-1.compute.amazonaws.com:8001"
+signaling_websocket = "ws://ec2-52-9-213-137.us-west-1.compute.amazonaws.com:8080"
+signaling_http = "http://ec2-52-9-213-137.us-west-1.compute.amazonaws.com:8001"
 
 # Note: Worker GPU ID and client timeout are configured via CLI arguments
 # gpu_id: Use --gpu_id flag when starting worker
