@@ -3,12 +3,24 @@
 This module provides utilities for working with shared filesystems (NFS, local mounts)
 using Python standard library. Future enhancement: Can integrate fsspec for cloud storage
 (S3, GCS, Azure) support.
+
+Key classes:
+- StorageResolver: Bridge between StorageConfig and filesystem operations
+- PathValidationError: Raised when path validation fails
+- SharedStorageError: Raised when storage operations fail
+
+Key functions:
+- validate_path_in_root: Security check for path traversal
+- safe_copy, safe_mkdir, safe_remove: Safe filesystem operations
 """
 
 import os
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    from sleap_rtc.config import StorageConfig
 
 
 class PathValidationError(Exception):
@@ -348,3 +360,259 @@ def get_disk_usage(path: Path) -> dict:
         }
     except OSError as e:
         raise SharedStorageError(f"Failed to get disk usage for '{path}': {e}") from e
+
+
+class StorageResolver:
+    """Bridge between StorageConfig and filesystem operations.
+
+    This class provides utilities for resolving paths between logical
+    (backend_name, user_subdir, relative_path) and absolute filesystem paths.
+    It's useful for:
+    - Converting user-provided paths to absolute paths for file operations
+    - Converting absolute paths back to logical paths for protocol messages
+    - Finding which backend an absolute path belongs to
+
+    Example:
+        >>> from sleap_rtc.config import get_config
+        >>> resolver = StorageResolver(get_config().storage)
+        >>>
+        >>> # Resolve logical path to absolute
+        >>> abs_path = resolver.resolve("vast", "user", "project/data.zip")
+        >>> # -> /mnt/vast/user/project/data.zip
+        >>>
+        >>> # Convert absolute path back to logical
+        >>> backend, user, rel = resolver.to_relative(abs_path)
+        >>> # -> ("vast", "user", "project/data.zip")
+    """
+
+    def __init__(self, storage_config: "StorageConfig") -> None:
+        """Initialize StorageResolver with a StorageConfig.
+
+        Args:
+            storage_config: The StorageConfig instance to use for resolution.
+        """
+        self._config = storage_config
+
+    @property
+    def config(self) -> "StorageConfig":
+        """Get the underlying StorageConfig."""
+        return self._config
+
+    def resolve(
+        self,
+        backend_name: str,
+        user_subdir: str,
+        relative_path: str,
+        validate: bool = True,
+    ) -> Path:
+        """Resolve a logical path to an absolute filesystem path.
+
+        Combines: backend.base_path / user_subdir / relative_path
+
+        Args:
+            backend_name: Name of the storage backend (e.g., "vast").
+            user_subdir: User's subdirectory (e.g., "amick").
+            relative_path: Path relative to user's directory (e.g., "project/data.zip").
+            validate: If True, validate that the path stays within the backend's
+                base_path (prevents path traversal). Default: True.
+
+        Returns:
+            Absolute path on the local filesystem.
+
+        Raises:
+            StorageBackendNotFoundError: If backend doesn't exist.
+            PathValidationError: If validate=True and path escapes base_path.
+
+        Example:
+            >>> path = resolver.resolve("vast", "user", "project/data.zip")
+            PosixPath('/mnt/vast/user/project/data.zip')
+        """
+        # Import here to avoid circular dependency
+        from sleap_rtc.config import StoragePathValidationError
+
+        if validate:
+            path = self._config.validate_and_resolve_path(
+                backend_name, user_subdir, relative_path
+            )
+        else:
+            path = self._config.resolve_path(backend_name, user_subdir, relative_path)
+
+        return path
+
+    def to_relative(
+        self,
+        absolute_path: Path,
+        backend_name: Optional[str] = None,
+    ) -> Tuple[str, str, str]:
+        """Convert an absolute path to logical components.
+
+        Decomposes an absolute path into (backend_name, user_subdir, relative_path).
+        If backend_name is not provided, attempts to find the matching backend
+        by checking which backend's base_path contains the absolute path.
+
+        Args:
+            absolute_path: The absolute path to decompose.
+            backend_name: Optional backend name. If not provided, will attempt
+                to auto-detect by finding the backend whose base_path contains
+                the path.
+
+        Returns:
+            Tuple of (backend_name, user_subdir, relative_path).
+            Note: user_subdir is the first path component after base_path,
+            and relative_path is everything after that.
+
+        Raises:
+            PathValidationError: If path doesn't belong to any backend or
+                the specified backend.
+            StorageBackendNotFoundError: If specified backend doesn't exist.
+
+        Example:
+            >>> backend, user, rel = resolver.to_relative(
+            ...     Path("/mnt/vast/user/project/data.zip")
+            ... )
+            >>> print(f"{backend=}, {user=}, {rel=}")
+            backend='vast', user='user', rel='project/data.zip'
+        """
+        resolved_path = absolute_path.resolve()
+
+        # If backend is specified, use it
+        if backend_name:
+            backend = self._config.get_backend(backend_name)
+            return self._decompose_path(resolved_path, backend_name, backend.base_path)
+
+        # Auto-detect backend by finding which base_path contains this path
+        for name in self._config.list_backends():
+            backend = self._config.get_backend(name)
+            try:
+                return self._decompose_path(resolved_path, name, backend.base_path)
+            except PathValidationError:
+                continue  # Try next backend
+
+        # No backend found
+        available = ", ".join(self._config.list_backends()) or "(none)"
+        raise PathValidationError(
+            f"Path '{absolute_path}' does not belong to any configured storage backend. "
+            f"Available backends: {available}"
+        )
+
+    def _decompose_path(
+        self,
+        absolute_path: Path,
+        backend_name: str,
+        base_path: Path,
+    ) -> Tuple[str, str, str]:
+        """Decompose an absolute path relative to a base_path.
+
+        Args:
+            absolute_path: The resolved absolute path.
+            backend_name: Name of the backend.
+            base_path: The backend's base path.
+
+        Returns:
+            Tuple of (backend_name, user_subdir, relative_path).
+
+        Raises:
+            PathValidationError: If path is not within base_path.
+        """
+        resolved_base = base_path.resolve()
+
+        try:
+            # Get path relative to base
+            rel_to_base = absolute_path.relative_to(resolved_base)
+        except ValueError as e:
+            raise PathValidationError(
+                f"Path '{absolute_path}' is not within backend '{backend_name}' "
+                f"base path '{base_path}'"
+            ) from e
+
+        # Split into parts
+        parts = rel_to_base.parts
+
+        if len(parts) == 0:
+            # Path is exactly the base path
+            return (backend_name, "", "")
+        elif len(parts) == 1:
+            # Just user_subdir, no relative path
+            return (backend_name, parts[0], "")
+        else:
+            # user_subdir + relative_path
+            user_subdir = parts[0]
+            relative_path = str(Path(*parts[1:]))
+            return (backend_name, user_subdir, relative_path)
+
+    def find_backend_for_path(self, absolute_path: Path) -> Optional[str]:
+        """Find which backend (if any) contains the given absolute path.
+
+        Args:
+            absolute_path: The path to check.
+
+        Returns:
+            Backend name if path is within a configured backend, None otherwise.
+
+        Example:
+            >>> backend = resolver.find_backend_for_path(
+            ...     Path("/mnt/vast/user/data.zip")
+            ... )
+            >>> print(backend)
+            'vast'
+        """
+        resolved_path = absolute_path.resolve()
+
+        for name in self._config.list_backends():
+            backend = self._config.get_backend(name)
+            try:
+                resolved_path.relative_to(backend.base_path.resolve())
+                return name
+            except ValueError:
+                continue
+
+        return None
+
+    def is_path_in_backend(self, absolute_path: Path, backend_name: str) -> bool:
+        """Check if an absolute path is within a specific backend.
+
+        Args:
+            absolute_path: The path to check.
+            backend_name: The backend to check against.
+
+        Returns:
+            True if path is within the backend's base_path.
+
+        Example:
+            >>> resolver.is_path_in_backend(
+            ...     Path("/mnt/vast/user/data.zip"), "vast"
+            ... )
+            True
+        """
+        backend = self._config.get_backend(backend_name)
+        resolved_path = absolute_path.resolve()
+
+        try:
+            resolved_path.relative_to(backend.base_path.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def validate_path(self, absolute_path: Path, backend_name: str) -> Path:
+        """Validate that a path is within a backend's base_path.
+
+        Uses the existing validate_path_in_root function for security validation.
+
+        Args:
+            absolute_path: The path to validate.
+            backend_name: The backend to validate against.
+
+        Returns:
+            The validated resolved path.
+
+        Raises:
+            StorageBackendNotFoundError: If backend doesn't exist.
+            PathValidationError: If path escapes base_path.
+        """
+        backend = self._config.get_backend(backend_name)
+        return validate_path_in_root(absolute_path, backend.base_path)
+
+    def __repr__(self) -> str:
+        """Return string representation."""
+        backends = ", ".join(self._config.list_backends())
+        return f"StorageResolver(backends=[{backends}])"
