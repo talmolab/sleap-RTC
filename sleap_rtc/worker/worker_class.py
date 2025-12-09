@@ -41,6 +41,9 @@ from sleap_rtc.protocol import (
     MSG_PATH_VALIDATED,
     MSG_PATH_ERROR,
     MSG_JOB_COMPLETE,
+    MSG_STORAGE_BACKEND,
+    MSG_USER_SUBDIR,
+    MSG_BACKEND_NOT_AVAILABLE,
     format_message,
     parse_message,
 )
@@ -79,7 +82,29 @@ class RTCWorkerClient:
         self.websocket = None  # WebSocket connection will be set later
         self.package_type = "train"  # Default to training, can be "track" for inference
 
-        # Initialize shared storage configuration
+        # Load application config for storage backends
+        self._config = get_config()
+        self._storage_config = self._config.storage
+
+        # Get list of available storage backends for capability advertisement
+        self._storage_backends = self._storage_config.list_backends()
+
+        # Log configured storage backends
+        if self._storage_backends:
+            logging.info("=" * 60)
+            logging.info("STORAGE BACKENDS CONFIGURED")
+            logging.info("=" * 60)
+            for backend_name in self._storage_backends:
+                backend = self._storage_config.get_backend(backend_name)
+                exists = "✓" if backend.exists() else "✗"
+                logging.info(
+                    f"  {exists} {backend_name}: {backend.base_path} ({backend.type})"
+                )
+            logging.info("=" * 60)
+        else:
+            logging.info("No storage backends configured - will use RTC transfer only")
+
+        # Initialize shared storage configuration (legacy support)
         try:
             self.shared_storage_root = SharedStorageConfig.get_shared_storage_root(
                 cli_override=shared_storage_root
@@ -107,8 +132,15 @@ class RTCWorkerClient:
         self.current_input_path = None
         self.current_output_path = None
 
+        # Storage backend job context (v2.0)
+        self._current_storage_backend: Optional[str] = None
+        self._current_user_subdir: Optional[str] = None
+
         # Worker state and capabilities (for v2.0 features)
-        self.capabilities = WorkerCapabilities(gpu_id=gpu_id)
+        self.capabilities = WorkerCapabilities(
+            gpu_id=gpu_id,
+            storage_backends=self._storage_backends,
+        )
         self.job_executor = JobExecutor(
             worker=self,
             capabilities=self.capabilities,
@@ -1192,6 +1224,7 @@ class RTCWorkerClient:
                                 "max_concurrent_jobs": self.max_concurrent_jobs,
                                 "supported_models": self.supported_models,
                                 "supported_job_types": self.supported_job_types,
+                                "storage_backends": self._storage_backends,
                             },
                         },
                     }
@@ -1639,8 +1672,35 @@ class RTCWorkerClient:
                 # Parse message type and arguments
                 msg_type, msg_args = parse_message(message)
 
+                # Handle storage backend messages (v2.0)
+                if msg_type == MSG_STORAGE_BACKEND:
+                    backend_name = msg_args[0] if msg_args else ""
+                    logging.info(f"Received storage backend request: {backend_name}")
+
+                    # Check if we have this backend
+                    if backend_name in self._storage_backends:
+                        self._current_storage_backend = backend_name
+                        logging.info(f"✓ Storage backend '{backend_name}' available")
+                        channel.send(format_message(MSG_PATH_VALIDATED, "backend"))
+                    else:
+                        logging.warning(
+                            f"✗ Storage backend '{backend_name}' not available. "
+                            f"Available: {self._storage_backends}"
+                        )
+                        channel.send(format_message(MSG_BACKEND_NOT_AVAILABLE, backend_name))
+                        # Reset storage context
+                        self._current_storage_backend = None
+                        self._current_user_subdir = None
+                    return
+
+                elif msg_type == MSG_USER_SUBDIR:
+                    user_subdir = msg_args[0] if msg_args else ""
+                    logging.info(f"Received user subdirectory: {user_subdir}")
+                    self._current_user_subdir = user_subdir
+                    return
+
                 # Handle shared storage job messages
-                if msg_type == MSG_JOB_ID:
+                elif msg_type == MSG_JOB_ID:
                     self.current_job_id = msg_args[0] if msg_args else None
                     logging.info(
                         f"Received shared storage job ID: {self.current_job_id}"
@@ -1652,12 +1712,34 @@ class RTCWorkerClient:
                     relative_path_str = msg_args[0] if msg_args else ""
                     logging.info(f"Received shared input path: {relative_path_str}")
 
-                    # Validate and store path using FileManager
-                    validated_path = await self.file_manager.validate_shared_input_path(
-                        relative_path_str, channel
-                    )
-                    if validated_path:
-                        self.current_input_path = validated_path
+                    # Use storage backend path resolution (v2.0) if context is set
+                    if self._current_storage_backend and self._current_user_subdir:
+                        try:
+                            validated_path = self._storage_config.resolve_path(
+                                self._current_storage_backend,
+                                self._current_user_subdir,
+                                relative_path_str,
+                            )
+                            # Verify file exists
+                            if not validated_path.exists():
+                                error_msg = f"Input path does not exist: {relative_path_str}"
+                                logging.error(error_msg)
+                                channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                                return
+                            self.current_input_path = validated_path
+                            logging.info(f"✓ Resolved input path: {validated_path}")
+                            channel.send(format_message(MSG_PATH_VALIDATED, "input"))
+                        except Exception as e:
+                            error_msg = f"Path validation error: {e}"
+                            logging.error(error_msg)
+                            channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                    else:
+                        # Legacy shared storage path resolution
+                        validated_path = await self.file_manager.validate_shared_input_path(
+                            relative_path_str, channel
+                        )
+                        if validated_path:
+                            self.current_input_path = validated_path
                     return
 
                 elif msg_type == MSG_SHARED_OUTPUT_PATH:
@@ -1665,13 +1747,32 @@ class RTCWorkerClient:
                     relative_path_str = msg_args[0] if msg_args else ""
                     logging.info(f"Received shared output path: {relative_path_str}")
 
-                    # Validate and store path using FileManager
-                    validated_path = await self.file_manager.validate_shared_output_path(
-                        relative_path_str, channel
-                    )
-                    if validated_path:
-                        self.current_output_path = validated_path
-                        self.output_dir = str(validated_path)
+                    # Use storage backend path resolution (v2.0) if context is set
+                    if self._current_storage_backend and self._current_user_subdir:
+                        try:
+                            validated_path = self._storage_config.resolve_path(
+                                self._current_storage_backend,
+                                self._current_user_subdir,
+                                relative_path_str,
+                            )
+                            # Create output directory if it doesn't exist
+                            validated_path.mkdir(parents=True, exist_ok=True)
+                            self.current_output_path = validated_path
+                            self.output_dir = str(validated_path)
+                            logging.info(f"✓ Resolved output path: {validated_path}")
+                            channel.send(format_message(MSG_PATH_VALIDATED, "output"))
+                        except Exception as e:
+                            error_msg = f"Path validation error: {e}"
+                            logging.error(error_msg)
+                            channel.send(format_message(MSG_PATH_ERROR, error_msg))
+                    else:
+                        # Legacy shared storage path resolution
+                        validated_path = await self.file_manager.validate_shared_output_path(
+                            relative_path_str, channel
+                        )
+                        if validated_path:
+                            self.current_output_path = validated_path
+                            self.output_dir = str(validated_path)
                     return
 
                 elif (
@@ -2115,6 +2216,7 @@ class RTCWorkerClient:
                                     "max_concurrent_jobs": self.max_concurrent_jobs,
                                     "supported_models": self.supported_models,
                                     "supported_job_types": self.supported_job_types,
+                                    "storage_backends": self._storage_backends,
                                 },
                             },
                         }
@@ -2126,6 +2228,12 @@ class RTCWorkerClient:
                 logging.info(
                     f"Worker capabilities: GPU={self.gpu_model}, Memory={self.gpu_memory_mb}MB, CUDA={self.cuda_version}"
                 )
+                if self._storage_backends:
+                    logging.info(
+                        f"Storage backends advertised: {', '.join(self._storage_backends)}"
+                    )
+                else:
+                    logging.info("No storage backends advertised (RTC transfer only)")
 
                 # Handle incoming messages from server (e.g. answers).
                 try:

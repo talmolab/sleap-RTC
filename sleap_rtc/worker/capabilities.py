@@ -1,18 +1,21 @@
 """Worker capabilities detection and job compatibility checking.
 
 This module provides GPU hardware detection, job compatibility evaluation,
-and resource utilization reporting for SLEAP-RTC workers.
+storage backend advertisement, and resource utilization reporting for SLEAP-RTC workers.
 """
 
 import logging
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from sleap_rtc.config import StorageConfig
 
 
 class WorkerCapabilities:
     """Manages worker hardware capabilities and job compatibility.
 
     This class handles GPU detection, job requirement matching, duration estimation,
-    and resource utilization reporting for worker nodes.
+    storage backend advertisement, and resource utilization reporting for worker nodes.
 
     Attributes:
         gpu_id: GPU device ID to use (default 0).
@@ -21,6 +24,7 @@ class WorkerCapabilities:
         cuda_version: CUDA version string (e.g., "11.8").
         supported_models: List of supported model types.
         supported_job_types: List of supported job types.
+        storage_backends: List of available storage backend names.
         status: Current worker status ("available", "busy", "reserved").
     """
 
@@ -29,6 +33,7 @@ class WorkerCapabilities:
         gpu_id: int = 0,
         supported_models: Optional[List[str]] = None,
         supported_job_types: Optional[List[str]] = None,
+        storage_backends: Optional[List[str]] = None,
     ):
         """Initialize worker capabilities.
 
@@ -38,6 +43,8 @@ class WorkerCapabilities:
                 ["base", "centroid", "topdown"].
             supported_job_types: List of supported job types. Defaults to
                 ["training", "inference"].
+            storage_backends: List of available storage backend names. If None,
+                loads from StorageConfig automatically.
         """
         self.gpu_id = gpu_id
         self.gpu_memory_mb = self._detect_gpu_memory()
@@ -45,6 +52,7 @@ class WorkerCapabilities:
         self.cuda_version = self._detect_cuda_version()
         self.supported_models = supported_models or ["base", "centroid", "topdown"]
         self.supported_job_types = supported_job_types or ["training", "inference"]
+        self.storage_backends = storage_backends or []
         self.status = "available"  # Managed by StateManager, but read here
 
     def _detect_gpu_memory(self) -> int:
@@ -210,4 +218,27 @@ class WorkerCapabilities:
             "cuda_version": self.cuda_version,
             "supported_models": self.supported_models,
             "supported_job_types": self.supported_job_types,
+            "storage_backends": self.storage_backends,
         }
+
+    def has_storage_backend(self, backend_name: str) -> bool:
+        """Check if this worker has a specific storage backend.
+
+        Args:
+            backend_name: Name of the storage backend to check.
+
+        Returns:
+            True if the backend is available, False otherwise.
+        """
+        return backend_name in self.storage_backends
+
+    def get_shared_backends(self, other_backends: List[str]) -> List[str]:
+        """Get list of storage backends shared with another peer.
+
+        Args:
+            other_backends: List of backend names from another peer.
+
+        Returns:
+            List of backend names available on both peers.
+        """
+        return [b for b in self.storage_backends if b in other_backends]

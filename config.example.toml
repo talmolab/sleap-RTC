@@ -24,3 +24,35 @@ signaling_http = "http://staging-server.example.com:8001"
 # Production signaling server (current default)
 signaling_websocket = "ws://ec2-52-9-213-137.us-west-1.compute.amazonaws.com:8080"
 signaling_http = "http://ec2-52-9-213-137.us-west-1.compute.amazonaws.com:8001"
+
+# =============================================================================
+# Storage Backends
+# =============================================================================
+# Configure shared filesystem backends for fast file transfer between
+# clients and workers. Each backend is a named mount point that maps to
+# a local filesystem path.
+#
+# Workers and clients must use the same backend NAMES (e.g., "vast"),
+# but can have different local paths (e.g., Mac: /Volumes/talmo, Linux: /mnt/vast)
+#
+# Alternative: Set SHARED_STORAGE_ROOT environment variable for legacy single-root mode
+
+# Example: Institutional VAST/NFS storage
+# [storage.vast]
+# base_path = "/Volumes/talmo"           # Mac mount point
+# # base_path = "/mnt/vast"              # Linux mount point
+# # base_path = "/home/jovyan/vast"      # Run:AI container mount point
+# type = "nfs"
+# description = "Institutional VAST storage"
+
+# Example: Local scratch storage (fast SSD)
+# [storage.scratch]
+# base_path = "/scratch"
+# type = "local"
+# description = "Fast local SSD for temporary files"
+
+# Example: Google Shared Drive
+# [storage.gdrive]
+# base_path = "/mnt/gdrive-lab"
+# type = "google_shared_drive"
+# description = "Lab shared Google Drive"

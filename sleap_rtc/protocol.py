@@ -15,11 +15,55 @@ Transfer Method Selection
 -------------------------
 
 The Client automatically selects the transfer method:
-- If shared storage is configured on both Client and Worker: Use shared storage transfer
+- If shared storage backends are configured on both Client and Worker: Use shared storage transfer
 - Otherwise: Use RTC transfer (backward compatible)
+
+Storage Backend System (v2.0)
+-----------------------------
+
+The storage backend system allows workers and clients to have different local mount
+paths for the same logical storage. Each storage backend has:
+
+- **name**: Logical name (e.g., "vast", "scratch", "gdrive")
+- **base_path**: Local mount point (different per machine)
+- **user_subdir**: User's subdirectory within the backend
+
+Example: Client and Worker both have "vast" backend configured:
+- Client: vast -> /Volumes/talmo (Mac mount)
+- Worker: vast -> /mnt/vast (Linux mount)
+
+When transferring files, the client sends:
+1. STORAGE_BACKEND::vast (which backend to use)
+2. USER_SUBDIR::sam (user's directory)
+3. SHARED_INPUT_PATH::project/data.zip (path relative to user dir)
 
 Message Types
 -------------
+
+### Storage Backend Messages (v2.0)
+
+These messages specify which storage backend and user directory to use.
+
+**STORAGE_BACKEND::{backend_name}**
+    Sent by: Client
+    Purpose: Specifies which storage backend to use for file transfer
+    Format: "STORAGE_BACKEND::{name}"
+    Example: "STORAGE_BACKEND::vast"
+    Note: Worker must have this backend configured, or will send BACKEND_NOT_AVAILABLE
+
+**USER_SUBDIR::{user_subdir}**
+    Sent by: Client
+    Purpose: Specifies the user subdirectory within the backend
+    Format: "USER_SUBDIR::{subdir}"
+    Example: "USER_SUBDIR::sam"
+    Note: Paths are relative to backend_base_path/user_subdir/
+
+**BACKEND_NOT_AVAILABLE::{backend_name}**
+    Sent by: Worker
+    Purpose: Indicates worker doesn't have the requested storage backend
+    Format: "BACKEND_NOT_AVAILABLE::{name}"
+    Example: "BACKEND_NOT_AVAILABLE::vast"
+    Note: Client should fall back to RTC transfer
 
 ### Shared Storage Transfer Messages
 
@@ -34,16 +78,18 @@ These messages are used when both Client and Worker have shared storage configur
 **SHARED_INPUT_PATH::{relative_path}**
     Sent by: Client
     Purpose: Tells Worker where to find input file in shared storage
-    Format: "SHARED_INPUT_PATH::jobs/{job_id}/{filename}"
-    Example: "SHARED_INPUT_PATH::jobs/job_f3a8b2c1/training.zip"
-    Note: Path is relative to shared storage root
+    Format: "SHARED_INPUT_PATH::{path_relative_to_user_dir}"
+    Example: "SHARED_INPUT_PATH::project/data.zip"
+    Note: Path is relative to backend_base_path/user_subdir/ (v2.0)
+          or shared_storage_root (legacy)
 
 **SHARED_OUTPUT_PATH::{relative_path}**
     Sent by: Client
     Purpose: Tells Worker where to write output files in shared storage
-    Format: "SHARED_OUTPUT_PATH::jobs/{job_id}/output"
-    Example: "SHARED_OUTPUT_PATH::jobs/job_f3a8b2c1/output"
-    Note: Path is relative to shared storage root
+    Format: "SHARED_OUTPUT_PATH::{path_relative_to_user_dir}"
+    Example: "SHARED_OUTPUT_PATH::project/output"
+    Note: Path is relative to backend_base_path/user_subdir/ (v2.0)
+          or shared_storage_root (legacy)
 
 **SHARED_STORAGE_JOB::start**
     Sent by: Client
@@ -60,13 +106,13 @@ These messages are used when both Client and Worker have shared storage configur
     Sent by: Worker
     Purpose: Reports path validation failure
     Format: "PATH_ERROR::{description}"
-    Example: "PATH_ERROR::Input path does not exist: jobs/job_123/data.zip"
+    Example: "PATH_ERROR::Input path does not exist: project/data.zip"
 
 **JOB_COMPLETE::{job_id}::{relative_output_path}**
     Sent by: Worker
     Purpose: Notifies Client that job is complete, output is ready
     Format: "JOB_COMPLETE::{job_id}::{relative_path}"
-    Example: "JOB_COMPLETE::job_f3a8b2c1::jobs/job_f3a8b2c1/output"
+    Example: "JOB_COMPLETE::job_f3a8b2c1::project/output"
 
 ### RTC Transfer Messages (Original Protocol)
 
@@ -116,7 +162,26 @@ These messages are used for backward compatibility when shared storage is unavai
 Message Flow Examples
 ---------------------
 
-### Shared Storage Transfer Flow
+### Storage Backend Transfer Flow (v2.0)
+
+This flow uses named storage backends for cross-platform path resolution.
+
+1. Client → Worker: STORAGE_BACKEND::vast
+2. Worker → Client: PATH_VALIDATED::backend (or BACKEND_NOT_AVAILABLE::vast)
+3. Client → Worker: USER_SUBDIR::sam
+4. Client → Worker: JOB_ID::job_abc123
+5. Client → Worker: SHARED_INPUT_PATH::project/training.zip
+6. Worker → Client: PATH_VALIDATED::input
+7. Client → Worker: SHARED_OUTPUT_PATH::project/output
+8. Worker → Client: PATH_VALIDATED::output
+9. Client → Worker: SHARED_STORAGE_JOB::start
+10. Worker processes job (reads from /mnt/vast/sam/project/training.zip)
+11. Worker → Client: TRAINING_COMPLETE
+12. Worker → Client: JOB_COMPLETE::job_abc123::project/output
+
+### Legacy Shared Storage Transfer Flow
+
+For backward compatibility with single shared_storage_root.
 
 1. Client → Worker: JOB_ID::job_abc123
 2. Client → Worker: SHARED_INPUT_PATH::jobs/job_abc123/training.zip
@@ -164,6 +229,11 @@ absolute_path = to_absolute_path(relative_path, shared_storage_root)
 validated_path = validate_path_in_root(absolute_path, shared_storage_root)
 ```
 """
+
+# Storage Backend Message Types (v2.0)
+MSG_STORAGE_BACKEND = "STORAGE_BACKEND"
+MSG_USER_SUBDIR = "USER_SUBDIR"
+MSG_BACKEND_NOT_AVAILABLE = "BACKEND_NOT_AVAILABLE"
 
 # Shared Storage Transfer Message Types
 MSG_JOB_ID = "JOB_ID"
@@ -240,3 +310,22 @@ def parse_message(message: str) -> tuple[str, list[str]]:
     msg_type = parts[0]
     args = parts[1].split(MSG_SEPARATOR) if len(parts) > 1 else []
     return msg_type, args
+
+
+def is_storage_backend_message(msg_type: str) -> bool:
+    """Check if a message type is a storage backend message.
+
+    Args:
+        msg_type: The message type to check.
+
+    Returns:
+        True if the message type is a storage backend message.
+
+    Examples:
+        >>> is_storage_backend_message("STORAGE_BACKEND")
+        True
+
+        >>> is_storage_backend_message("JOB_ID")
+        False
+    """
+    return msg_type in (MSG_STORAGE_BACKEND, MSG_USER_SUBDIR, MSG_BACKEND_NOT_AVAILABLE)
