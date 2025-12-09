@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import List, Optional, Text, Tuple
 from websockets.client import ClientConnection
 
-from sleap_rtc.config import get_config, SharedStorageConfig, SharedStorageConfigError
+from sleap_rtc.config import get_config, SharedStorageConfig, SharedStorageConfigError, StorageConfig
 from sleap_rtc.exceptions import (
     NoWorkersAvailableError,
     NoWorkersAcceptedError,
@@ -42,6 +42,9 @@ from sleap_rtc.protocol import (
     MSG_SHARED_STORAGE_JOB,
     MSG_PATH_VALIDATED,
     MSG_PATH_ERROR,
+    MSG_STORAGE_BACKEND,
+    MSG_USER_SUBDIR,
+    MSG_BACKEND_NOT_AVAILABLE,
     format_message,
     parse_message,
 )
@@ -74,27 +77,52 @@ class RTCClient:
 
         # Initialize given parameters.
         # Use config if DNS not provided via CLI
-        config = get_config()
-        self.DNS = DNS if DNS is not None else config.signaling_websocket
+        self._config = get_config()
+        self.DNS = DNS if DNS is not None else self._config.signaling_websocket
         self.port_number = port_number
         self.gui = gui
 
-        # Initialize shared storage configuration.
+        # Initialize storage backend configuration (v2.0)
+        self._storage_config = self._config.storage
+        self._storage_backends = self._storage_config.list_backends()
+
+        # Log configured storage backends
+        if self._storage_backends:
+            logging.info("=" * 60)
+            logging.info("CLIENT STORAGE BACKENDS")
+            logging.info("=" * 60)
+            for backend_name in self._storage_backends:
+                backend = self._storage_config.get_backend(backend_name)
+                exists = "✓" if backend.exists() else "✗"
+                logging.info(
+                    f"  {exists} {backend_name}: {backend.base_path} ({backend.type})"
+                )
+            logging.info("=" * 60)
+        else:
+            logging.info("No storage backends configured")
+
+        # Current storage context (set during transfer)
+        self._current_backend: Optional[str] = None
+        self._current_user_subdir: Optional[str] = None
+        self._worker_backends: List[str] = []  # Set after connecting to worker
+
+        # Initialize shared storage configuration (legacy support).
         try:
             self.shared_storage_root = SharedStorageConfig.get_shared_storage_root(
                 cli_override=shared_storage_root
             )
             if self.shared_storage_root:
-                logging.info(f"Shared storage enabled: {self.shared_storage_root}")
+                logging.info(f"Legacy shared storage enabled: {self.shared_storage_root}")
                 # Create jobs directory in shared storage
                 self.shared_jobs_dir = self.shared_storage_root / "jobs"
                 safe_mkdir(self.shared_jobs_dir)
             else:
-                logging.info("Shared storage not configured, will use RTC transfer")
+                self.shared_jobs_dir = None
+                logging.info("Legacy shared storage not configured")
         except SharedStorageConfigError as e:
-            logging.error(f"Shared storage configuration error: {e}")
-            logging.info("Falling back to RTC transfer")
+            logging.error(f"Legacy shared storage configuration error: {e}")
             self.shared_storage_root = None
+            self.shared_jobs_dir = None
 
         # Other variables.
         self.received_files = {}
@@ -644,6 +672,232 @@ class RTCClient:
             logging.error(f"Unexpected error in shared storage transfer: {e}")
             return False
 
+    def get_shared_backends(self, worker_backends: List[str]) -> List[str]:
+        """Get list of storage backends available on both client and worker.
+
+        Args:
+            worker_backends: List of backend names available on the worker.
+
+        Returns:
+            List of backend names available on both client and worker.
+        """
+        return [b for b in self._storage_backends if b in worker_backends]
+
+    def find_backend_for_file(self, file_path: Path) -> Optional[Tuple[str, str, str]]:
+        """Find which storage backend contains a file.
+
+        Args:
+            file_path: Absolute path to the file.
+
+        Returns:
+            Tuple of (backend_name, user_subdir, relative_path) if file is in a
+            storage backend, None otherwise.
+        """
+        file_path = Path(file_path).resolve()
+
+        for backend_name in self._storage_backends:
+            backend = self._storage_config.get_backend(backend_name)
+            try:
+                # Check if file is under this backend's base_path
+                rel_path = file_path.relative_to(backend.base_path)
+                parts = rel_path.parts
+
+                if len(parts) >= 1:
+                    # First component is user_subdir, rest is relative path
+                    user_subdir = parts[0]
+                    relative_path = str(Path(*parts[1:])) if len(parts) > 1 else ""
+                    return (backend_name, user_subdir, relative_path)
+            except ValueError:
+                # File is not under this backend
+                continue
+
+        return None
+
+    async def send_file_via_storage_backend(
+        self,
+        file_path: str,
+        output_dir: str = "",
+        backend_name: Optional[str] = None,
+        user_subdir: Optional[str] = None,
+    ) -> bool:
+        """Send file via storage backend (v2.0 protocol).
+
+        This method uses the new storage backend protocol which allows different
+        mount paths on client and worker.
+
+        Args:
+            file_path: Path to the file to send.
+            output_dir: Output directory name for results.
+            backend_name: Storage backend to use (auto-detected if None).
+            user_subdir: User subdirectory (auto-detected if None).
+
+        Returns:
+            True if successful, False if transfer failed (caller should fall back).
+        """
+        try:
+            # Validate data channel
+            if self.data_channel.readyState != "open":
+                logging.warning(
+                    f"Data channel not open (state: {self.data_channel.readyState})"
+                )
+                return False
+
+            # Validate file path
+            if not file_path:
+                logging.error("No file path provided")
+                return False
+
+            local_file = Path(file_path).resolve()
+            if not local_file.exists():
+                logging.error(f"File does not exist: {file_path}")
+                return False
+
+            # Auto-detect backend and user_subdir from file path if not provided
+            if backend_name is None or user_subdir is None:
+                detected = self.find_backend_for_file(local_file)
+                if detected:
+                    backend_name = backend_name or detected[0]
+                    user_subdir = user_subdir or detected[1]
+                    relative_path = detected[2]
+                    logging.info(
+                        f"Auto-detected storage: backend={backend_name}, "
+                        f"user={user_subdir}, path={relative_path}"
+                    )
+                else:
+                    logging.info("File not in any storage backend, cannot use backend transfer")
+                    return False
+
+            # Check if worker has this backend
+            if self._worker_backends and backend_name not in self._worker_backends:
+                logging.warning(
+                    f"Worker doesn't have backend '{backend_name}'. "
+                    f"Worker backends: {self._worker_backends}"
+                )
+                return False
+
+            # Get the backend and compute paths
+            backend = self._storage_config.get_backend(backend_name)
+            user_path = backend.base_path / user_subdir
+
+            # Get relative path from user directory
+            try:
+                relative_input = str(local_file.relative_to(user_path))
+            except ValueError:
+                logging.error(f"File not under user directory: {user_path}")
+                return False
+
+            # Generate unique job ID
+            job_id = f"job_{uuid.uuid4().hex[:8]}"
+            logging.info(f"Starting storage backend transfer for job {job_id}")
+
+            # Output path relative to user directory
+            output_subdir = output_dir if output_dir else "models"
+            output_base = Path(relative_input).parent
+            relative_output = str(output_base / output_subdir)
+
+            logging.info(f"Storage backend transfer:")
+            logging.info(f"  Backend:  {backend_name}")
+            logging.info(f"  User:     {user_subdir}")
+            logging.info(f"  Input:    {relative_input}")
+            logging.info(f"  Output:   {relative_output}")
+
+            # Send storage backend info
+            self.data_channel.send(format_message(MSG_STORAGE_BACKEND, backend_name))
+
+            # Wait for backend validation
+            try:
+                response = await asyncio.wait_for(
+                    self.path_validation_queue.get(), timeout=5.0
+                )
+                msg_type, msg_args = parse_message(response)
+
+                if msg_type == MSG_BACKEND_NOT_AVAILABLE:
+                    logging.warning(f"Worker doesn't have backend '{backend_name}'")
+                    return False
+                elif msg_type != MSG_PATH_VALIDATED:
+                    logging.warning(f"Unexpected response to STORAGE_BACKEND: {response}")
+                    return False
+
+                logging.info(f"✓ Worker confirmed backend '{backend_name}'")
+
+            except asyncio.TimeoutError:
+                logging.error("Timeout waiting for backend validation")
+                return False
+
+            # Send user subdirectory
+            self.data_channel.send(format_message(MSG_USER_SUBDIR, user_subdir))
+
+            # Send job ID and paths
+            self.data_channel.send(format_message(MSG_JOB_ID, job_id))
+
+            # Send file metadata
+            file_name = local_file.name
+            file_size = local_file.stat().st_size
+            self.data_channel.send(f"FILE_META::{file_name}:{file_size}:{self.gui}")
+
+            # Send input path
+            self.data_channel.send(format_message(MSG_SHARED_INPUT_PATH, relative_input))
+
+            # Wait for input path validation
+            try:
+                response = await asyncio.wait_for(
+                    self.path_validation_queue.get(), timeout=10.0
+                )
+                msg_type, msg_args = parse_message(response)
+
+                if msg_type == MSG_PATH_ERROR:
+                    error_msg = msg_args[0] if msg_args else "Unknown error"
+                    logging.error(f"Worker input path validation failed: {error_msg}")
+                    return False
+                elif msg_type != MSG_PATH_VALIDATED:
+                    logging.warning(f"Unexpected response: {response}")
+                    return False
+
+                logging.info("✓ Worker validated input path")
+
+            except asyncio.TimeoutError:
+                logging.error("Timeout waiting for input path validation")
+                return False
+
+            # Send output path
+            self.data_channel.send(format_message(MSG_SHARED_OUTPUT_PATH, relative_output))
+
+            # Wait for output path validation
+            try:
+                response = await asyncio.wait_for(
+                    self.path_validation_queue.get(), timeout=10.0
+                )
+                msg_type, msg_args = parse_message(response)
+
+                if msg_type == MSG_PATH_ERROR:
+                    error_msg = msg_args[0] if msg_args else "Unknown error"
+                    logging.error(f"Worker output path validation failed: {error_msg}")
+                    return False
+                elif msg_type != MSG_PATH_VALIDATED:
+                    logging.warning(f"Unexpected response: {response}")
+                    return False
+
+                logging.info("✓ Worker validated output path")
+
+            except asyncio.TimeoutError:
+                logging.error("Timeout waiting for output path validation")
+                return False
+
+            # Start the job
+            self.data_channel.send(format_message(MSG_SHARED_STORAGE_JOB, "start"))
+
+            # Store current context
+            self._current_backend = backend_name
+            self._current_user_subdir = user_subdir
+            self.current_job_id = job_id
+
+            logging.info("✓ Storage backend transfer initiated successfully")
+            return True
+
+        except Exception as e:
+            logging.error(f"Unexpected error in storage backend transfer: {e}")
+            return False
+
     async def on_channel_open(self):
         """Event handler function for when the datachannel is open.
 
@@ -656,22 +910,42 @@ class RTCClient:
         asyncio.create_task(self.keep_ice_alive())
         logging.info(f"{self.data_channel.label} is open")
 
-        # Try shared storage transfer first, fall back to RTC if not available or fails
         transfer_success = False
-        if self.shared_storage_root:
-            logging.info("Attempting shared storage transfer...")
+
+        # Try v2.0 storage backend transfer first (if file is in a storage backend)
+        if self._storage_backends and self.file_path:
+            backend_info = self.find_backend_for_file(Path(self.file_path))
+            if backend_info:
+                backend_name, user_subdir, _ = backend_info
+                logging.info(
+                    f"File is in storage backend '{backend_name}', "
+                    f"attempting storage backend transfer..."
+                )
+                transfer_success = await self.send_file_via_storage_backend(
+                    self.file_path, self.output_dir
+                )
+                if transfer_success:
+                    logging.info("✓ Using storage backend transfer (v2.0)")
+                else:
+                    logging.warning("Storage backend transfer failed")
+
+        # Try legacy shared storage transfer if v2.0 failed or not applicable
+        if not transfer_success and self.shared_storage_root:
+            logging.info("Attempting legacy shared storage transfer...")
             transfer_success = await self.send_file_via_shared_storage(
                 self.file_path, self.output_dir
             )
+            if transfer_success:
+                logging.info("✓ Using legacy shared storage transfer")
 
-        # Fall back to RTC transfer if shared storage not configured or failed
+        # Fall back to RTC transfer if all storage options failed
         if not transfer_success:
-            if self.shared_storage_root:
+            if self._storage_backends or self.shared_storage_root:
                 logging.warning(
-                    "Shared storage transfer failed, falling back to RTC transfer"
+                    "Storage transfer failed, falling back to RTC transfer"
                 )
             else:
-                logging.info("Using RTC transfer")
+                logging.info("Using RTC transfer (no storage backends configured)")
             await self.send_client_file(self.file_path, self.output_dir)
 
     async def on_message(self, message):
@@ -690,6 +964,12 @@ class RTCClient:
         if isinstance(message, str):
             # Parse message type
             msg_type, msg_args = parse_message(message)
+
+            # Handle storage backend responses (v2.0)
+            if msg_type == MSG_BACKEND_NOT_AVAILABLE:
+                # Put response in queue for send_file_via_storage_backend to handle
+                await self.path_validation_queue.put(message)
+                return
 
             # Handle shared storage path validation responses
             if msg_type in (MSG_PATH_VALIDATED, MSG_PATH_ERROR):
@@ -1124,13 +1404,17 @@ class RTCClient:
 
         selected = sorted_workers[0]
         peer_id = selected["peer_id"]
-        gpu_memory = (
-            selected.get("metadata", {})
-            .get("properties", {})
-            .get("gpu_memory_mb", "unknown")
-        )
+        properties = selected.get("metadata", {}).get("properties", {})
+        gpu_memory = properties.get("gpu_memory_mb", "unknown")
+
+        # Store worker's storage backends
+        self._worker_backends = properties.get("storage_backends", [])
 
         logging.info(f"Auto-selected worker {peer_id} (GPU memory: {gpu_memory}MB)")
+        if self._worker_backends:
+            shared = self.get_shared_backends(self._worker_backends)
+            logging.info(f"Worker storage backends: {self._worker_backends}")
+            logging.info(f"Shared backends with client: {shared}")
         return peer_id
 
     async def _prompt_worker_selection(self, workers: list) -> str:
@@ -1154,12 +1438,20 @@ class RTCClient:
                 gpu_memory = metadata.get("gpu_memory_mb", 0)
                 cuda_version = metadata.get("cuda_version", "Unknown")
                 hostname = metadata.get("hostname", "Unknown")
+                worker_backends = metadata.get("storage_backends", [])
+
+                # Check shared backends with client
+                shared_backends = self.get_shared_backends(worker_backends)
 
                 print(f"\n  {i}. {peer_id}")
                 print(f"     GPU Model:    {gpu_model}")
                 print(f"     GPU Memory:   {gpu_memory} MB")
                 print(f"     CUDA Version: {cuda_version}")
                 print(f"     Hostname:     {hostname}")
+                if worker_backends:
+                    print(f"     Storage:      {', '.join(worker_backends)}")
+                    if shared_backends:
+                        print(f"     Shared:       {', '.join(shared_backends)} ✓")
 
             print("\n" + "=" * 80)
             print(
@@ -1188,8 +1480,18 @@ class RTCClient:
             try:
                 idx = int(choice) - 1
                 if 0 <= idx < len(workers):
-                    selected_worker = workers[idx]["peer_id"]
+                    selected = workers[idx]
+                    selected_worker = selected["peer_id"]
+                    properties = selected.get("metadata", {}).get("properties", {})
+
+                    # Store worker's storage backends
+                    self._worker_backends = properties.get("storage_backends", [])
+
                     print(f"\nSelected: {selected_worker}")
+                    if self._worker_backends:
+                        shared = self.get_shared_backends(self._worker_backends)
+                        logging.info(f"Worker storage backends: {self._worker_backends}")
+                        logging.info(f"Shared backends with client: {shared}")
                     return selected_worker
                 else:
                     print(
