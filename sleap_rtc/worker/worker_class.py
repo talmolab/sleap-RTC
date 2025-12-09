@@ -79,7 +79,29 @@ class RTCWorkerClient:
         self.websocket = None  # WebSocket connection will be set later
         self.package_type = "train"  # Default to training, can be "track" for inference
 
-        # Initialize shared storage configuration
+        # Load application config for storage backends
+        self._config = get_config()
+        self._storage_config = self._config.storage
+
+        # Get list of available storage backends for capability advertisement
+        self._storage_backends = self._storage_config.list_backends()
+
+        # Log configured storage backends
+        if self._storage_backends:
+            logging.info("=" * 60)
+            logging.info("STORAGE BACKENDS CONFIGURED")
+            logging.info("=" * 60)
+            for backend_name in self._storage_backends:
+                backend = self._storage_config.get_backend(backend_name)
+                exists = "✓" if backend.exists() else "✗"
+                logging.info(
+                    f"  {exists} {backend_name}: {backend.base_path} ({backend.type})"
+                )
+            logging.info("=" * 60)
+        else:
+            logging.info("No storage backends configured - will use RTC transfer only")
+
+        # Initialize shared storage configuration (legacy support)
         try:
             self.shared_storage_root = SharedStorageConfig.get_shared_storage_root(
                 cli_override=shared_storage_root
@@ -108,7 +130,10 @@ class RTCWorkerClient:
         self.current_output_path = None
 
         # Worker state and capabilities (for v2.0 features)
-        self.capabilities = WorkerCapabilities(gpu_id=gpu_id)
+        self.capabilities = WorkerCapabilities(
+            gpu_id=gpu_id,
+            storage_backends=self._storage_backends,
+        )
         self.job_executor = JobExecutor(
             worker=self,
             capabilities=self.capabilities,
@@ -1192,6 +1217,7 @@ class RTCWorkerClient:
                                 "max_concurrent_jobs": self.max_concurrent_jobs,
                                 "supported_models": self.supported_models,
                                 "supported_job_types": self.supported_job_types,
+                                "storage_backends": self._storage_backends,
                             },
                         },
                     }
@@ -2115,6 +2141,7 @@ class RTCWorkerClient:
                                     "max_concurrent_jobs": self.max_concurrent_jobs,
                                     "supported_models": self.supported_models,
                                     "supported_job_types": self.supported_job_types,
+                                    "storage_backends": self._storage_backends,
                                 },
                             },
                         }
@@ -2126,6 +2153,12 @@ class RTCWorkerClient:
                 logging.info(
                     f"Worker capabilities: GPU={self.gpu_model}, Memory={self.gpu_memory_mb}MB, CUDA={self.cuda_version}"
                 )
+                if self._storage_backends:
+                    logging.info(
+                        f"Storage backends advertised: {', '.join(self._storage_backends)}"
+                    )
+                else:
+                    logging.info("No storage backends advertised (RTC transfer only)")
 
                 # Handle incoming messages from server (e.g. answers).
                 try:
