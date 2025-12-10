@@ -9,21 +9,22 @@ Message Protocol Overview
 SLEAP-RTC uses two transfer methods:
 
 1. **RTC Transfer** (original): Sends files as chunked binary data over WebRTC
-2. **Shared Storage Transfer** (new): Sends only file paths, files accessed via shared filesystem
+2. **Worker I/O Paths** (recommended): Worker has configured input/output paths;
+   client sends just the filename, worker reads from its input directory
 
 Transfer Method Selection
 -------------------------
 
 The Client automatically selects the transfer method:
-- If shared storage is configured on both Client and Worker: Use shared storage transfer
+- If Worker has I/O paths configured: Use Worker I/O Paths transfer
 - Otherwise: Use RTC transfer (backward compatible)
 
 Message Types
 -------------
 
-### Shared Storage Transfer Messages
+### Worker I/O Paths Messages
 
-These messages are used when both Client and Worker have shared storage configured.
+These messages are used when Worker has I/O paths configured (input_path, output_path).
 
 **JOB_ID::{job_id}**
     Sent by: Client
@@ -31,42 +32,52 @@ These messages are used when both Client and Worker have shared storage configur
     Format: "JOB_ID::job_abc123"
     Example: "JOB_ID::job_f3a8b2c1"
 
-**SHARED_INPUT_PATH::{relative_path}**
+**INPUT_FILE::{filename}**
     Sent by: Client
-    Purpose: Tells Worker where to find input file in shared storage
-    Format: "SHARED_INPUT_PATH::jobs/{job_id}/{filename}"
-    Example: "SHARED_INPUT_PATH::jobs/job_f3a8b2c1/training.zip"
-    Note: Path is relative to shared storage root
+    Purpose: Tells Worker which file to use from its input directory
+    Format: "INPUT_FILE::{filename}"
+    Example: "INPUT_FILE::my_training.pkg.slp"
+    Note: Just the filename, not a path. Worker resolves to {input_path}/{filename}
+
+**FILE_EXISTS::{filename}**
+    Sent by: Worker
+    Purpose: Confirms the file exists and is readable in worker's input directory
+    Format: "FILE_EXISTS::{filename}"
+    Example: "FILE_EXISTS::my_training.pkg.slp"
+
+**FILE_NOT_FOUND::{filename}::{reason}**
+    Sent by: Worker
+    Purpose: Reports that the file was not found or is not accessible
+    Format: "FILE_NOT_FOUND::{filename}::{reason}"
+    Example: "FILE_NOT_FOUND::missing.slp::File does not exist"
+
+**JOB_OUTPUT_PATH::{path}**
+    Sent by: Worker
+    Purpose: Tells Client where job outputs will be written
+    Format: "JOB_OUTPUT_PATH::{path}"
+    Example: "JOB_OUTPUT_PATH::/mnt/shared/outputs/jobs/job_f3a8b2c1"
+
+### Legacy Shared Storage Messages (Deprecated)
+
+These messages are deprecated and will be removed in a future version.
+
+**SHARED_INPUT_PATH::{relative_path}**
+    Deprecated: Use INPUT_FILE instead
 
 **SHARED_OUTPUT_PATH::{relative_path}**
-    Sent by: Client
-    Purpose: Tells Worker where to write output files in shared storage
-    Format: "SHARED_OUTPUT_PATH::jobs/{job_id}/output"
-    Example: "SHARED_OUTPUT_PATH::jobs/job_f3a8b2c1/output"
-    Note: Path is relative to shared storage root
+    Deprecated: Worker now controls output path
 
 **SHARED_STORAGE_JOB::start**
-    Sent by: Client
-    Purpose: Signals Worker to begin processing using shared storage paths
-    Format: "SHARED_STORAGE_JOB::start"
+    Deprecated: Use INPUT_FILE flow instead
 
 **PATH_VALIDATED::{path_type}**
-    Sent by: Worker
-    Purpose: Confirms path is valid and accessible
-    Format: "PATH_VALIDATED::input" or "PATH_VALIDATED::output"
-    Example: "PATH_VALIDATED::input"
+    Deprecated: Use FILE_EXISTS instead
 
 **PATH_ERROR::{error_message}**
-    Sent by: Worker
-    Purpose: Reports path validation failure
-    Format: "PATH_ERROR::{description}"
-    Example: "PATH_ERROR::Input path does not exist: jobs/job_123/data.zip"
+    Deprecated: Use FILE_NOT_FOUND instead
 
 **JOB_COMPLETE::{job_id}::{relative_output_path}**
-    Sent by: Worker
-    Purpose: Notifies Client that job is complete, output is ready
-    Format: "JOB_COMPLETE::{job_id}::{relative_path}"
-    Example: "JOB_COMPLETE::job_f3a8b2c1::jobs/job_f3a8b2c1/output"
+    Deprecated: Use JOB_OUTPUT_PATH instead
 
 ### RTC Transfer Messages (Original Protocol)
 
@@ -116,17 +127,14 @@ These messages are used for backward compatibility when shared storage is unavai
 Message Flow Examples
 ---------------------
 
-### Shared Storage Transfer Flow
+### Worker I/O Paths Transfer Flow
 
 1. Client → Worker: JOB_ID::job_abc123
-2. Client → Worker: SHARED_INPUT_PATH::jobs/job_abc123/training.zip
-3. Worker → Client: PATH_VALIDATED::input
-4. Client → Worker: SHARED_OUTPUT_PATH::jobs/job_abc123/output
-5. Worker → Client: PATH_VALIDATED::output
-6. Client → Worker: SHARED_STORAGE_JOB::start
-7. Worker processes job (reads from shared storage, writes to shared storage)
-8. Worker → Client: TRAINING_COMPLETE
-9. Worker → Client: JOB_COMPLETE::job_abc123::jobs/job_abc123/output
+2. Client → Worker: INPUT_FILE::my_training.pkg.slp
+3. Worker → Client: FILE_EXISTS::my_training.pkg.slp
+4. Worker → Client: JOB_OUTPUT_PATH::/mnt/shared/outputs/jobs/job_abc123
+5. Worker processes job (reads from input_path, writes to output_path/jobs/{job_id}/)
+6. Worker → Client: TRAINING_COMPLETE
 
 ### RTC Transfer Flow (Fallback)
 
@@ -144,29 +152,46 @@ Message Flow Examples
 Security Considerations
 -----------------------
 
-**Path Validation:**
-All shared storage paths received over the network MUST be validated:
-1. Convert relative path to absolute using shared_storage_root
-2. Resolve symlinks (Path.resolve())
-3. Verify resolved path is within shared_storage_root (prevent traversal attacks)
-4. Check path exists (for input paths)
-5. Check permissions (readable for input, writable for output)
+**Filename Validation (Worker I/O Paths):**
+All filenames received from clients MUST be validated:
+1. Reject filenames containing path separators (/, \\)
+2. Reject parent directory references (..)
+3. Resolve the full path: input_path / filename
+4. Verify resolved path is within input_path (prevent traversal attacks)
+5. Check file exists and is readable
 
 **Example Attack Prevention:**
-Bad input: "../../etc/passwd"
-Resolved: /etc/passwd (outside shared root)
-Result: PATH_ERROR::Path outside shared storage
+Bad input: "../../../etc/passwd"
+Result: FILE_NOT_FOUND::../../../etc/passwd::Invalid filename (contains path separator)
 
 **Recommended Implementation:**
 ```python
-from sleap_rtc.filesystem import validate_path_in_root
-absolute_path = to_absolute_path(relative_path, shared_storage_root)
-validated_path = validate_path_in_root(absolute_path, shared_storage_root)
+import os
+filename = received_filename
+
+# Reject path traversal attempts
+if os.sep in filename or (os.altsep and os.altsep in filename) or ".." in filename:
+    send(FILE_NOT_FOUND, filename, "Invalid filename")
+    return
+
+# Resolve full path
+full_path = input_path / filename
+if not full_path.exists():
+    send(FILE_NOT_FOUND, filename, "File does not exist")
+    return
+
+send(FILE_EXISTS, filename)
 ```
 """
 
-# Shared Storage Transfer Message Types
+# Worker I/O Paths Message Types
 MSG_JOB_ID = "JOB_ID"
+MSG_INPUT_FILE = "INPUT_FILE"
+MSG_FILE_EXISTS = "FILE_EXISTS"
+MSG_FILE_NOT_FOUND = "FILE_NOT_FOUND"
+MSG_JOB_OUTPUT_PATH = "JOB_OUTPUT_PATH"
+
+# Legacy Shared Storage Message Types (Deprecated)
 MSG_SHARED_INPUT_PATH = "SHARED_INPUT_PATH"
 MSG_SHARED_OUTPUT_PATH = "SHARED_OUTPUT_PATH"
 MSG_SHARED_STORAGE_JOB = "SHARED_STORAGE_JOB"

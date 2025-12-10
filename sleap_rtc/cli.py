@@ -50,16 +50,54 @@ def show_worker_help():
     "--shared-storage-root",
     type=str,
     required=False,
-    help="Path to shared storage root (NFS mount, etc.). If not set, uses SHARED_STORAGE_ROOT env var or falls back to RTC transfer.",
+    help="[DEPRECATED] Use --input-path and --output-path instead.",
 )
-def worker(room_id, token, shared_storage_root):
+@click.option(
+    "--input-path",
+    type=str,
+    required=False,
+    help="Directory where worker reads input files from shared filesystem.",
+)
+@click.option(
+    "--output-path",
+    type=str,
+    required=False,
+    help="Directory where worker writes job outputs to shared filesystem.",
+)
+@click.option(
+    "--filesystem",
+    type=str,
+    required=False,
+    default=None,
+    help="Human-readable label for the filesystem (e.g., 'vast', 'gdrive'). Displayed to clients.",
+)
+def worker(room_id, token, shared_storage_root, input_path, output_path, filesystem):
     """Start the sleap-RTC worker node."""
     # Validate that both room_id and token are provided together
     if (room_id and not token) or (token and not room_id):
         logger.error("Both --room-id and --token must be provided together")
         sys.exit(1)
 
-    run_RTCworker(room_id=room_id, token=token, shared_storage_root=shared_storage_root)
+    # Validate I/O path options
+    if (input_path and not output_path) or (output_path and not input_path):
+        logger.error("Both --input-path and --output-path must be provided together")
+        sys.exit(1)
+
+    # Warn about deprecated option
+    if shared_storage_root:
+        logger.warning(
+            "--shared-storage-root is deprecated. "
+            "Use --input-path and --output-path instead."
+        )
+
+    run_RTCworker(
+        room_id=room_id,
+        token=token,
+        shared_storage_root=shared_storage_root,
+        input_path=input_path,
+        output_path=output_path,
+        filesystem=filesystem,
+    )
 
 
 @cli.command(name="client-train")

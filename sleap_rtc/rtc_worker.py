@@ -10,17 +10,31 @@ from sleap_rtc.worker.worker_class import RTCWorkerClient
 from sleap_rtc.config import get_config
 
 
-def run_RTCworker(room_id=None, token=None, shared_storage_root=None):
+def run_RTCworker(
+    room_id=None,
+    token=None,
+    shared_storage_root=None,
+    input_path=None,
+    output_path=None,
+    filesystem=None,
+):
     """Create RTCWorkerClient and start it.
 
     Args:
         room_id: Optional room ID to join. If not provided, a new room will be created.
         token: Optional room token for authentication. Required if room_id is provided.
-        shared_storage_root: Optional path to shared storage root. If not provided,
-            uses SHARED_STORAGE_ROOT env var or falls back to RTC transfer.
+        shared_storage_root: [DEPRECATED] Optional path to shared storage root.
+        input_path: Optional directory where worker reads input files.
+        output_path: Optional directory where worker writes job outputs.
+        filesystem: Optional human-readable label for the filesystem.
     """
     # Create the worker instance.
-    worker = RTCWorkerClient(shared_storage_root=shared_storage_root)
+    worker = RTCWorkerClient(
+        shared_storage_root=shared_storage_root,
+        input_path=input_path,
+        output_path=output_path,
+        filesystem=filesystem,
+    )
 
     # Create the RTCPeerConnection object.
     pc = RTCPeerConnection()

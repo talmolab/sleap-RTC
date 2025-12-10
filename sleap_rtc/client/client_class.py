@@ -37,6 +37,10 @@ from sleap_rtc.filesystem import (
 )
 from sleap_rtc.protocol import (
     MSG_JOB_ID,
+    MSG_INPUT_FILE,
+    MSG_FILE_EXISTS,
+    MSG_FILE_NOT_FOUND,
+    MSG_JOB_OUTPUT_PATH,
     MSG_SHARED_INPUT_PATH,
     MSG_SHARED_OUTPUT_PATH,
     MSG_SHARED_STORAGE_JOB,
@@ -99,8 +103,12 @@ class RTCClient:
         # Other variables.
         self.received_files = {}
         self.target_worker = None
+        self.target_worker_io_paths = None  # I/O paths of selected worker (if configured)
         self.reconnecting = False
         self.current_job_id = None  # For tracking active job submissions
+        self.file_validation_queue = (
+            asyncio.Queue()
+        )  # Queue for INPUT_FILE validation responses
         self.path_validation_queue = (
             asyncio.Queue()
         )  # For PATH_VALIDATED/PATH_ERROR responses
@@ -644,6 +652,95 @@ class RTCClient:
             logging.error(f"Unexpected error in shared storage transfer: {e}")
             return False
 
+    async def send_file_via_io_paths(
+        self, file_path: str = None, output_dir: str = ""
+    ) -> bool:
+        """Send file via Worker I/O Paths (worker reads from its input directory).
+
+        This method sends just the filename to the worker. The worker validates
+        that the file exists in its configured input_path directory and responds
+        with FILE_EXISTS or FILE_NOT_FOUND.
+
+        Args:
+            file_path: Path to the local file (only filename is extracted and sent).
+            output_dir: Output directory name (where worker saves results).
+
+        Returns:
+            True if file exists on worker and job can proceed, False otherwise.
+        """
+        try:
+            # Validate data channel
+            if self.data_channel.readyState != "open":
+                logging.warning(
+                    f"Data channel not open (state: {self.data_channel.readyState}). "
+                    f"Cannot use I/O paths transfer."
+                )
+                return False
+
+            # Validate file path
+            if not file_path:
+                logging.error("No file path provided")
+                return False
+
+            # Extract just the filename
+            filename = Path(file_path).name
+            logging.info(f"Using Worker I/O Paths transfer for: {filename}")
+
+            # Generate unique job ID
+            job_id = f"job_{uuid.uuid4().hex[:8]}"
+            self.current_job_id = job_id
+            logging.info(f"Job ID: {job_id}")
+
+            # Send package type indicator
+            self.data_channel.send("PACKAGE_TYPE::train")
+
+            # Send output directory hint (where models will be saved locally)
+            output_dir = "models"
+            if self.config_info_list:
+                output_dir = self.config_info_list[0].config.outputs.runs_folder
+            self.data_channel.send(f"OUTPUT_DIR::{output_dir}")
+
+            # Send job ID
+            self.data_channel.send(format_message(MSG_JOB_ID, job_id))
+
+            # Send INPUT_FILE message with just the filename
+            self.data_channel.send(format_message(MSG_INPUT_FILE, filename))
+            logging.info(f"Sent INPUT_FILE::{filename} to worker")
+
+            # Wait for FILE_EXISTS or FILE_NOT_FOUND response
+            try:
+                response = await asyncio.wait_for(
+                    self.file_validation_queue.get(), timeout=30.0
+                )
+
+                msg_type, msg_args = parse_message(response)
+
+                if msg_type == MSG_FILE_EXISTS:
+                    logging.info(f"Worker confirmed file exists: {msg_args[0] if msg_args else filename}")
+                    return True
+
+                elif msg_type == MSG_FILE_NOT_FOUND:
+                    reason = msg_args[1] if len(msg_args) > 1 else "Unknown reason"
+                    logging.error(f"File not found on worker: {msg_args[0] if msg_args else filename}")
+                    logging.error(f"Reason: {reason}")
+                    # Show the user where to place the file
+                    if self.target_worker_io_paths:
+                        input_path = self.target_worker_io_paths.get("input", "N/A")
+                        logging.error(f"Please place your file at: {input_path}/{filename}")
+                    return False
+
+                else:
+                    logging.warning(f"Unexpected response: {response}")
+                    return False
+
+            except asyncio.TimeoutError:
+                logging.error("Timeout waiting for worker file validation response")
+                return False
+
+        except Exception as e:
+            logging.error(f"Unexpected error in I/O paths transfer: {e}")
+            return False
+
     async def on_channel_open(self):
         """Event handler function for when the datachannel is open.
 
@@ -656,9 +753,24 @@ class RTCClient:
         asyncio.create_task(self.keep_ice_alive())
         logging.info(f"{self.data_channel.label} is open")
 
-        # Try shared storage transfer first, fall back to RTC if not available or fails
+        # Determine transfer method based on worker I/O paths
         transfer_success = False
-        if self.shared_storage_root:
+
+        # Priority 1: Worker I/O Paths (new method - worker has input/output configured)
+        if self.target_worker_io_paths:
+            logging.info("Worker has I/O paths configured, using I/O paths transfer...")
+            transfer_success = await self.send_file_via_io_paths(
+                self.file_path, self.output_dir
+            )
+            if not transfer_success:
+                # Don't fall back to RTC - user needs to place file in correct location
+                logging.error(
+                    "I/O paths transfer failed. Please ensure file is placed in worker's input directory."
+                )
+                return
+
+        # Priority 2: Legacy shared storage (deprecated)
+        elif self.shared_storage_root:
             logging.info("Attempting shared storage transfer...")
             transfer_success = await self.send_file_via_shared_storage(
                 self.file_path, self.output_dir
@@ -691,7 +803,19 @@ class RTCClient:
             # Parse message type
             msg_type, msg_args = parse_message(message)
 
-            # Handle shared storage path validation responses
+            # Handle Worker I/O Paths file validation responses
+            if msg_type in (MSG_FILE_EXISTS, MSG_FILE_NOT_FOUND):
+                # Put response in queue for send_file_via_io_paths to handle
+                await self.file_validation_queue.put(message)
+                return
+
+            # Handle JOB_OUTPUT_PATH message
+            if msg_type == MSG_JOB_OUTPUT_PATH:
+                output_path = msg_args[0] if msg_args else "unknown"
+                logging.info(f"Job outputs will be written to: {output_path}")
+                return
+
+            # Handle shared storage path validation responses (legacy)
             if msg_type in (MSG_PATH_VALIDATED, MSG_PATH_ERROR):
                 # Put response in queue for send_file_via_shared_storage to handle
                 await self.path_validation_queue.put(message)
@@ -1124,13 +1248,24 @@ class RTCClient:
 
         selected = sorted_workers[0]
         peer_id = selected["peer_id"]
-        gpu_memory = (
-            selected.get("metadata", {})
-            .get("properties", {})
-            .get("gpu_memory_mb", "unknown")
-        )
+        metadata = selected.get("metadata", {}).get("properties", {})
+        gpu_memory = metadata.get("gpu_memory_mb", "unknown")
+        io_paths = metadata.get("io_paths", None)
+
+        # Store I/O paths for use in on_channel_open
+        self.target_worker_io_paths = io_paths
 
         logging.info(f"Auto-selected worker {peer_id} (GPU memory: {gpu_memory}MB)")
+
+        # Log I/O paths if configured
+        if io_paths:
+            logging.info(f"Worker I/O paths:")
+            logging.info(f"  Filesystem: {io_paths.get('filesystem', 'shared')}")
+            logging.info(f"  Input:      {io_paths.get('input', 'N/A')}")
+            logging.info(f"  Output:     {io_paths.get('output', 'N/A')}")
+        else:
+            logging.info("Worker transfer mode: RTC (no shared filesystem)")
+
         return peer_id
 
     async def _prompt_worker_selection(self, workers: list) -> str:
@@ -1154,12 +1289,24 @@ class RTCClient:
                 gpu_memory = metadata.get("gpu_memory_mb", 0)
                 cuda_version = metadata.get("cuda_version", "Unknown")
                 hostname = metadata.get("hostname", "Unknown")
+                io_paths = metadata.get("io_paths", None)
 
                 print(f"\n  {i}. {peer_id}")
                 print(f"     GPU Model:    {gpu_model}")
                 print(f"     GPU Memory:   {gpu_memory} MB")
                 print(f"     CUDA Version: {cuda_version}")
                 print(f"     Hostname:     {hostname}")
+
+                # Display I/O paths if configured
+                if io_paths:
+                    filesystem = io_paths.get("filesystem", "shared")
+                    input_path = io_paths.get("input", "N/A")
+                    output_path = io_paths.get("output", "N/A")
+                    print(f"     Filesystem:   {filesystem}")
+                    print(f"     Input:        {input_path}  <- Place your files here")
+                    print(f"     Output:       {output_path}")
+                else:
+                    print(f"     Transfer:     RTC (no shared filesystem)")
 
             print("\n" + "=" * 80)
             print(
@@ -1189,6 +1336,9 @@ class RTCClient:
                 idx = int(choice) - 1
                 if 0 <= idx < len(workers):
                     selected_worker = workers[idx]["peer_id"]
+                    # Store I/O paths for use in on_channel_open
+                    metadata = workers[idx].get("metadata", {}).get("properties", {})
+                    self.target_worker_io_paths = metadata.get("io_paths", None)
                     print(f"\nSelected: {selected_worker}")
                     return selected_worker
                 else:

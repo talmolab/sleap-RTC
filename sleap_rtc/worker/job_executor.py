@@ -657,6 +657,97 @@ class JobExecutor:
             channel.send(f"JOB_FAILED::{self.worker.current_job_id}::{str(e)}")
             raise
 
+    async def process_io_paths_job(self, channel):
+        """Process a job using Worker I/O Paths mode.
+
+        In this mode, the worker reads from its configured input_path directory
+        and writes to its configured output_path directory. The client only sends
+        the filename, not the file data.
+
+        Args:
+            channel: RTC data channel for sending progress/status updates
+        """
+        try:
+            input_file = self.worker.file_manager.current_input_file
+            output_dir = self.worker.file_manager.output_dir
+
+            logging.info(
+                f"Processing job {self.worker.current_job_id} via I/O paths"
+            )
+            logging.info(f"Input:  {input_file}")
+            logging.info(f"Output: {output_dir}")
+
+            # Store original file name
+            original_file_name = input_file.name
+
+            # Determine working directory
+            if input_file.suffix == ".zip":
+                # Unzip to the output directory
+                logging.info(f"Unzipping {input_file}...")
+                shutil.unpack_archive(input_file, output_dir)
+                # The unzipped directory name is the zip filename without extension
+                self.unzipped_dir = str(Path(output_dir) / original_file_name[:-4])
+                logging.info(f"Unzipped to: {self.unzipped_dir}")
+            elif input_file.suffix == ".slp":
+                # For .slp files, the working dir is the output directory
+                # Copy the slp file to the working directory
+                self.unzipped_dir = output_dir
+                target_file = Path(output_dir) / original_file_name
+                if not target_file.exists():
+                    shutil.copy2(input_file, target_file)
+                    logging.info(f"Copied {original_file_name} to {output_dir}")
+            else:
+                # For other file types, use the parent directory
+                self.unzipped_dir = str(input_file.parent)
+
+            # Set output directory for job execution
+            self.output_dir = output_dir
+
+            # Determine package type and run appropriate workflow
+            train_script_path = os.path.join(self.unzipped_dir, "train-script.sh")
+            track_script_path = os.path.join(self.unzipped_dir, "track-script.sh")
+
+            if Path(track_script_path).exists():
+                # Inference workflow
+                logging.info("Detected inference workflow (track-script.sh found)")
+                self.package_type = "track"
+                await self.run_track_workflow(channel, track_script_path)
+
+            elif Path(train_script_path).exists():
+                # Training workflow
+                logging.info("Detected training workflow (train-script.sh found)")
+                self.package_type = "train"
+
+                logging.info(f"Running training script: {train_script_path}")
+
+                # Make script executable
+                os.chmod(
+                    train_script_path,
+                    os.stat(train_script_path).st_mode | stat.S_IEXEC,
+                )
+
+                # Run training
+                await self.run_all_training_jobs(
+                    channel, train_script_path=train_script_path
+                )
+
+                logging.info("Training completed successfully.")
+                logging.info(f"Results available at: {output_dir}")
+
+            else:
+                raise FileNotFoundError(
+                    f"No train-script.sh or track-script.sh found in {self.unzipped_dir}"
+                )
+
+            # Send training complete message
+            channel.send("TRAINING_COMPLETE")
+            logging.info(f"Job {self.worker.current_job_id} completed successfully!")
+
+        except Exception as e:
+            logging.error(f"Error processing I/O paths job: {e}")
+            channel.send(f"JOB_FAILED::{self.worker.current_job_id}::{str(e)}")
+            raise
+
     async def _send_peer_message(self, to_peer_id: str, payload: dict):
         """Send peer message via worker's websocket.
 
