@@ -24,3 +24,25 @@ signaling_http = "http://staging-server.example.com:8001"
 # Production signaling server (current default)
 signaling_websocket = "ws://ec2-52-9-213-137.us-west-1.compute.amazonaws.com:8080"
 signaling_http = "http://ec2-52-9-213-137.us-west-1.compute.amazonaws.com:8001"
+
+# ============================================================================
+# Worker I/O Configuration (Optional)
+# ============================================================================
+# Configure worker input/output paths for shared filesystem transfer.
+# When configured, clients will see these paths and can place files directly
+# in the input folder instead of transferring via WebRTC.
+#
+# If not configured, the worker will use RTC transfer (default).
+
+[worker.io]
+# Directory where worker reads input files
+# Clients will be told to place their training packages here
+input_path = "/mnt/shared/inputs"
+
+# Directory where worker writes job outputs
+# Job outputs will be written to: {output_path}/jobs/{job_id}/
+output_path = "/mnt/shared/outputs"
+
+# Human-readable label for the filesystem (displayed to clients)
+# Examples: "vast", "gdrive", "nfs", "local"
+filesystem = "shared"

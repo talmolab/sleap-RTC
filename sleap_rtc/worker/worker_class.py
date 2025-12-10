@@ -23,25 +23,15 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel, RTC
 from pathlib import Path
 from websockets.client import ClientConnection
 
-from sleap_rtc.config import get_config, SharedStorageConfig, SharedStorageConfigError
-from sleap_rtc.filesystem import (
-    safe_mkdir,
-    to_relative_path,
-    to_absolute_path,
-    get_file_info,
-    validate_path_in_root,
-    PathValidationError,
-    SharedStorageError,
+from sleap_rtc.config import (
+    get_config,
+    WorkerIOConfig,
+    WorkerIOConfigError,
 )
+from sleap_rtc.filesystem import safe_mkdir
 from sleap_rtc.protocol import (
     MSG_JOB_ID,
-    MSG_SHARED_INPUT_PATH,
-    MSG_SHARED_OUTPUT_PATH,
-    MSG_SHARED_STORAGE_JOB,
-    MSG_PATH_VALIDATED,
-    MSG_PATH_ERROR,
-    MSG_JOB_COMPLETE,
-    format_message,
+    MSG_INPUT_FILE,
     parse_message,
 )
 from sleap_rtc.worker.capabilities import WorkerCapabilities
@@ -68,7 +58,14 @@ SEP = re.compile(rb"[\r\n]")
 
 
 class RTCWorkerClient:
-    def __init__(self, chunk_size=32 * 1024, gpu_id=0, shared_storage_root=None):
+    def __init__(
+        self,
+        chunk_size=32 * 1024,
+        gpu_id=0,
+        input_path=None,
+        output_path=None,
+        filesystem=None,
+    ):
         # Use /app/shared_data in production, current dir + shared_data in dev
         self.save_dir = "."
         self.chunk_size = chunk_size
@@ -79,28 +76,31 @@ class RTCWorkerClient:
         self.websocket = None  # WebSocket connection will be set later
         self.package_type = "train"  # Default to training, can be "track" for inference
 
-        # Initialize shared storage configuration
+        # Initialize Worker I/O configuration
+        self.io_config: Optional[WorkerIOConfig] = None
         try:
-            self.shared_storage_root = SharedStorageConfig.get_shared_storage_root(
-                cli_override=shared_storage_root
+            self.io_config = WorkerIOConfig.load(
+                cli_input_path=input_path,
+                cli_output_path=output_path,
+                cli_filesystem=filesystem,
             )
-            if self.shared_storage_root:
-                # Create jobs directory for shared storage transfers
-                self.shared_jobs_dir = self.shared_storage_root / "jobs"
-                safe_mkdir(self.shared_jobs_dir)
-                logging.info(
-                    f"Worker shared storage enabled: {self.shared_storage_root}"
-                )
-            else:
-                self.shared_jobs_dir = None
-                logging.info(
-                    "Worker shared storage not configured, will use RTC transfer"
-                )
-        except SharedStorageConfigError as e:
-            logging.error(f"Worker shared storage configuration error: {e}")
+            if self.io_config:
+                logging.info("=" * 60)
+                logging.info("WORKER I/O PATHS CONFIGURED")
+                logging.info(f"  Input:      {self.io_config.input_path}")
+                logging.info(f"  Output:     {self.io_config.output_path}")
+                logging.info(f"  Filesystem: {self.io_config.filesystem}")
+                logging.info("=" * 60)
+        except WorkerIOConfigError as e:
+            logging.error(f"Worker I/O configuration error: {e}")
             logging.info("Falling back to RTC transfer")
-            self.shared_storage_root = None
-            self.shared_jobs_dir = None
+            self.io_config = None
+
+        # Log transfer mode
+        if self.io_config:
+            logging.info("Transfer mode: Worker I/O Paths")
+        else:
+            logging.info("Transfer mode: RTC Transfer (no shared filesystem)")
 
         # Shared storage job tracking
         self.current_job_id = None
@@ -108,15 +108,17 @@ class RTCWorkerClient:
         self.current_output_path = None
 
         # Worker state and capabilities (for v2.0 features)
-        self.capabilities = WorkerCapabilities(gpu_id=gpu_id)
+        self.capabilities = WorkerCapabilities(
+            gpu_id=gpu_id,
+            io_config=self.io_config,
+        )
         self.job_executor = JobExecutor(
             worker=self,
             capabilities=self.capabilities,
-            shared_storage_root=self.shared_storage_root,
         )
         self.file_manager = FileManager(
             chunk_size=chunk_size,
-            shared_storage_root=self.shared_storage_root,
+            io_config=self.io_config,
         )
         self.job_coordinator = None  # Initialized in run_worker after authentication
         self.state_manager = None  # Initialized in run_worker after authentication
@@ -1165,6 +1167,23 @@ class RTCWorkerClient:
             except (ImportError, AttributeError):
                 sleap_version = "unknown"
 
+            # Build properties dict
+            properties = {
+                "gpu_memory_mb": self.gpu_memory_mb,
+                "gpu_model": self.gpu_model,
+                "sleap_version": sleap_version,
+                "cuda_version": self.cuda_version,
+                "hostname": socket.gethostname(),
+                "status": self.status,
+                "max_concurrent_jobs": self.max_concurrent_jobs,
+                "supported_models": self.supported_models,
+                "supported_job_types": self.supported_job_types,
+            }
+
+            # Include I/O paths if configured
+            if self.io_config:
+                properties["io_paths"] = self.io_config.to_dict()
+
             # Send register message with is_admin=True
             await self.websocket.send(
                 json.dumps(
@@ -1182,17 +1201,7 @@ class RTCWorkerClient:
                                 "training-worker",
                                 "inference-worker",
                             ],
-                            "properties": {
-                                "gpu_memory_mb": self.gpu_memory_mb,
-                                "gpu_model": self.gpu_model,
-                                "sleap_version": sleap_version,
-                                "cuda_version": self.cuda_version,
-                                "hostname": socket.gethostname(),
-                                "status": self.status,
-                                "max_concurrent_jobs": self.max_concurrent_jobs,
-                                "supported_models": self.supported_models,
-                                "supported_job_types": self.supported_job_types,
-                            },
+                            "properties": properties,
                         },
                     }
                 )
@@ -1647,52 +1656,30 @@ class RTCWorkerClient:
                     )
                     return
 
-                elif msg_type == MSG_SHARED_INPUT_PATH:
-                    # Receive relative path from client
-                    relative_path_str = msg_args[0] if msg_args else ""
-                    logging.info(f"Received shared input path: {relative_path_str}")
+                elif msg_type == MSG_INPUT_FILE:
+                    # Worker I/O Paths mode: receive filename from client
+                    filename = msg_args[0] if msg_args else ""
+                    logging.info(f"Received INPUT_FILE: {filename}")
 
-                    # Validate and store path using FileManager
-                    validated_path = await self.file_manager.validate_shared_input_path(
-                        relative_path_str, channel
+                    if not self.current_job_id:
+                        logging.error("Received INPUT_FILE before JOB_ID")
+                        return
+
+                    # Validate and resolve the input file
+                    validated_path = self.file_manager.validate_input_file(
+                        filename, self.current_job_id, channel
                     )
                     if validated_path:
                         self.current_input_path = validated_path
-                    return
+                        self.output_dir = self.file_manager.output_dir
+                        logging.info(f"Input file ready: {validated_path}")
 
-                elif msg_type == MSG_SHARED_OUTPUT_PATH:
-                    # Receive relative output path from client
-                    relative_path_str = msg_args[0] if msg_args else ""
-                    logging.info(f"Received shared output path: {relative_path_str}")
-
-                    # Validate and store path using FileManager
-                    validated_path = await self.file_manager.validate_shared_output_path(
-                        relative_path_str, channel
-                    )
-                    if validated_path:
-                        self.current_output_path = validated_path
-                        self.output_dir = str(validated_path)
-                    return
-
-                elif (
-                    msg_type == MSG_SHARED_STORAGE_JOB
-                    and msg_args
-                    and msg_args[0] == "start"
-                ):
-                    logging.info("Starting shared storage job processing")
-                    # Process the job using shared storage paths
-                    if self.current_input_path and self.current_output_path:
+                        # Process the job immediately
                         try:
-                            await self.job_executor.process_shared_storage_job(channel)
+                            await self.job_executor.process_io_paths_job(channel)
                         except Exception as e:
-                            logging.error(f"Error processing shared storage job: {e}")
+                            logging.error(f"Error processing I/O paths job: {e}")
                             channel.send(f"JOB_FAILED::{self.current_job_id}::{str(e)}")
-                    else:
-                        error_msg = (
-                            "Missing input or output path for shared storage job"
-                        )
-                        logging.error(error_msg)
-                        channel.send(format_message(MSG_PATH_ERROR, error_msg))
                     return
 
                 if message == b"KEEP_ALIVE":
@@ -2115,6 +2102,8 @@ class RTCWorkerClient:
                                     "max_concurrent_jobs": self.max_concurrent_jobs,
                                     "supported_models": self.supported_models,
                                     "supported_job_types": self.supported_job_types,
+                                    # Include I/O paths if configured
+                                    **({"io_paths": self.io_config.to_dict()} if self.io_config else {}),
                                 },
                             },
                         }

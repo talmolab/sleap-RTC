@@ -131,6 +131,23 @@ class StateManager:
             sleap_version = "unknown"
 
         try:
+            # Build registration message properties
+            properties = {
+                "gpu_memory_mb": self.capabilities.gpu_memory_mb,
+                "gpu_model": self.capabilities.gpu_model,
+                "sleap_version": sleap_version,
+                "cuda_version": self.capabilities.cuda_version,
+                "hostname": socket.gethostname(),
+                "status": self.status,
+                "max_concurrent_jobs": self.max_concurrent_jobs,
+                "supported_models": self.capabilities.supported_models,
+                "supported_job_types": self.capabilities.supported_job_types,
+            }
+
+            # Include I/O paths if configured
+            if self.capabilities.io_config:
+                properties["io_paths"] = self.capabilities.io_config.to_dict()
+
             # Build registration message
             registration_msg = {
                 "type": "register",
@@ -145,17 +162,7 @@ class StateManager:
                         "training-worker",
                         "inference-worker",
                     ],
-                    "properties": {
-                        "gpu_memory_mb": self.capabilities.gpu_memory_mb,
-                        "gpu_model": self.capabilities.gpu_model,
-                        "sleap_version": sleap_version,
-                        "cuda_version": self.capabilities.cuda_version,
-                        "hostname": socket.gethostname(),
-                        "status": self.status,
-                        "max_concurrent_jobs": self.max_concurrent_jobs,
-                        "supported_models": self.capabilities.supported_models,
-                        "supported_job_types": self.capabilities.supported_job_types,
-                    },
+                    "properties": properties,
                 },
             }
 
