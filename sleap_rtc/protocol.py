@@ -57,28 +57,6 @@ These messages are used when Worker has I/O paths configured (input_path, output
     Format: "JOB_OUTPUT_PATH::{path}"
     Example: "JOB_OUTPUT_PATH::/mnt/shared/outputs/jobs/job_f3a8b2c1"
 
-### Legacy Shared Storage Messages (Deprecated)
-
-These messages are deprecated and will be removed in a future version.
-
-**SHARED_INPUT_PATH::{relative_path}**
-    Deprecated: Use INPUT_FILE instead
-
-**SHARED_OUTPUT_PATH::{relative_path}**
-    Deprecated: Worker now controls output path
-
-**SHARED_STORAGE_JOB::start**
-    Deprecated: Use INPUT_FILE flow instead
-
-**PATH_VALIDATED::{path_type}**
-    Deprecated: Use FILE_EXISTS instead
-
-**PATH_ERROR::{error_message}**
-    Deprecated: Use FILE_NOT_FOUND instead
-
-**JOB_COMPLETE::{job_id}::{relative_output_path}**
-    Deprecated: Use JOB_OUTPUT_PATH instead
-
 ### RTC Transfer Messages (Original Protocol)
 
 These messages are used for backward compatibility when shared storage is unavailable.
@@ -191,14 +169,6 @@ MSG_FILE_EXISTS = "FILE_EXISTS"
 MSG_FILE_NOT_FOUND = "FILE_NOT_FOUND"
 MSG_JOB_OUTPUT_PATH = "JOB_OUTPUT_PATH"
 
-# Legacy Shared Storage Message Types (Deprecated)
-MSG_SHARED_INPUT_PATH = "SHARED_INPUT_PATH"
-MSG_SHARED_OUTPUT_PATH = "SHARED_OUTPUT_PATH"
-MSG_SHARED_STORAGE_JOB = "SHARED_STORAGE_JOB"
-MSG_PATH_VALIDATED = "PATH_VALIDATED"
-MSG_PATH_ERROR = "PATH_ERROR"
-MSG_JOB_COMPLETE = "JOB_COMPLETE"
-
 # RTC Transfer Message Types (Original Protocol)
 MSG_FILE_META = "FILE_META"
 MSG_CHUNK = "CHUNK"
@@ -229,11 +199,11 @@ def format_message(msg_type: str, *args) -> str:
         >>> format_message(MSG_JOB_ID, "job_abc123")
         'JOB_ID::job_abc123'
 
-        >>> format_message(MSG_SHARED_INPUT_PATH, "jobs/job_123/data.zip")
-        'SHARED_INPUT_PATH::jobs/job_123/data.zip'
+        >>> format_message(MSG_INPUT_FILE, "my_training.pkg.slp")
+        'INPUT_FILE::my_training.pkg.slp'
 
-        >>> format_message(MSG_PATH_VALIDATED, "input")
-        'PATH_VALIDATED::input'
+        >>> format_message(MSG_FILE_EXISTS, "my_training.pkg.slp")
+        'FILE_EXISTS::my_training.pkg.slp'
     """
     if args:
         return (
@@ -255,8 +225,8 @@ def parse_message(message: str) -> tuple[str, list[str]]:
         >>> parse_message("JOB_ID::job_abc123")
         ('JOB_ID', ['job_abc123'])
 
-        >>> parse_message("PATH_VALIDATED::input")
-        ('PATH_VALIDATED', ['input'])
+        >>> parse_message("FILE_EXISTS::my_training.pkg.slp")
+        ('FILE_EXISTS', ['my_training.pkg.slp'])
 
         >>> parse_message("READY")
         ('READY', [])

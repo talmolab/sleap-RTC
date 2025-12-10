@@ -19,33 +19,20 @@ from pathlib import Path
 from typing import List, Optional, Text, Tuple
 from websockets.client import ClientConnection
 
-from sleap_rtc.config import get_config, SharedStorageConfig, SharedStorageConfigError
+from sleap_rtc.config import get_config
 from sleap_rtc.exceptions import (
     NoWorkersAvailableError,
     NoWorkersAcceptedError,
     JobFailedError,
     WorkerDiscoveryError,
 )
-from sleap_rtc.filesystem import (
-    safe_copy,
-    safe_mkdir,
-    to_relative_path,
-    to_absolute_path,
-    get_file_info,
-    check_disk_space,
-    SharedStorageError,
-)
+from sleap_rtc.filesystem import safe_mkdir
 from sleap_rtc.protocol import (
     MSG_JOB_ID,
     MSG_INPUT_FILE,
     MSG_FILE_EXISTS,
     MSG_FILE_NOT_FOUND,
     MSG_JOB_OUTPUT_PATH,
-    MSG_SHARED_INPUT_PATH,
-    MSG_SHARED_OUTPUT_PATH,
-    MSG_SHARED_STORAGE_JOB,
-    MSG_PATH_VALIDATED,
-    MSG_PATH_ERROR,
     format_message,
     parse_message,
 )
@@ -65,7 +52,6 @@ class RTCClient:
         DNS: Optional[str] = None,
         port_number: str = "8080",
         gui: bool = False,
-        shared_storage_root: Optional[str] = None,
     ):
         # Initialize RTC peer connection and websocket.
         # Note: RTCPeerConnection is created later in run_client after receiving ICE servers
@@ -83,23 +69,6 @@ class RTCClient:
         self.port_number = port_number
         self.gui = gui
 
-        # Initialize shared storage configuration.
-        try:
-            self.shared_storage_root = SharedStorageConfig.get_shared_storage_root(
-                cli_override=shared_storage_root
-            )
-            if self.shared_storage_root:
-                logging.info(f"Shared storage enabled: {self.shared_storage_root}")
-                # Create jobs directory in shared storage
-                self.shared_jobs_dir = self.shared_storage_root / "jobs"
-                safe_mkdir(self.shared_jobs_dir)
-            else:
-                logging.info("Shared storage not configured, will use RTC transfer")
-        except SharedStorageConfigError as e:
-            logging.error(f"Shared storage configuration error: {e}")
-            logging.info("Falling back to RTC transfer")
-            self.shared_storage_root = None
-
         # Other variables.
         self.received_files = {}
         self.target_worker = None
@@ -109,9 +78,6 @@ class RTCClient:
         self.file_validation_queue = (
             asyncio.Queue()
         )  # Queue for INPUT_FILE validation responses
-        self.path_validation_queue = (
-            asyncio.Queue()
-        )  # For PATH_VALIDATED/PATH_ERROR responses
 
         # Response queues for coordinating websocket messages
         # (Only handle_connection() calls recv(), other functions wait on these queues)
@@ -497,161 +463,6 @@ class RTCClient:
 
         return
 
-    async def send_file_via_shared_storage(
-        self, file_path: str = None, output_dir: str = ""
-    ) -> bool:
-        """Send file via shared filesystem instead of RTC transfer.
-
-        This method copies the file to shared storage and sends the path to the worker
-        over the RTC data channel. The worker can then access the file directly from
-        shared storage without transferring data over RTC.
-
-        Args:
-            file_path: Path to the local file to send.
-            output_dir: Output directory name (where worker saves results).
-
-        Returns:
-            True if successful, False if shared storage transfer failed (caller should
-            fall back to RTC transfer).
-
-        Raises:
-            None - errors are caught and logged, returns False for fallback.
-        """
-        try:
-            # Validate data channel
-            if self.data_channel.readyState != "open":
-                logging.warning(
-                    f"Data channel not open (state: {self.data_channel.readyState}). "
-                    f"Cannot send file via shared storage."
-                )
-                return False
-
-            # Validate file path
-            if not file_path:
-                logging.error("No file path provided")
-                return False
-
-            local_file = Path(file_path)
-            if not local_file.exists():
-                logging.error(f"File does not exist: {file_path}")
-                return False
-
-            # Generate unique job ID
-            job_id = f"job_{uuid.uuid4().hex[:8]}"
-            logging.info(f"Starting shared storage transfer for job {job_id}")
-
-            # Create job directory in shared storage
-            job_dir = self.shared_jobs_dir / job_id
-            safe_mkdir(job_dir)
-
-            # Check disk space before copying
-            file_size = local_file.stat().st_size
-            # Add 20% buffer for safety (extracted files, output files, etc.)
-            required_space = int(file_size * 1.2)
-
-            if not check_disk_space(self.shared_storage_root, required_space):
-                error_msg = (
-                    f"Insufficient disk space on shared storage. "
-                    f"Required: {required_space / 1e9:.2f} GB, "
-                    f"File size: {file_size / 1e9:.2f} GB"
-                )
-                logging.error(error_msg)
-                raise SharedStorageError(error_msg)
-
-            # Copy file to shared storage with timeout
-            shared_file_path = job_dir / local_file.name
-            logging.info(f"Copying {local_file.name} to shared storage...")
-
-            # Calculate timeout based on file size (assume 100 MB/s minimum transfer rate)
-            # Add 30 seconds base overhead for safety
-            copy_timeout = max(60, (file_size / (100 * 1024 * 1024)) + 30)
-            logging.debug(
-                f"File copy timeout set to {copy_timeout:.0f} seconds for {file_size / 1e9:.2f} GB file"
-            )
-
-            try:
-                # Run synchronous copy in thread pool to avoid blocking event loop
-                await asyncio.wait_for(
-                    asyncio.to_thread(safe_copy, local_file, shared_file_path),
-                    timeout=copy_timeout,
-                )
-
-                file_info = get_file_info(shared_file_path)
-                logging.info(
-                    f"✓ File copied to shared storage: {file_info['size'] / 1e6:.1f} MB"
-                )
-
-            except asyncio.TimeoutError:
-                error_msg = (
-                    f"File copy timed out after {copy_timeout:.0f} seconds. "
-                    f"This may indicate slow shared storage or network issues."
-                )
-                logging.error(error_msg)
-                raise SharedStorageError(error_msg)
-
-            # Create output directory
-            output_subdir = output_dir if output_dir else "models"
-            output_path = job_dir / output_subdir
-            safe_mkdir(output_path)
-
-            # Convert to relative paths (for cross-platform compatibility)
-            relative_input = to_relative_path(
-                shared_file_path, self.shared_storage_root
-            )
-            relative_output = to_relative_path(output_path, self.shared_storage_root)
-
-            logging.info(f"Sending paths to worker via RTC:")
-            logging.info(f"  Input:  {relative_input}")
-            logging.info(f"  Output: {relative_output}")
-
-            # Obtain file metadata.
-            file_name = Path(file_path).name
-            file_size = Path(file_path).stat().st_size
-
-            # Send metadata next.
-            self.data_channel.send(f"FILE_META::{file_name}:{file_size}:{self.gui}")
-
-            # Send paths over RTC data channel
-            self.data_channel.send(format_message(MSG_JOB_ID, job_id))
-            self.data_channel.send(
-                format_message(MSG_SHARED_INPUT_PATH, relative_input)
-            )
-            self.data_channel.send(
-                format_message(MSG_SHARED_OUTPUT_PATH, relative_output)
-            )
-            self.data_channel.send(format_message(MSG_SHARED_STORAGE_JOB, "start"))
-
-            # Wait for path validation response from worker
-            try:
-                response = await asyncio.wait_for(
-                    self.path_validation_queue.get(), timeout=10.0
-                )
-
-                # Parse response message
-                msg_type, msg_args = parse_message(response)
-
-                if msg_type == MSG_PATH_VALIDATED:
-                    logging.info("✓ Worker validated paths successfully")
-                    return True
-                elif msg_type == MSG_PATH_ERROR:
-                    error_msg = msg_args[0] if msg_args else "Unknown error"
-                    logging.error(f"Worker path validation failed: {error_msg}")
-                    return False
-                else:
-                    logging.warning(f"Unexpected response: {response}")
-                    return False
-
-            except asyncio.TimeoutError:
-                logging.error("Timeout waiting for worker path validation")
-                return False
-
-        except SharedStorageError as e:
-            logging.error(f"Shared storage error: {e}")
-            return False
-        except Exception as e:
-            logging.error(f"Unexpected error in shared storage transfer: {e}")
-            return False
-
     async def send_file_via_io_paths(
         self, file_path: str = None, output_dir: str = ""
     ) -> bool:
@@ -756,7 +567,7 @@ class RTCClient:
         # Determine transfer method based on worker I/O paths
         transfer_success = False
 
-        # Priority 1: Worker I/O Paths (new method - worker has input/output configured)
+        # Worker I/O Paths transfer (worker has input/output paths configured)
         if self.target_worker_io_paths:
             logging.info("Worker has I/O paths configured, using I/O paths transfer...")
             transfer_success = await self.send_file_via_io_paths(
@@ -769,21 +580,9 @@ class RTCClient:
                 )
                 return
 
-        # Priority 2: Legacy shared storage (deprecated)
-        elif self.shared_storage_root:
-            logging.info("Attempting shared storage transfer...")
-            transfer_success = await self.send_file_via_shared_storage(
-                self.file_path, self.output_dir
-            )
-
-        # Fall back to RTC transfer if shared storage not configured or failed
+        # Fall back to RTC transfer if I/O paths not configured
         if not transfer_success:
-            if self.shared_storage_root:
-                logging.warning(
-                    "Shared storage transfer failed, falling back to RTC transfer"
-                )
-            else:
-                logging.info("Using RTC transfer")
+            logging.info("Using RTC transfer")
             await self.send_client_file(self.file_path, self.output_dir)
 
     async def on_message(self, message):
@@ -813,12 +612,6 @@ class RTCClient:
             if msg_type == MSG_JOB_OUTPUT_PATH:
                 output_path = msg_args[0] if msg_args else "unknown"
                 logging.info(f"Job outputs will be written to: {output_path}")
-                return
-
-            # Handle shared storage path validation responses (legacy)
-            if msg_type in (MSG_PATH_VALIDATED, MSG_PATH_ERROR):
-                # Put response in queue for send_file_via_shared_storage to handle
-                await self.path_validation_queue.put(message)
                 return
 
             # if message == b"KEEP_ALIVE":

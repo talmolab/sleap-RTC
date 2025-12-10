@@ -12,19 +12,9 @@ import shutil
 import stat
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from aiortc import RTCDataChannel
-
-from sleap_rtc.filesystem import (
-    safe_mkdir,
-    to_relative_path,
-    get_file_info,
-)
-from sleap_rtc.protocol import (
-    MSG_JOB_COMPLETE,
-    format_message,
-)
 
 if TYPE_CHECKING:
     from sleap_rtc.worker.capabilities import WorkerCapabilities
@@ -43,8 +33,6 @@ class JobExecutor:
     Attributes:
         worker: Reference to parent RTCWorkerClient for accessing shared state.
         capabilities: WorkerCapabilities instance for job compatibility.
-        shared_storage_root: Path to shared storage root directory.
-        shared_jobs_dir: Directory for shared storage jobs.
         unzipped_dir: Working directory for current job.
         output_dir: Output directory for job results.
         package_type: Type of package ("train" or "track").
@@ -54,21 +42,15 @@ class JobExecutor:
         self,
         worker,
         capabilities: "WorkerCapabilities",
-        shared_storage_root: Optional[Path] = None,
     ):
         """Initialize job executor.
 
         Args:
             worker: Parent RTCWorkerClient instance.
             capabilities: WorkerCapabilities for job compatibility checking.
-            shared_storage_root: Optional path to shared storage root.
         """
         self.worker = worker
         self.capabilities = capabilities
-        self.shared_storage_root = shared_storage_root
-        self.shared_jobs_dir = (
-            shared_storage_root / "jobs" if shared_storage_root else None
-        )
 
         # Job execution state
         self.unzipped_dir = ""
@@ -468,16 +450,16 @@ class JobExecutor:
             if predictions_files:
                 predictions_path = predictions_files[0]
 
-                # Check if we're in shared storage mode
-                using_shared_storage = (
-                    self.shared_storage_root is not None
-                    and self.worker.current_output_path is not None
+                # Check if we're in I/O paths mode (results stay in filesystem)
+                using_io_paths = (
+                    self.worker.io_config is not None
+                    and self.worker.file_manager.output_dir
                 )
 
-                if using_shared_storage:
-                    # Shared storage: results stay in filesystem, no RTC transfer needed
+                if using_io_paths:
+                    # I/O paths mode: results stay in filesystem, no RTC transfer needed
                     logging.info(
-                        f"Predictions available in shared storage at: {predictions_path}"
+                        f"Predictions available at: {predictions_path}"
                     )
                 else:
                     # RTC transfer: send predictions back to client
@@ -554,108 +536,6 @@ class JobExecutor:
             if self.worker.current_job:
                 await self.worker.update_status("available")
                 self.worker.current_job = None
-
-    async def process_shared_storage_job(self, channel):
-        """Process a job using shared filesystem (no RTC file transfer).
-
-        Args:
-            channel: RTC data channel for sending progress/status updates
-        """
-        try:
-            logging.info(
-                f"Processing job {self.worker.current_job_id} from shared storage"
-            )
-            logging.info(f"Input:  {self.worker.current_input_path}")
-            logging.info(f"Output: {self.worker.current_output_path}")
-
-            # Get file info
-            file_info = get_file_info(self.worker.current_input_path)
-            if not file_info.get("exists"):
-                raise FileNotFoundError(
-                    f"Input file not found: {self.worker.current_input_path}"
-                )
-
-            logging.info(
-                f"Reading input file: {self.worker.current_input_path.name} "
-                f"({file_info['size'] / 1e6:.1f} MB)"
-            )
-
-            # Store original file name
-            original_file_name = self.worker.current_input_path.name
-
-            # If it's a zip file, unzip it
-            if self.worker.current_input_path.suffix == ".zip":
-                logging.info(f"Unzipping {self.worker.current_input_path}...")
-                job_dir = self.worker.current_input_path.parent
-                shutil.unpack_archive(self.worker.current_input_path, job_dir)
-                self.unzipped_dir = str(job_dir / original_file_name[:-4])
-                logging.info(f"Unzipped to: {self.unzipped_dir}")
-            else:
-                self.unzipped_dir = str(self.worker.current_input_path.parent)
-
-            # Determine package type and run appropriate workflow
-            train_script_path = os.path.join(self.unzipped_dir, "train-script.sh")
-            track_script_path = os.path.join(self.unzipped_dir, "track-script.sh")
-
-            if Path(track_script_path).exists():
-                # Inference workflow
-                logging.info("Detected inference workflow (track-script.sh found)")
-                self.package_type = "track"
-                await self.run_track_workflow(channel, track_script_path)
-
-            elif Path(train_script_path).exists():
-                # Training workflow
-                logging.info("Detected training workflow (train-script.sh found)")
-                self.package_type = "train"
-
-                # Start progress listener if GUI mode
-                progress_listener_task = None
-                if self.worker.gui:
-                    # Note: Progress reporter integration will be added in later task
-                    logging.info("GUI mode detected, progress reporting TBD")
-
-                logging.info(f"Running training script: {train_script_path}")
-
-                # Make script executable
-                os.chmod(
-                    train_script_path,
-                    os.stat(train_script_path).st_mode | stat.S_IEXEC,
-                )
-
-                # Run training
-                await self.run_all_training_jobs(
-                    channel, train_script_path=train_script_path
-                )
-
-                logging.info("Training completed successfully.")
-
-                # Note: For shared storage, results remain in the shared filesystem
-                # No need to zip - client can access directly via the shared path
-                logging.info(
-                    f"Results available in shared storage at: "
-                    f"{self.worker.current_output_path}"
-                )
-
-            else:
-                raise FileNotFoundError(
-                    f"No train-script.sh or track-script.sh found in {self.unzipped_dir}"
-                )
-
-            # Notify client of job completion
-            relative_output = to_relative_path(
-                self.worker.current_output_path, self.shared_storage_root
-            )
-            channel.send(
-                format_message(
-                    MSG_JOB_COMPLETE, self.worker.current_job_id, relative_output
-                )
-            )
-            logging.info(f"Job {self.worker.current_job_id} completed successfully!")
-
-        except Exception as e:
-            logging.error(f"Error processing shared storage job: {e}")
-            channel.send(f"JOB_FAILED::{self.worker.current_job_id}::{str(e)}")
-            raise
 
     async def process_io_paths_job(self, channel):
         """Process a job using Worker I/O Paths mode.

@@ -47,12 +47,6 @@ def show_worker_help():
     help="Room token for authentication (required if --room-id is provided).",
 )
 @click.option(
-    "--shared-storage-root",
-    type=str,
-    required=False,
-    help="[DEPRECATED] Use --input-path and --output-path instead.",
-)
-@click.option(
     "--input-path",
     type=str,
     required=False,
@@ -71,7 +65,7 @@ def show_worker_help():
     default=None,
     help="Human-readable label for the filesystem (e.g., 'vast', 'gdrive'). Displayed to clients.",
 )
-def worker(room_id, token, shared_storage_root, input_path, output_path, filesystem):
+def worker(room_id, token, input_path, output_path, filesystem):
     """Start the sleap-RTC worker node."""
     # Validate that both room_id and token are provided together
     if (room_id and not token) or (token and not room_id):
@@ -83,17 +77,9 @@ def worker(room_id, token, shared_storage_root, input_path, output_path, filesys
         logger.error("Both --input-path and --output-path must be provided together")
         sys.exit(1)
 
-    # Warn about deprecated option
-    if shared_storage_root:
-        logger.warning(
-            "--shared-storage-root is deprecated. "
-            "Use --input-path and --output-path instead."
-        )
-
     run_RTCworker(
         room_id=room_id,
         token=token,
-        shared_storage_root=shared_storage_root,
         input_path=input_path,
         output_path=output_path,
         filesystem=filesystem,
@@ -160,12 +146,6 @@ def worker(room_id, token, shared_storage_root, input_path, output_path, filesys
     required=False,
     default=None,
     help="Minimum GPU memory in MB required for training.",
-)
-@click.option(
-    "--shared-storage-root",
-    type=str,
-    required=False,
-    help="Path to shared storage root (NFS mount, etc.). If not set, uses SHARED_STORAGE_ROOT env var or falls back to RTC transfer.",
 )
 def client_train(**kwargs):
     """Run remote training on a worker.
@@ -321,12 +301,6 @@ def client_train(**kwargs):
     required=False,
     default=None,
     help="Minimum GPU memory in MB required for inference.",
-)
-@click.option(
-    "--shared-storage-root",
-    type=str,
-    required=False,
-    help="Path to shared storage root (NFS mount, etc.). If not set, uses SHARED_STORAGE_ROOT env var or falls back to RTC transfer.",
 )
 def client_track(**kwargs):
     """Run remote inference on a worker with pre-trained models.

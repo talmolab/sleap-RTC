@@ -1,7 +1,7 @@
 """File transfer and storage management for worker nodes.
 
 This module handles file transfer via RTC data channels, file compression,
-and shared storage path validation for SLEAP-RTC workers.
+and Worker I/O paths validation for SLEAP-RTC workers.
 """
 
 import asyncio
@@ -16,17 +16,8 @@ from aiortc import RTCDataChannel
 if TYPE_CHECKING:
     from sleap_rtc.config import WorkerIOConfig
 
-from sleap_rtc.config import SharedStorageConfig, SharedStorageConfigError
-from sleap_rtc.filesystem import (
-    safe_mkdir,
-    to_relative_path,
-    to_absolute_path,
-    validate_path_in_root,
-    PathValidationError,
-)
+from sleap_rtc.filesystem import safe_mkdir
 from sleap_rtc.protocol import (
-    MSG_PATH_VALIDATED,
-    MSG_PATH_ERROR,
     MSG_FILE_EXISTS,
     MSG_FILE_NOT_FOUND,
     MSG_JOB_OUTPUT_PATH,
@@ -35,33 +26,30 @@ from sleap_rtc.protocol import (
 
 
 class FileManager:
-    """Manages file transfer, compression, and shared storage operations.
+    """Manages file transfer, compression, and Worker I/O paths operations.
 
     This class handles file transfer via RTC data channels, compression of
-    training results, and validation of shared storage paths for security.
+    training results, and validation of Worker I/O paths for security.
 
     Attributes:
         chunk_size: Size of chunks for file transfer (default 32KB).
-        shared_storage_root: Path to shared storage root directory.
-        shared_jobs_dir: Directory for shared storage jobs.
         zipped_file: Path to most recently created zip file.
         save_dir: Local directory for saving files.
         output_dir: Output directory for job results.
         io_config: Worker I/O configuration (input/output paths).
+        current_input_file: Resolved input file path for current job.
     """
 
     def __init__(
         self,
         chunk_size: int = 32 * 1024,
-        shared_storage_root: Optional[Path] = None,
         io_config: Optional["WorkerIOConfig"] = None,
     ):
         """Initialize file manager.
 
         Args:
             chunk_size: Size of chunks for file transfer (default 32KB).
-            shared_storage_root: Optional path to shared storage root (deprecated).
-            io_config: Optional Worker I/O configuration for new I/O paths mode.
+            io_config: Optional Worker I/O configuration for I/O paths mode.
         """
         self.chunk_size = chunk_size
         self.save_dir = "."
@@ -69,27 +57,6 @@ class FileManager:
         self.output_dir = ""
         self.io_config = io_config
         self.current_input_file: Optional[Path] = None  # Resolved input file path
-
-        # Initialize shared storage configuration (legacy, deprecated)
-        try:
-            self.shared_storage_root = shared_storage_root or SharedStorageConfig.get_shared_storage_root()
-            if self.shared_storage_root:
-                # Create jobs directory for shared storage transfers
-                self.shared_jobs_dir = self.shared_storage_root / "jobs"
-                safe_mkdir(self.shared_jobs_dir)
-                logging.info(
-                    f"FileManager shared storage enabled: {self.shared_storage_root}"
-                )
-            else:
-                self.shared_jobs_dir = None
-                logging.info(
-                    "FileManager shared storage not configured, will use RTC transfer"
-                )
-        except SharedStorageConfigError as e:
-            logging.error(f"FileManager shared storage configuration error: {e}")
-            logging.info("Falling back to RTC transfer")
-            self.shared_storage_root = None
-            self.shared_jobs_dir = None
 
     async def send_file(self, channel: RTCDataChannel, file_path: str, output_dir: str = ""):
         """Send a file to client via RTC data channel.
@@ -180,113 +147,6 @@ class FileManager:
             logging.error(f"Error unzipping results: {e}")
             return None
 
-    async def validate_shared_input_path(
-        self,
-        relative_path_str: str,
-        channel: RTCDataChannel
-    ) -> Optional[Path]:
-        """Validate shared storage input path and send confirmation.
-
-        Args:
-            relative_path_str: Relative path from client.
-            channel: RTC data channel for sending validation response.
-
-        Returns:
-            Validated absolute path, or None if validation failed.
-        """
-        if not self.shared_storage_root:
-            error_msg = "Shared storage not configured on worker"
-            logging.error(error_msg)
-            channel.send(format_message(MSG_PATH_ERROR, error_msg))
-            return None
-
-        try:
-            # Convert relative path to absolute
-            relative_path = Path(relative_path_str)
-            absolute_path = to_absolute_path(
-                relative_path, self.shared_storage_root
-            )
-
-            # Validate path exists
-            if not absolute_path.exists():
-                error_msg = f"Input path does not exist: {absolute_path}"
-                logging.error(error_msg)
-                channel.send(format_message(MSG_PATH_ERROR, error_msg))
-                return None
-
-            # Security: Validate path is within shared root
-            validated_path = validate_path_in_root(
-                absolute_path, self.shared_storage_root
-            )
-
-            logging.info(f"✓ Input path validated: {validated_path}")
-            channel.send(format_message(MSG_PATH_VALIDATED, "input"))
-            return validated_path
-
-        except PathValidationError as e:
-            error_msg = f"Path validation failed: {e}"
-            logging.error(error_msg)
-            channel.send(format_message(MSG_PATH_ERROR, error_msg))
-            return None
-        except Exception as e:
-            error_msg = f"Error processing input path: {e}"
-            logging.error(error_msg)
-            channel.send(format_message(MSG_PATH_ERROR, error_msg))
-            return None
-
-    async def validate_shared_output_path(
-        self,
-        relative_path_str: str,
-        channel: RTCDataChannel
-    ) -> Optional[Path]:
-        """Validate shared storage output path and create directory.
-
-        Args:
-            relative_path_str: Relative path from client.
-            channel: RTC data channel for sending validation response.
-
-        Returns:
-            Validated absolute path, or None if validation failed.
-        """
-        if not self.shared_storage_root:
-            error_msg = "Shared storage not configured on worker"
-            logging.error(error_msg)
-            channel.send(format_message(MSG_PATH_ERROR, error_msg))
-            return None
-
-        try:
-            # Convert relative path to absolute
-            relative_path = Path(relative_path_str)
-            absolute_path = to_absolute_path(
-                relative_path, self.shared_storage_root
-            )
-
-            # Security: Validate path is within shared root
-            validated_path = validate_path_in_root(
-                absolute_path, self.shared_storage_root
-            )
-
-            # Create output directory
-            safe_mkdir(validated_path)
-
-            # Update output_dir for file transfer metadata
-            self.output_dir = str(validated_path)
-
-            logging.info(f"✓ Output path validated and created: {validated_path}")
-            channel.send(format_message(MSG_PATH_VALIDATED, "output"))
-            return validated_path
-
-        except PathValidationError as e:
-            error_msg = f"Path validation failed: {e}"
-            logging.error(error_msg)
-            channel.send(format_message(MSG_PATH_ERROR, error_msg))
-            return None
-        except Exception as e:
-            error_msg = f"Error processing output path: {e}"
-            logging.error(error_msg)
-            channel.send(format_message(MSG_PATH_ERROR, error_msg))
-            return None
-
     def validate_input_file(
         self,
         filename: str,
@@ -372,28 +232,3 @@ class FileManager:
         channel.send(format_message(MSG_JOB_OUTPUT_PATH, str(job_output_dir)))
 
         return input_path
-
-    def is_shared_storage_available(self) -> bool:
-        """Check if shared storage is configured and available.
-
-        Returns:
-            True if shared storage is available, False otherwise.
-        """
-        return self.shared_storage_root is not None
-
-    def get_relative_path(self, absolute_path: Path) -> Path:
-        """Convert absolute path to relative path within shared storage.
-
-        Args:
-            absolute_path: Absolute path to convert.
-
-        Returns:
-            Relative path within shared storage root.
-
-        Raises:
-            ValueError: If shared storage not configured.
-        """
-        if not self.shared_storage_root:
-            raise ValueError("Shared storage not configured")
-
-        return to_relative_path(absolute_path, self.shared_storage_root)
